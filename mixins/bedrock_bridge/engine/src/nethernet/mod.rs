@@ -13,6 +13,7 @@
 //! session as soon as the media stack is available.
 
 pub mod codec;
+pub mod discovery;
 pub mod message;
 pub mod signal;
 

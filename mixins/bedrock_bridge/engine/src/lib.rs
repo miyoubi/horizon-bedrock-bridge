@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aes;
 pub mod auth;
 pub mod bitarray;
 pub mod client;
