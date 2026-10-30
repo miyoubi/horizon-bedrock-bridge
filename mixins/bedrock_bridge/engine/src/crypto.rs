@@ -63,6 +63,11 @@ impl IdentityKey {
         &self.pkcs8
     }
 
+    /// The uncompressed EC point `0x04 || X || Y` (97 bytes for P-384).
+    pub fn public_point(&self) -> &[u8] {
+        &self.public_p384
+    }
+
     /// The public key as DER SubjectPublicKeyInfo (the `x5u` claim).
     pub fn public_der(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(P384_SPKI_PREFIX.len() + self.public_p384.len());
