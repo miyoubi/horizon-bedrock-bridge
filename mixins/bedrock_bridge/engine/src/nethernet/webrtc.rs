@@ -204,17 +204,17 @@ impl Session {
                             self.ready = true;
                         }
                     }
-                    RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(id)) => {
-                        if self.reliable.is_none() {
-                            self.reliable = Some(id);
-                            self.ready = true;
-                        }
+                    RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(id))
+                        if self.reliable.is_none() =>
+                    {
+                        self.reliable = Some(id);
+                        self.ready = true;
                     }
-                    RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(id)) => {
-                        if self.reliable == Some(id) {
-                            self.reliable = None;
-                            self.ready = false;
-                        }
+                    RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(id))
+                        if self.reliable == Some(id) =>
+                    {
+                        self.reliable = None;
+                        self.ready = false;
                     }
                     _ => {}
                 }
