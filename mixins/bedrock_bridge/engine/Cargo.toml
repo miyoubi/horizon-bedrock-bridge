@@ -26,3 +26,13 @@ hkdf = "0.12.4"
 subtle = "2.6.1"
 zeroize = "1.9.1"
 log = "0.4.34"
+# WebRTC (webrtc-rs, sans-I/O), for the NetherNet transport. Off unless the
+# `nethernet-webrtc` feature is on; it is in Horizon's Cargo.lock (enabled there
+# via the same optional `rtc` dependency), so a staged native build accepts it.
+rtc = { version = "0.21", optional = true }
+bytes = { version = "1.12.1", optional = true }
+
+[features]
+# Builds the WebRTC driver. Default off so the portable layers test offline
+# without the heavy webrtc tree.
+nethernet-webrtc = ["dep:rtc", "dep:bytes"]
