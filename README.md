@@ -23,10 +23,10 @@ Bedrock server ──RakNet──▶ bedrock-core (RakNet, MCPE codecs, Xbox aut
 
 | Path | What it is |
 |---|---|
-| `mixins/bedrock-bridge/engine/` | `bedrock-core`: the whole Bedrock stack, a standalone crate with no Horizon dependency (unit-tested with `cargo test`). |
-| `mixins/bedrock-bridge/horizon-mixin.toml` | The bundle: the `[[crate]]`, the injected session module, and the four `Session` hooks. |
-| `mixins/bedrock-bridge/session.rs` | The injected module `crate::net::bedrock`: session lifecycle, the client thread, and Bedrock→Java translation. |
-| `mixins/bedrock-bridge/hooks/` | Thin `horizon-mixins` helpers for `Session::connect` / `connect_transferred` / `send` / `disconnect`. |
+| `mixins/bedrock_bridge/engine/` | `bedrock-core`: the whole Bedrock stack, a standalone crate with no Horizon dependency (unit-tested with `cargo test`). |
+| `mixins/bedrock_bridge/horizon-mixin.toml` | The bundle: the `[[crate]]`, the injected session module, and the four `Session` hooks. |
+| `mixins/bedrock_bridge/session.rs` | The injected module `crate::net::bedrock`: session lifecycle, the client thread, and Bedrock→Java translation. |
+| `mixins/bedrock_bridge/hooks/` | Thin `horizon-mixins` helpers for `Session::connect` / `connect_transferred` / `send` / `disconnect`. |
 | `compatibility.json` | Pinned Horizon and horizon-mixins revisions. |
 
 ### `bedrock-core` (the engine)
@@ -77,6 +77,20 @@ scanned memory for the transport and protocol names. It confirmed:
 That analysis is why the transport is split behind RakNet (implemented) and NetherNet
 (WebRTC — out of scope; see below) rather than assuming the old RakNet-only world.
 
+## Install
+
+Native mods are compiled into the game, not dropped beside it. Build the file with
+`python3 tools/package.py` (it writes `target/bedrock_bridge-0.1.0.hnmod`), then either:
+
+* **Launcher:** put the `.hnmod` (or the `mixins/bedrock_bridge/` folder) in the instance's
+  `horizon-native-mods/`, open **Mods**, turn it on and press **Build**. Accept the native-mods
+  warning when asked (Settings ▸ Game ▸ Native mods). The launcher fetches the pinned commit's
+  source and its own Rust, then builds a private instance.
+* **CLI:** `horizon-launcher native-build target/bedrock_bridge-0.1.0.hnmod --trust-native-code`.
+
+Both compile on **Nightly 2026-10-30** (`ba6344a5`), the pin in `compatibility.json`; every mod a
+build combines must pin the same revision and the same horizon-mixins revision.
+
 ## Build and test
 
 The engine is a plain crate and needs no Horizon checkout:
@@ -106,11 +120,11 @@ Non-prefixed addresses default to port 19132 only when the prefix is present.
 
 ## Status and what is left
 
-**Verified against the pinned commit:** `horizon-mixins plan` and `apply` succeed (4 injections,
-1 module, 1 crate all resolve), and the staged workspace **compiles and links** —
-`cargo check`/`cargo build -p horizon-client --bin horizon-client --no-default-features` finish
-with no warnings and produce the `horizon-client` binary. So the injection, the engine crate and
-the whole dependency wiring are real, not just sketched.
+**Verified against the pinned commit (Nightly 2026-10-30, `ba6344a5`):** `horizon-mixins plan` and
+`apply` succeed (4 injections, 1 module, 1 crate all resolve), and the staged workspace
+**compiles and links** — `cargo check`/`cargo build -p horizon-client --bin horizon-client
+--no-default-features` finish with no warnings and produce the `horizon-client` binary. So the
+injection, the engine crate and the whole dependency wiring are real, not just sketched.
 
 Implemented and unit-tested: the wire codecs, RakNet, the login chain and Xbox auth, the
 mappings, and the session lifecycle + packet dispatch.

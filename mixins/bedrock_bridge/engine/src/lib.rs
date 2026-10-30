@@ -1,5 +1,5 @@
 //! `bedrock-core`: a Minecraft: Bedrock Edition **client** stack, written for the
-//! Horizon bedrock-bridge native mod.
+//! Horizon `bedrock_bridge` native mod.
 //!
 //! Horizon speaks Java Edition protocol 777 to servers through
 //! `horizon_protocol`. Bedrock servers speak an entirely different protocol over

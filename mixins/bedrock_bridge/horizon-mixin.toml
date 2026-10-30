@@ -1,10 +1,10 @@
 [mod]
-id = "bedrock-bridge"
+id = "bedrock_bridge"
 version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "8f4e570979ae85b954a3fc313ce89b7970fd8f87"
+horizon_revision = "ba6344a59cb9e755b730dcf02285fc0d33b97d3c"
 
 # The Bedrock stack (RakNet, codecs, Xbox auth, crypto, mappings) is this
 # bundle's own crate; the game glue in the two modules below is thin.

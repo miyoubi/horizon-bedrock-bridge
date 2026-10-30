@@ -1,13 +1,17 @@
 {
-  "horizon_revision": "8f4e570979ae85b954a3fc313ce89b7970fd8f87",
+  "horizon_revision": "ba6344a59cb9e755b730dcf02285fc0d33b97d3c",
+  "source_sha256": {
+    "crates/horizon-client/src/game.rs": "043c7853552104e8250b89987f0ff5de86cbcec0abece1d319c268e66644015f"
+  },
   "horizon_repository": "https://github.com/horizon-rust/horizon",
   "horizon_mixins_repository": "https://github.com/horizon-rust/horizon-mixins",
-  "horizon_mixins_revision": "0500ff24aa5933fca95a877ef41125353c4b4fe3",
+  "horizon_mixins_revision": "d9c83d7096b7ea5b83678da2efdfd6161f74997e",
   "mixin_schema": 6,
   "bedrock_protocol_version": 2225,
   "bedrock_version": "1.26.60",
   "notes": [
-    "Pins the Horizon commit the mod was written against and the horizon-mixins revision that stages it.",
-    "mixin_schema 6 is required for the bundle [[crate]] (the engine dependency)."
+    "Pins Nightly 2026-10-30 (ba6344a5) and horizon-mixins d9c83d7, matching horizon-native-mod-template.",
+    "mixin_schema 6 is required for the bundle [[crate]] (the engine dependency).",
+    "When moving to a newer Nightly, update horizon_revision here and in the manifest, and refresh source_sha256."
   ]
 }
