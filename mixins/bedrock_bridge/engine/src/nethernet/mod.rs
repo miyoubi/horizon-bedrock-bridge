@@ -14,6 +14,7 @@
 
 pub mod codec;
 pub mod discovery;
+pub mod http;
 pub mod message;
 pub mod signal;
 

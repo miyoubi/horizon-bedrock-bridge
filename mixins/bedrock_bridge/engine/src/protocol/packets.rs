@@ -172,8 +172,9 @@ impl NetworkSettings {
     }
 }
 
-/// The prefix of `StartGame` the bridge needs (position, mode, dimension, seed
-/// and level id). Later fields are not read: the game only needs the spawn.
+/// `StartGame`, decoded through the block palette (spawn, mode, seed, level id
+/// and the `runtime_id → block` palette). The trailing metadata is not needed
+/// to render, so decoding stops after the palette.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StartGame {
     pub entity_unique_id: i64,
@@ -188,9 +189,16 @@ pub struct StartGame {
     pub world_gamemode: i32,
     pub difficulty: i32,
     pub spawn: [i32; 3],
+    pub level_id: String,
+    pub world_name: String,
+    /// The server's block palette in runtime-id order: `(identifier, state NBT)`.
+    /// Chunk runtime ids index this, then map to Java block states.
+    pub palette: Vec<(String, crate::nbt::Tag)>,
 }
 
 impl StartGame {
+    /// Decode through the block palette (the trailing level metadata is not
+    /// needed to render the world, so decoding stops after the palette).
     pub fn read(r: &mut Reader) -> Result<StartGame> {
         let entity_unique_id = r.zigzag64()?;
         let entity_runtime_id = r.varlong()?;
@@ -207,6 +215,97 @@ impl StartGame {
         let _hardcore = r.bool()?;
         let difficulty = r.zigzag32()?;
         let spawn = [r.zigzag32()?, r.zigzag32()?, r.zigzag32()?];
+
+        // Level settings.
+        let _achievements_disabled = r.bool()?;
+        let _editor_world_type = r.zigzag32()?;
+        let _created_in_editor = r.bool()?;
+        let _exported_from_editor = r.bool()?;
+        let _editor_migration_version = r.u8()?;
+        let _day_cycle_stop = r.zigzag32()?;
+        let _edu_offer = r.varint()?;
+        let _edu_features = r.bool()?;
+        let _edu_product = r.string()?;
+        let _rain = r.f32()?;
+        let _lightning = r.f32()?;
+        let _platform_locked = r.bool()?;
+        let _multiplayer = r.bool()?;
+        let _broadcast_lan = r.bool()?;
+        let _xbl_intent = r.zigzag32()?;
+        let _platform_intent = r.zigzag32()?;
+        let _commands = r.bool()?;
+        let _texture_packs = r.bool()?;
+
+        // Game rules: uvarint count, each name + canBeChanged + type + value.
+        let rules = r.varint()?;
+        for _ in 0..rules {
+            let _name = r.string()?;
+            let _can_change = r.bool()?;
+            match r.varint()? {
+                1 => {
+                    let _ = r.bool()?;
+                }
+                2 => {
+                    let _ = r.i32()?;
+                }
+                3 => {
+                    let _ = r.f32()?;
+                }
+                _ => {}
+            }
+        }
+        // Experiments: LInt count, each name + enabled, then a bool.
+        let experiments = r.i32()?;
+        for _ in 0..experiments {
+            let _name = r.string()?;
+            let _enabled = r.bool()?;
+        }
+        let _any_experiment = r.bool()?;
+
+        let _bonus_chest = r.bool()?;
+        let _start_with_map = r.bool()?;
+        let _permission = r.u8()?;
+        let _chunk_tick_range = r.i32()?;
+        let _locked_behavior = r.bool()?;
+        let _locked_resource = r.bool()?;
+        let _from_locked_template = r.bool()?;
+        let _msa_gamertags = r.bool()?;
+        let _from_template = r.bool()?;
+        let _template_locked = r.bool()?;
+        let _only_v1_villagers = r.bool()?;
+        let _disabling_personas = r.bool()?;
+        let _disabling_custom_skins = r.bool()?;
+        let _emote_chat_muted = r.bool()?;
+        let _minecraft_version = r.string()?;
+        let _limited_width = r.i32()?;
+        let _limited_height = r.i32()?;
+        let _nether_type = r.bool()?;
+        let _edu_uri_button = r.string()?;
+        let _edu_uri_link = r.string()?;
+        let _experimental_gameplay = r.bool()?;
+        let _chat_restriction = r.u8()?;
+        let _disable_interactions = r.bool()?;
+        let _editor_connection_policy = r.zigzag32()?;
+        let _anon_block_drops = r.bool()?;
+
+        let level_id = r.string()?;
+        let world_name = r.string()?;
+        let _premium_template = r.string()?;
+        let _trial = r.bool()?;
+        let _rewind_history = r.zigzag32()?;
+        let _server_auth_block_breaking = r.bool()?;
+        let _current_tick = r.i64()?;
+        let _enchantment_seed = r.zigzag32()?;
+
+        // The block palette: uvarint count of (string identifier, network NBT).
+        let count = r.varint()?;
+        let mut palette = Vec::with_capacity((count as usize).min(4096));
+        for _ in 0..count {
+            let name = r.string()?;
+            let state = crate::nbt::read_named(r)?.1;
+            palette.push((name, state));
+        }
+
         Ok(StartGame {
             entity_unique_id,
             entity_runtime_id,
@@ -220,7 +319,17 @@ impl StartGame {
             world_gamemode,
             difficulty,
             spawn,
+            level_id,
+            world_name,
+            palette,
         })
+    }
+
+    /// The palette entry for a runtime block id (`identifier`, `state`).
+    pub fn block(&self, runtime_id: i32) -> Option<&(String, crate::nbt::Tag)> {
+        usize::try_from(runtime_id)
+            .ok()
+            .and_then(|i| self.palette.get(i))
     }
 }
 
