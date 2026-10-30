@@ -49,7 +49,27 @@ impl Session {
     ///
     /// `base` is the server's HTTP origin (e.g. `http://127.0.0.1:19132`).
     pub fn connect(base: &str, network_id: &str, identity: &ClientIdentity) -> Result<Session> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        // Bind to the signalling host when it is an IP (127.0.0.1 for a local
+        // server), so the host candidate is a real, routable address rather
+        // than 0.0.0.0.
+        let host = base
+            .split("://")
+            .nth(1)
+            .unwrap_or(base)
+            .split('/')
+            .next()
+            .unwrap_or(base);
+        let host = host
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host)
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let bind: SocketAddr = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, 0),
+            Err(_) => "0.0.0.0:0".parse().expect("literal"),
+        };
+        let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
         socket.set_nonblocking(false)?;
         let local_addr = socket.local_addr()?;
@@ -98,35 +118,53 @@ impl Session {
         pc.set_local_description(Instant::now(), offer.clone())
             .map_err(|e| Error::transport(format!("local description: {e}")))?;
 
-        // Make the offer match the NetherNet shape: no trickle, our host
-        // candidate in the reference's format, and end-of-candidates.
-        let sdp = pc
+        // NetherNet's parser reads the DTLS fingerprint and ICE credentials from
+        // the *media* section, but webrtc-rs writes the fingerprint at the
+        // session level. Rebuild the offer in the reference's exact shape,
+        // reusing the peer connection's own ufrag/pwd/fingerprint/setup so the
+        // handshake stays consistent.
+        let raw = pc
             .local_description()
             .map(|d| d.sdp)
             .unwrap_or(offer.sdp);
-        let sdp = sdp
-            .lines()
-            .filter(|l| !l.starts_with("a=ice-options:trickle"))
-            .collect::<Vec<_>>()
-            .join("\r\n");
-        let ufrag = sdp
-            .lines()
-            .find_map(|l| l.strip_prefix("a=ice-ufrag:"))
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let mut sdp = sdp;
-        if !sdp.contains("a=candidate:") {
-            let line = format!(
-                "a=candidate:1 1 udp 2130706431 {} {} typ host generation 0 ufrag {} network-id 0 network-cost 0\r\n",
-                local_addr.ip(),
-                local_addr.port(),
-                ufrag
-            );
-            sdp = insert_before_media_end(&sdp, &line);
-        }
-        let sdp = insert_before_media_end(&sdp, "a=end-of-candidates\r\n");
+        let grab = |key: &str| -> Option<String> {
+            raw.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(|v| v.trim().to_string())
+        };
+        let ufrag =
+            grab("a=ice-ufrag:").ok_or_else(|| Error::transport("offer has no ice-ufrag"))?;
+        let pwd = grab("a=ice-pwd:").ok_or_else(|| Error::transport("offer has no ice-pwd"))?;
+        let fingerprint = grab("a=fingerprint:")
+            .ok_or_else(|| Error::transport("offer has no fingerprint"))?;
+        let (alg, digest) = fingerprint
+            .split_once(' ')
+            .ok_or_else(|| Error::transport("malformed fingerprint"))?;
+        let dtls_role = match grab("a=setup:").as_deref() {
+            Some("active") => crate::nethernet::sdp::DtlsRole::Client,
+            _ => crate::nethernet::sdp::DtlsRole::Server,
+        };
+        let max_msg = grab("a=max-message-size:")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(65536);
+        let desc = crate::nethernet::sdp::Description {
+            ufrag,
+            pwd,
+            dtls_role,
+            fingerprint: (alg.to_string(), digest.to_string()),
+            sctp_max_message_size: max_msg,
+            identity: None,
+        };
+        let candidate = format!(
+            "candidate:1 1 udp 2130706431 {} {} typ host",
+            local_addr.ip(),
+            local_addr.port()
+        );
+        let sdp = desc.encode_full(&[candidate]);
 
+        if std::env::var_os("NETHER_DEBUG_SDP").is_some() {
+            eprintln!("--- OFFER SDP ---\n{sdp}\n--- END ---");
+        }
         let augmented = identity
             .augment(&sdp, SystemTime::now())
             .map_err(|e| Error::auth(format!("identity: {e}")))?;
@@ -261,15 +299,3 @@ impl Session {
     }
 }
 
-/// Insert `line` just before the final media-level line ends. SDP is
-/// line-oriented; appending before the trailing empty line keeps it in the
-/// media section.
-fn insert_before_media_end(sdp: &str, line: &str) -> String {
-    let mut out = String::with_capacity(sdp.len() + line.len() + 2);
-    out.push_str(sdp.trim_end_matches(['\r', '\n']));
-    if !out.ends_with(['\r', '\n']) {
-        out.push_str("\r\n");
-    }
-    out.push_str(line);
-    out
-}
