@@ -16,6 +16,7 @@ pub mod codec;
 pub mod discovery;
 pub mod http;
 pub mod identity;
+pub mod join;
 pub mod message;
 pub mod signal;
 
