@@ -38,6 +38,7 @@ pub mod crypto;
 pub mod error;
 pub mod mapping;
 pub mod nbt;
+pub mod nethernet;
 pub mod protocol;
 pub mod raknet;
 pub mod stream;
