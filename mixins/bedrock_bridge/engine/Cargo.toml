@@ -36,3 +36,8 @@ bytes = { version = "1.12.1", optional = true }
 # Builds the WebRTC driver. Default off so the portable layers test offline
 # without the heavy webrtc tree.
 nethernet-webrtc = ["dep:rtc", "dep:bytes"]
+
+[[example]]
+name = "netherjoin"
+path = "examples/netherjoin.rs"
+required-features = ["nethernet-webrtc"]
