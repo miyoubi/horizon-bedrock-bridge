@@ -177,6 +177,79 @@ impl Mappings {
     }
 }
 
+/// One entry of the GeyserMC `blocks.nbt` table (`bedrock_mappings`), indexed by
+/// the **Java block state id**.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BedrockBlockEntry {
+    /// The Bedrock identifier, when it differs from the Java one. Absent means
+    /// the Bedrock name is the Java block's identifier (the table's default).
+    pub bedrock_identifier: Option<String>,
+    /// The Bedrock block-state properties (`state`).
+    pub states: Option<crate::nbt::Tag>,
+}
+
+/// The GeyserMC `blocks.nbt` table: `java_state_id → Bedrock state`.
+///
+/// This is the mapping's native direction (Java → Bedrock), which is what the
+/// table stores. Chunk translation needs the reverse for each block in the
+/// server's palette; the glue resolves the Java *name* to a state id with
+/// Horizon's block registry, so only the entries whose Bedrock name differs
+/// need the explicit identifier.
+pub struct BedrockBlockMappings {
+    pub entries: Vec<BedrockBlockEntry>,
+}
+
+impl BedrockBlockMappings {
+    /// Load a gzip-compressed big-endian `blocks.nbt`.
+    pub fn load(path: &Path) -> crate::Result<Self> {
+        use std::io::Read;
+        let compressed = std::fs::read(path)?;
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut data)
+            .map_err(|e| crate::Error::other(format!("blocks.nbt gzip: {e}")))?;
+        Self::parse(&data)
+    }
+
+    /// Parse uncompressed big-endian NBT.
+    pub fn parse(data: &[u8]) -> crate::Result<Self> {
+        let root = crate::nbt::from_bytes_be(data)?;
+        let list = root
+            .get("bedrock_mappings")
+            .and_then(|t| t.as_list())
+            .ok_or_else(|| crate::Error::decode("blocks.nbt has no bedrock_mappings list"))?;
+        let entries = list
+            .iter()
+            .map(|e| BedrockBlockEntry {
+                bedrock_identifier: e.get_str("bedrock_identifier").map(str::to_owned),
+                states: e.get("state").cloned(),
+            })
+            .collect();
+        Ok(Self { entries })
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn entry(&self, java_state_id: usize) -> Option<&BedrockBlockEntry> {
+        self.entries.get(java_state_id)
+    }
+
+    /// The first Java state id whose Bedrock identifier and state match.
+    ///
+    /// `states` is compared structurally; an entry with no `state` matches only
+    /// an empty/absent query, and an entry with no `bedrock_identifier` is
+    /// skipped (its Bedrock name is the Java name, unknown to this table alone).
+    pub fn by_bedrock_state(&self, name: &str, states: Option<&crate::nbt::Tag>) -> Option<usize> {
+        self.entries.iter().position(|e| {
+            e.bedrock_identifier.as_deref() == Some(name) && e.states.as_ref() == states
+        })
+    }
+}
+
 /// A minimal, valid humanoid geometry so the client always renders.
 pub const HUMANOID_GEOMETRY: &str = "{\"format_version\":\"1.12.0\",\"minecraft:geometry\":[{\"description\":{\"identifier\":\"geometry.humanoid.custom\",\"texture_width\":64,\"texture_height\":64},\"bones\":[]}]}";
 
@@ -265,6 +338,44 @@ mod tests {
         )]);
         let ids = Mappings::parse_entity_identifiers(&nbt);
         assert_eq!(ids, vec!["minecraft:cow", "mymod:robot"]);
+    }
+
+    #[test]
+    fn loads_geyser_blocks_nbt_when_present() {
+        // Skips when the reference checkout is not beside this crate (e.g. in a
+        // staged native build).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../references/mappings-master/blocks.nbt");
+        if !path.is_file() {
+            return;
+        }
+        let m = BedrockBlockMappings::load(&path).unwrap();
+        assert_eq!(m.len(), 35723);
+        // Every entry is a compound; at least one carries an explicit Bedrock
+        // identifier (the rest default to the Java name).
+        assert!(m.entries.iter().any(|e| e.bedrock_identifier.is_some()));
+    }
+
+    #[test]
+    fn reverse_lookup_matches_identifier_and_state() {
+        let m = BedrockBlockMappings {
+            entries: vec![
+                BedrockBlockEntry {
+                    bedrock_identifier: None,
+                    states: None,
+                },
+                BedrockBlockEntry {
+                    bedrock_identifier: Some("minecraft:grass".into()),
+                    states: Some(crate::nbt::Tag::compound([("x", crate::nbt::Tag::Int(1))])),
+                },
+            ],
+        };
+        let states = crate::nbt::Tag::compound([("x", crate::nbt::Tag::Int(1))]);
+        assert_eq!(
+            m.by_bedrock_state("minecraft:grass", Some(&states)),
+            Some(1)
+        );
+        assert_eq!(m.by_bedrock_state("minecraft:stone", None), None);
     }
 
     #[test]

@@ -291,6 +291,132 @@ pub fn from_bytes(data: &[u8]) -> Result<Tag> {
     Ok(tag)
 }
 
+// -------------------------------------------------------------------------
+// Big-endian NBT: Java's file format, used by the GeyserMC mapping tables
+// (`blocks.nbt` and friends, gzip-compressed). Network NBT above is little
+// endian and varint-based; this is the classic big-endian form with fixed-width
+// ints and `u16`-length strings.
+// -------------------------------------------------------------------------
+
+/// Read a big-endian NBT document (type byte, name, payload).
+pub fn from_bytes_be(data: &[u8]) -> Result<Tag> {
+    let mut r = BeReader { data, pos: 0 };
+    let id = r.u8()?;
+    if id == tag_id::END {
+        return Ok(Tag::End);
+    }
+    let _name = r.string()?;
+    r.payload(id)
+}
+
+struct BeReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BeReader<'a> {
+    fn need(&self, n: usize) -> Result<()> {
+        if self.data.len() - self.pos < n {
+            return Err(Error::decode("big-endian NBT truncated"));
+        }
+        Ok(())
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.need(n)?;
+        let b = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(b)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn i16(&mut self) -> Result<i16> {
+        let b = self.take(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+    fn i32(&mut self) -> Result<i32> {
+        let b = self.take(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn i64(&mut self) -> Result<i64> {
+        let b = self.take(8)?;
+        Ok(i64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    fn string(&mut self) -> Result<String> {
+        let len = u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as usize;
+        let bytes = self.take(len)?;
+        String::from_utf8(bytes.to_vec()).map_err(|e| Error::decode(format!("bad utf-8: {e}")))
+    }
+    fn payload(&mut self, id: u8) -> Result<Tag> {
+        Ok(match id {
+            tag_id::END => Tag::End,
+            tag_id::BYTE => Tag::Byte(self.u8()? as i8),
+            tag_id::SHORT => Tag::Short(self.i16()?),
+            tag_id::INT => Tag::Int(self.i32()?),
+            tag_id::LONG => Tag::Long(self.i64()?),
+            tag_id::FLOAT => Tag::Float(f32::from_bits(self.i32()? as u32)),
+            tag_id::DOUBLE => Tag::Double(f64::from_bits(self.i64()? as u64)),
+            tag_id::BYTE_ARRAY => {
+                let len = self.i32()?;
+                if len < 0 {
+                    return Err(Error::decode("negative byte-array length"));
+                }
+                Tag::ByteArray(self.take(len as usize)?.to_vec())
+            }
+            tag_id::STRING => Tag::String(self.string()?),
+            tag_id::LIST => {
+                let elem = self.u8()?;
+                let len = self.i32()?;
+                if len < 0 {
+                    return Err(Error::decode("negative list length"));
+                }
+                let mut items = Vec::with_capacity((len as usize).min(1024));
+                for _ in 0..len {
+                    items.push(self.payload(elem)?);
+                }
+                Tag::List(items)
+            }
+            tag_id::COMPOUND => {
+                let mut fields = Vec::new();
+                loop {
+                    let id = self.u8()?;
+                    if id == tag_id::END {
+                        break;
+                    }
+                    let name = self.string()?;
+                    fields.push((name, self.payload(id)?));
+                }
+                Tag::Compound(fields)
+            }
+            tag_id::INT_ARRAY => {
+                let len = self.i32()?;
+                if len < 0 {
+                    return Err(Error::decode("negative int-array length"));
+                }
+                let mut items = Vec::with_capacity((len as usize).min(4096));
+                for _ in 0..len {
+                    items.push(self.i32()?);
+                }
+                Tag::IntArray(items)
+            }
+            tag_id::LONG_ARRAY => {
+                let len = self.i32()?;
+                if len < 0 {
+                    return Err(Error::decode("negative long-array length"));
+                }
+                let mut items = Vec::with_capacity((len as usize).min(4096));
+                for _ in 0..len {
+                    items.push(self.i64()?);
+                }
+                Tag::LongArray(items)
+            }
+            other => return Err(Error::decode(format!("unknown NBT tag id {other}"))),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +461,16 @@ mod tests {
         let mut w = Writer::new();
         write_named(&mut w, "", &Tag::End);
         assert_eq!(w.data, vec![tag_id::END]);
+    }
+
+    #[test]
+    fn big_endian_root_decodes() {
+        // compound{} { int x = 5 }
+        let bytes = [10, 0, 0, 3, 0, 1, b'x', 0, 0, 0, 5, 0];
+        assert_eq!(
+            from_bytes_be(&bytes).unwrap(),
+            Tag::compound([("x", Tag::Int(5))])
+        );
     }
 
     #[test]
