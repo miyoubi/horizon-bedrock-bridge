@@ -110,8 +110,9 @@ impl Aes256 {
     }
 
     fn add_round_key(&self, state: &mut [u8; BLOCK], round: usize) {
-        for i in 0..BLOCK {
-            state[i] ^= self.round_keys[round * BLOCK + i];
+        let key = &self.round_keys[round * BLOCK..(round + 1) * BLOCK];
+        for (s, k) in state.iter_mut().zip(key) {
+            *s ^= *k;
         }
     }
 
@@ -219,7 +220,7 @@ pub fn pad(buf: &mut Vec<u8>) {
 /// Strip the discovery padding, verifying every pad byte.
 pub fn unpad(buf: &mut Vec<u8>) -> Option<()> {
     let len = buf.len();
-    if len == 0 || len % BLOCK != 0 {
+    if len == 0 || !len.is_multiple_of(BLOCK) {
         return None;
     }
     let padding_len = *buf.last()? as usize;
