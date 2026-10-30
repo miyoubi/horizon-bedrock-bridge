@@ -41,6 +41,7 @@ Everything below the Horizon glue, in one testable crate:
 * `crypto` — ES384 identity key + JWT signing, X25519 handshake key, AES-256-GCM stream cipher, `ServerToClientHandshake` parsing (`ring`).
 * `auth` — Xbox Live device-code sign-in, the user/device/title/XSTS chain with the ES256 proof-of-key signature header, the Minecraft JWT chain, and the client-data (skin) JWT.
 * `mapping` — Bedrock↔Java block-range and biome tables (loaded from the GeyserMC mappings), the **addon entity registry** (custom entities from `AvailableEntityIdentifiers`), and the skin helpers.
+* `nethernet` — the portable half of the WebRTC transport newer clients use: the wire codec, data-channel segmentation/reassembly, the signaling message and the discovery constants (the connection half needs a WebRTC stack, see below).
 * `client` — ties it together: RakNet connect, zlib batch compression, the login handshake state machine, login/encryption/resource-pack handling.
 
 ### Xbox authentication
@@ -142,9 +143,11 @@ The parts that still need work, in order of importance:
    is needed for full parity.
 3. **Inventories and interaction.** `InventoryContent`/`InventorySlot` → Java container
    packets, and `ContainerClick`/`UseItemOn` → `InventoryTransaction`/`ItemStackRequest`.
-4. **NetherNet.** Servers that have moved off RakNet need the WebRTC/DTLS/SCTP transport and
-   the JSON-RPC signalling client. That is a large, separate piece; RakNet still reaches
-   servers on 19132.
+4. **NetherNet.** The portable layers are ported (`bedrock_core::nethernet`: codec, message
+   segmentation, signaling, constants, `Transport` selection). The connection half — ICE, DTLS,
+   SCTP and the data channels — needs a WebRTC stack, and a bundle crate may only use crates
+   already in Horizon's `Cargo.lock`, where no WebRTC stack exists. Until Horizon carries one,
+   RakNet (on 19132) is the working transport.
 5. **The handshake cipher.** The key/IV derivation is the documented modern scheme; the
    AES-GCM nonce layout is isolated in `crypto::Cipher` and should be confirmed against a
    live online-mode server.

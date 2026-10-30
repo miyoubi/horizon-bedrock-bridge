@@ -41,6 +41,9 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
+    /// Last position sent to the server; rotation-only updates reuse it, so a
+    /// MovePlayerRot never looks like a teleport to (0,0,0).
+    position: Mutex<[f32; 3]>,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -66,6 +69,7 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
+        position: Mutex::new([0.0; 3]),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -467,6 +471,31 @@ mod translate {
                     on_ground: m.on_ground,
                 }),
             ))],
+            bp::Packet::SetEntityMotion {
+                runtime_id,
+                velocity,
+            } => vec![Event::Packet(Box::new(play::Clientbound::SetEntityMotion(
+                play::SetEntityMotion {
+                    id: *runtime_id as i32,
+                    velocity: [velocity[0] as f64, velocity[1] as f64, velocity[2] as f64],
+                },
+            )))],
+            bp::Packet::Animate { action, runtime_id } => vec![Event::Packet(Box::new(
+                play::Clientbound::Animate(play::Animate {
+                    id: *runtime_id as i32,
+                    action: *action as u8,
+                }),
+            ))],
+            bp::Packet::SetSpawnPosition { position } => vec![Event::Packet(Box::new(
+                play::Clientbound::SetDefaultSpawnPosition(play::SetDefaultSpawnPosition {
+                    pos: play::GlobalPos {
+                        dimension: "minecraft:overworld".into(),
+                        pos: *position,
+                    },
+                    yaw: 0.0,
+                    pitch: 0.0,
+                }),
+            ))],
             bp::Packet::RemoveEntity(id) => vec![Event::Packet(Box::new(
                 play::Clientbound::RemoveEntities(play::RemoveEntities {
                     ids: vec![*id as i32],
@@ -490,24 +519,45 @@ mod translate {
     pub fn serverbound(bridge: &Bridge, packet: &play::Serverbound) -> Vec<bp::Out> {
         let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
         match packet {
-            play::Serverbound::MovePlayerPos(p) => vec![bp::Out::MovePlayer {
-                runtime_id,
-                position: [p.x as f32, p.y as f32, p.z as f32],
-                pitch: 0.0,
-                yaw: 0.0,
-                head_yaw: 0.0,
-                mode: 0,
-                on_ground: p.flags & 1 != 0,
-            }],
-            play::Serverbound::MovePlayerPosRot(p) => vec![bp::Out::MovePlayer {
-                runtime_id,
-                position: [p.x as f32, p.y as f32, p.z as f32],
-                pitch: p.pitch,
-                yaw: p.yaw,
-                head_yaw: p.yaw,
-                mode: 0,
-                on_ground: p.flags & 1 != 0,
-            }],
+            play::Serverbound::MovePlayerPos(p) => {
+                let pos = [p.x as f32, p.y as f32, p.z as f32];
+                *bridge.position.lock().unwrap() = pos;
+                vec![bp::Out::MovePlayer {
+                    runtime_id,
+                    position: pos,
+                    pitch: 0.0,
+                    yaw: 0.0,
+                    head_yaw: 0.0,
+                    mode: 0,
+                    on_ground: p.flags & 1 != 0,
+                }]
+            }
+            play::Serverbound::MovePlayerPosRot(p) => {
+                let pos = [p.x as f32, p.y as f32, p.z as f32];
+                *bridge.position.lock().unwrap() = pos;
+                vec![bp::Out::MovePlayer {
+                    runtime_id,
+                    position: pos,
+                    pitch: p.pitch,
+                    yaw: p.yaw,
+                    head_yaw: p.yaw,
+                    mode: 0,
+                    on_ground: p.flags & 1 != 0,
+                }]
+            }
+            play::Serverbound::MovePlayerRot(p) => {
+                // Rotation only: keep the last position so it is not a teleport.
+                let pos = *bridge.position.lock().unwrap();
+                vec![bp::Out::MovePlayer {
+                    runtime_id,
+                    position: pos,
+                    pitch: p.pitch,
+                    yaw: p.yaw,
+                    head_yaw: p.yaw,
+                    mode: 0,
+                    on_ground: p.flags & 1 != 0,
+                }]
+            }
             play::Serverbound::Chat(c) => vec![bp::Out::Text {
                 kind: 1,
                 source: String::new(),
