@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use horizon_protocol::packets::play;
-use horizon_protocol::registry::{Builtin, Dynamic};
+use horizon_protocol::registry::Builtin;
 
 use super::{Cookies, Event, Session};
 
@@ -41,7 +41,8 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
-    joined: AtomicBool,
+    /// Set when the game drops the session, so the thread ends.
+    shutdown: AtomicBool,
 }
 
 static BRIDGES: OnceLock<Mutex<HashMap<String, Arc<Bridge>>>> = OnceLock::new();
@@ -65,7 +66,7 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
-        joined: AtomicBool::new(false),
+        shutdown: AtomicBool::new(false),
     });
     bridges()
         .lock()
@@ -74,10 +75,11 @@ pub fn try_connect(
 
     let addr = address.to_owned();
     let name = name.to_owned();
+    let thread_name = name.clone();
     let thread = std::thread::Builder::new()
         .name("horizon-bedrock".into())
         .spawn(move || {
-            run(&addr, &name, view_distance, &resources, &send, out_rx, &bridge);
+            run(&addr, &thread_name, view_distance, &resources, &send, out_rx, &bridge);
         })
         .ok();
 
@@ -116,8 +118,7 @@ pub fn send(session: &Session, packet: &play::Serverbound) -> bool {
 /// The session is going away: tell the thread to stop.
 pub fn on_disconnect(address: &str) {
     if let Some(bridge) = bridges().lock().unwrap().remove(address) {
-        // Dropping the last Sender ends the thread's receive loop.
-        drop(bridge);
+        bridge.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -148,7 +149,7 @@ fn run(
     };
 
     // Xbox sign-in (device code), then the Minecraft JWT chain.
-    let login = match crate::bedrock::auth::sign_in(&host, port) {
+    let login = match auth::sign_in(&host, port) {
         Ok(l) => l,
         Err(e) => {
             let _ = events.send(Event::Disconnected {
@@ -183,24 +184,34 @@ fn run(
         mappings: &mappings,
         runtime_id: 0,
         unique_id: 0,
-        spawned: false,
     };
 
-    while !bridge_shutdown(events) {
-        // Outbound Java → Bedrock.
-        while let Ok(batch) = outbound.try_recv() {
-            if let Err(e) = client.send(&batch) {
-                log::warn!("bedrock: send failed: {e}");
+    loop {
+        // Outbound Java → Bedrock. The channel closing (or the game signalling
+        // shutdown) ends the thread.
+        let mut alive = true;
+        loop {
+            match outbound.try_recv() {
+                Ok(batch) => {
+                    if let Err(e) = client.send(&batch) {
+                        log::warn!("bedrock: send failed: {e}");
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    alive = false;
+                    break;
+                }
             }
+        }
+        if !alive || bridge.shutdown.load(Ordering::Relaxed) {
+            break;
         }
         // Bedrock → Java.
         match client.poll() {
             Ok(packets) => {
                 for packet in packets {
                     for event in translate::clientbound(&mut ctx, &packet) {
-                        if matches!(event, Event::Joined { .. }) {
-                            bridge.joined.store(true, Ordering::Relaxed);
-                        }
                         let _ = events.send(event);
                     }
                     // React to the resource-pack phase automatically.
@@ -235,27 +246,23 @@ fn run(
     let _ = name;
 }
 
-/// The thread stops when the game drops the `Receiver` (its `Session`).
-fn bridge_shutdown(_events: &mpsc::Sender<Event>) -> bool {
-    // A send failure means the game is gone; checked on the next send.
-    false
-}
-
 // -------------------------------------------------------------------------
 // Translation: Bedrock packets → Horizon's Java clientbound packets.
 // -------------------------------------------------------------------------
 mod translate {
-    use super::*;
+    use super::{Bridge, Event};
     use bedrock_core::protocol as bp;
-    use horizon_protocol::nbt::Tag;
+    use horizon_protocol::packets::play;
+    use horizon_protocol::registry::{Builtin, Dynamic};
     use horizon_world::nbt::{JavaString, Tag as JTag};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     pub struct Context<'a> {
         pub builtin: &'a Builtin,
         pub mappings: &'a bedrock_core::mapping::Mappings,
         pub runtime_id: u64,
         pub unique_id: i64,
-        pub spawned: bool,
     }
 
     fn entity_type_id(ctx: &Context, java_name: &str) -> i32 {
@@ -265,7 +272,8 @@ mod translate {
             .unwrap_or(0)
     }
 
-    /// Bedrock network NBT → Java NBT.
+    /// Bedrock network NBT → Java NBT (used once block entities are translated).
+    #[allow(dead_code)]
     pub fn nbt(tag: &bedrock_core::nbt::Tag) -> JTag {
         use bedrock_core::nbt::Tag as B;
         match tag {
@@ -290,17 +298,11 @@ mod translate {
         }
     }
 
-    fn text_component(message: &str) -> Tag {
-        // Horizon's `Tag` here is the world NBT tag used by the packet.
-        let _ = message;
-        JTag::compound([(
-            "text",
-            JTag::String(JavaString::from(message)),
-        )])
+    fn text_component(message: &str) -> JTag {
+        JTag::compound([("text", JTag::String(JavaString::from(message)))])
     }
 
     pub fn clientbound(ctx: &mut Context, packet: &bp::Packet) -> Vec<Event> {
-        let _ = text_component; // used for chat below
         match packet {
             bp::Packet::StartGame(g) => {
                 let spawn = play::SpawnInfo {
@@ -490,12 +492,21 @@ mod translate {
         match packet {
             play::Serverbound::MovePlayerPos(p) => vec![bp::Out::MovePlayer {
                 runtime_id,
-                position: [p.position[0] as f32, p.position[1] as f32, p.position[2] as f32],
+                position: [p.x as f32, p.y as f32, p.z as f32],
                 pitch: 0.0,
                 yaw: 0.0,
                 head_yaw: 0.0,
                 mode: 0,
-                on_ground: p.on_ground,
+                on_ground: p.flags & 1 != 0,
+            }],
+            play::Serverbound::MovePlayerPosRot(p) => vec![bp::Out::MovePlayer {
+                runtime_id,
+                position: [p.x as f32, p.y as f32, p.z as f32],
+                pitch: p.pitch,
+                yaw: p.yaw,
+                head_yaw: p.yaw,
+                mode: 0,
+                on_ground: p.flags & 1 != 0,
             }],
             play::Serverbound::Chat(c) => vec![bp::Out::Text {
                 kind: 1,
@@ -515,7 +526,6 @@ mod translate {
 // The Xbox sign-in helper is kept beside the session glue so the game thread
 // can show its device code as a status line.
 mod auth {
-    use super::*;
     use bedrock_core::auth as core_auth;
 
     pub struct SignedIn {

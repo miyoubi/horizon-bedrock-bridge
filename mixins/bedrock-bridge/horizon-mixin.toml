@@ -21,14 +21,13 @@ file = "crates/horizon-client/src/net.rs"
 name = "bedrock"
 source = "session.rs"
 
-# `Session::connect` is replaced for a Bedrock address: a cancellable HEAD hook
-# returns the bridge's own Session and leaves the original path untouched for a
-# Java address (Continue(()) lets the original body run).
+# `Session::connect` returns `Self`, which a cancellable HEAD cannot carry, so it
+# is replaced instead: the helper returns the bridge's Session for a Bedrock
+# address and otherwise delegates to the original `Session::start`.
 [[injection]]
 id = "connect"
 target = "horizon_client::net::Session::connect"
-kind = "HEAD"
-cancellable = true
+kind = "OVERWRITE"
 helper = "hooks/connect.rs"
 bindings = [
     { name = "address", ty = "&str", value = "address" },
@@ -42,8 +41,7 @@ bindings = [
 [[injection]]
 id = "connect-transferred"
 target = "horizon_client::net::Session::connect_transferred"
-kind = "HEAD"
-cancellable = true
+kind = "OVERWRITE"
 helper = "hooks/connect_transferred.rs"
 bindings = [
     { name = "address", ty = "&str", value = "address" },

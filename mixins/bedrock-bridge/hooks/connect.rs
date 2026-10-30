@@ -1,6 +1,5 @@
-// Cancellable HEAD of Session::connect: for a `bedrock:` address the bridge
-// builds the Session and Break returns it, skipping the Java connection path;
-// `Continue(())` leaves every other address to the original body.
+// Body of Session::connect: a Bedrock address becomes the bridge's Session,
+// every other address keeps the original path (Session::start with no pipe).
 fn connect(
     address: &str,
     name: &str,
@@ -8,10 +7,20 @@ fn connect(
     view_distance: i8,
     lang: ::std::sync::Arc<horizon_protocol::text::Language>,
     resources: ::std::path::PathBuf,
-) -> ::core::ops::ControlFlow<crate::net::Session> {
-    let _ = (auth, lang);
-    match crate::net::bedrock::try_connect(address, name, view_distance, resources) {
-        Some(session) => ::core::ops::ControlFlow::Break(session),
-        None => ::core::ops::ControlFlow::Continue(()),
+) -> crate::net::Session {
+    if let Some(session) =
+        crate::net::bedrock::try_connect(address, name, view_distance, resources.clone())
+    {
+        return session;
     }
+    crate::net::Session::start(
+        address,
+        name,
+        auth,
+        view_distance,
+        lang,
+        None,
+        None,
+        resources,
+    )
 }

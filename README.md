@@ -106,6 +106,12 @@ Non-prefixed addresses default to port 19132 only when the prefix is present.
 
 ## Status and what is left
 
+**Verified against the pinned commit:** `horizon-mixins plan` and `apply` succeed (4 injections,
+1 module, 1 crate all resolve), and the staged workspace **compiles and links** —
+`cargo check`/`cargo build -p horizon-client --bin horizon-client --no-default-features` finish
+with no warnings and produce the `horizon-client` binary. So the injection, the engine crate and
+the whole dependency wiring are real, not just sketched.
+
 Implemented and unit-tested: the wire codecs, RakNet, the login chain and Xbox auth, the
 mappings, and the session lifecycle + packet dispatch.
 

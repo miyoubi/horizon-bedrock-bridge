@@ -1,6 +1,5 @@
-// Cancellable HEAD of Session::connect_transferred: a transfer to a Bedrock
-// address is not supported yet, so a Bedrock target is refused by letting the
-// original path run (which will simply fail to connect).
+// Body of Session::connect_transferred: a transfer keeps the original path
+// (cookies carried); a Bedrock transfer is not supported yet.
 fn connect_transferred(
     address: &str,
     name: &str,
@@ -9,10 +8,18 @@ fn connect_transferred(
     lang: ::std::sync::Arc<horizon_protocol::text::Language>,
     cookies: crate::net::Cookies,
     resources: ::std::path::PathBuf,
-) -> ::core::ops::ControlFlow<crate::net::Session> {
-    let _ = (name, auth, view_distance, lang, cookies, resources);
+) -> crate::net::Session {
     if crate::net::bedrock::is_bedrock(address) {
         eprintln!("[bedrock] transfers to a Bedrock address are not supported yet");
     }
-    ::core::ops::ControlFlow::Continue(())
+    crate::net::Session::start(
+        address,
+        name,
+        auth,
+        view_distance,
+        lang,
+        None,
+        Some(cookies),
+        resources,
+    )
 }
