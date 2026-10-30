@@ -1,0 +1,6 @@
+[workspace]
+members = ["mixins/bedrock-bridge/engine"]
+resolver = "2"
+
+# The bundle crate is a member so `cargo test` here exercises the Bedrock stack on
+# its own, with no Horizon checkout and no Minecraft resources (see README).

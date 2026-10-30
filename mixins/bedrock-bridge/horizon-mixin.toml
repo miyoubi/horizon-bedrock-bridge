@@ -1,0 +1,79 @@
+[mod]
+id = "bedrock-bridge"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "8f4e570979ae85b954a3fc313ce89b7970fd8f87"
+
+# The Bedrock stack (RakNet, codecs, Xbox auth, crypto, mappings) is this
+# bundle's own crate; the game glue in the two modules below is thin.
+[[crate]]
+id = "engine"
+path = "engine"
+dependent = "horizon-client"
+
+# The session bridge lives in the client's `net` module: it can reach Session's
+# private fields and SocketWriter state, and it owns the translation module.
+[[module]]
+id = "session"
+file = "crates/horizon-client/src/net.rs"
+name = "bedrock"
+source = "session.rs"
+
+# `Session::connect` is replaced for a Bedrock address: a cancellable HEAD hook
+# returns the bridge's own Session and leaves the original path untouched for a
+# Java address (Continue(()) lets the original body run).
+[[injection]]
+id = "connect"
+target = "horizon_client::net::Session::connect"
+kind = "HEAD"
+cancellable = true
+helper = "hooks/connect.rs"
+bindings = [
+    { name = "address", ty = "&str", value = "address" },
+    { name = "name", ty = "&str", value = "name" },
+    { name = "auth", ty = "Option<::std::sync::Arc<crate::auth::AuthSession>>", value = "auth" },
+    { name = "view_distance", ty = "i8", value = "view_distance" },
+    { name = "lang", ty = "::std::sync::Arc<horizon_protocol::text::Language>", value = "lang" },
+    { name = "resources", ty = "::std::path::PathBuf", value = "resources" },
+]
+
+[[injection]]
+id = "connect-transferred"
+target = "horizon_client::net::Session::connect_transferred"
+kind = "HEAD"
+cancellable = true
+helper = "hooks/connect_transferred.rs"
+bindings = [
+    { name = "address", ty = "&str", value = "address" },
+    { name = "name", ty = "&str", value = "name" },
+    { name = "auth", ty = "Option<::std::sync::Arc<crate::auth::AuthSession>>", value = "auth" },
+    { name = "view_distance", ty = "i8", value = "view_distance" },
+    { name = "lang", ty = "::std::sync::Arc<horizon_protocol::text::Language>", value = "lang" },
+    { name = "cookies", ty = "crate::net::Cookies", value = "cookies" },
+    { name = "resources", ty = "::std::path::PathBuf", value = "resources" },
+]
+
+# Outgoing play packets for a Bedrock session are translated instead of encoded
+# over the Java socket. A cancellable HEAD returns Break(()) after handing the
+# packet to the bridge, so the original encoder never runs.
+[[injection]]
+id = "send"
+target = "horizon_client::net::Session::send"
+kind = "HEAD"
+cancellable = true
+helper = "hooks/send.rs"
+bindings = [
+    { name = "session", ty = "&crate::net::Session", value = "self" },
+    { name = "packet", ty = "&horizon_protocol::packets::play::Serverbound", value = "&packet" },
+]
+
+[[injection]]
+id = "disconnect"
+target = "horizon_client::net::Session::disconnect"
+kind = "HEAD"
+helper = "hooks/disconnect.rs"
+bindings = [
+    { name = "session", ty = "&mut crate::net::Session", value = "self" },
+]
