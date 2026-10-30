@@ -80,17 +80,20 @@ impl Session {
             .map_err(|e| Error::transport(format!("peer connection: {e}")))?;
 
         // Reliable (ordered) and unreliable (unordered, no retransmits) channels.
-        let _ = pc
+        // Keep their ids: locally-created channels do not raise OnDataChannel.
+        let reliable = pc
             .create_data_channel(RELIABLE_CHANNEL, None)
-            .map_err(|e| Error::transport(format!("data channel: {e}")))?;
+            .map_err(|e| Error::transport(format!("data channel: {e}")))?
+            .id();
         let unordered = rtc::data_channel::RTCDataChannelInit {
             ordered: false,
             max_retransmits: Some(0),
             ..Default::default()
         };
-        let _ = pc
+        let _unreliable = pc
             .create_data_channel(UNRELIABLE_CHANNEL, Some(unordered))
-            .map_err(|e| Error::transport(format!("data channel: {e}")))?;
+            .map_err(|e| Error::transport(format!("data channel: {e}")))?
+            .id();
 
         // Register our UDP host candidate so the server can reach this socket.
         let candidate = CandidateHostConfig {
@@ -123,10 +126,7 @@ impl Session {
         // session level. Rebuild the offer in the reference's exact shape,
         // reusing the peer connection's own ufrag/pwd/fingerprint/setup so the
         // handshake stays consistent.
-        let raw = pc
-            .local_description()
-            .map(|d| d.sdp)
-            .unwrap_or(offer.sdp);
+        let raw = pc.local_description().map(|d| d.sdp).unwrap_or(offer.sdp);
         let grab = |key: &str| -> Option<String> {
             raw.lines()
                 .find_map(|l| l.strip_prefix(key))
@@ -135,8 +135,8 @@ impl Session {
         let ufrag =
             grab("a=ice-ufrag:").ok_or_else(|| Error::transport("offer has no ice-ufrag"))?;
         let pwd = grab("a=ice-pwd:").ok_or_else(|| Error::transport("offer has no ice-pwd"))?;
-        let fingerprint = grab("a=fingerprint:")
-            .ok_or_else(|| Error::transport("offer has no fingerprint"))?;
+        let fingerprint =
+            grab("a=fingerprint:").ok_or_else(|| Error::transport("offer has no fingerprint"))?;
         let (alg, digest) = fingerprint
             .split_once(' ')
             .ok_or_else(|| Error::transport("malformed fingerprint"))?;
@@ -179,7 +179,7 @@ impl Session {
             pc,
             socket,
             local_addr,
-            reliable: None,
+            reliable: Some(reliable),
             ready: false,
         })
     }
@@ -298,4 +298,3 @@ impl Session {
         let _ = self.pc.close();
     }
 }
-

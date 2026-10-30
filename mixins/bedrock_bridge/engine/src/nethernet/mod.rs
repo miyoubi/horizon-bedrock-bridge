@@ -12,6 +12,7 @@
 //! here is dependency-light and unit-tested, so it is ready to plug into a
 //! session as soon as the media stack is available.
 
+pub mod auth_service;
 pub mod codec;
 pub mod discovery;
 pub mod http;

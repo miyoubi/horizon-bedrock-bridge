@@ -307,6 +307,9 @@ pub struct ClientIdentity {
     key: IdentityKey,
     domain: String,
     lifetime: Option<Duration>,
+    /// A token minted by the Minecraft authorization service (RS256, `cpk` =
+    /// our key). When set it replaces the self-signed token.
+    external_token: Option<String>,
 }
 
 impl ClientIdentity {
@@ -315,7 +318,26 @@ impl ClientIdentity {
             key,
             domain: DEFAULT_DOMAIN.to_string(),
             lifetime: Some(DEFAULT_TOKEN_LIFETIME),
+            external_token: None,
         }
+    }
+
+    /// Use a token minted by the Minecraft authorization service instead of the
+    /// self-signed one. `key` must be the same P-384 key whose public DER was
+    /// sent as the token's `cpk`, so the fingerprint signature still validates.
+    pub fn external(key: IdentityKey, token: impl Into<String>) -> Self {
+        Self {
+            key,
+            domain: DEFAULT_DOMAIN.to_string(),
+            lifetime: None,
+            external_token: Some(token.into()),
+        }
+    }
+
+    /// The P-384 public key as DER SubjectPublicKeyInfo (the `publicKey` sent to
+    /// `multiplayer/session/start`).
+    pub fn public_key_der(&self) -> Vec<u8> {
+        self.key.public_der()
     }
 
     pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
@@ -347,8 +369,11 @@ impl ClientIdentity {
         })
     }
 
-    /// A token issued at `now`.
+    /// The identity token: the externally minted one, or a self-signed token.
     pub fn token(&self, now: SystemTime) -> Result<String> {
+        if let Some(token) = &self.external_token {
+            return Ok(token.clone());
+        }
         let mut claims = json!({ "cpk": self.cpk(), "iat": seconds(now) });
         if !self.domain.is_empty() {
             claims["iss"] = json!(self.domain);

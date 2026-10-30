@@ -41,3 +41,8 @@ nethernet-webrtc = ["dep:rtc", "dep:bytes"]
 name = "netherjoin"
 path = "examples/netherjoin.rs"
 required-features = ["nethernet-webrtc"]
+
+[[example]]
+name = "netherjoin_auth"
+path = "examples/netherjoin_auth.rs"
+required-features = ["nethernet-webrtc"]

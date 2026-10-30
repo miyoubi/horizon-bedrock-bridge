@@ -24,15 +24,16 @@ use ring::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The Xbox Live device-code OAuth client id (Minecraft).
-pub const CLIENT_ID: &str = "00000000402b5328";
+/// The Bedrock (Android) title client id, used with the LIVE device-code flow.
+pub const CLIENT_ID: &str = "0000000048183522";
 /// The scope that yields an Xbox Live capable token.
 pub const SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
 
-const DEVICE_CODE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
-const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+const DEVICE_CODE_URL: &str = "https://login.live.com/oauth20_connect.srf";
+const TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
 const USER_AUTH_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
 const DEVICE_AUTH_URL: &str = "https://device.auth.xboxlive.com/device/authenticate";
+#[allow(dead_code)]
 const TITLE_AUTH_URL: &str = "https://title.auth.xboxlive.com/title/authenticate";
 const XSTS_AUTH_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const MINECRAFT_AUTH_URL: &str = "https://multiplayer.minecraft.net/authentication";
@@ -62,11 +63,14 @@ pub struct DeviceCode {
 /// Start the device-code flow. The caller shows `user_code` and
 /// `verification_uri`, then calls [`poll_device_code`].
 pub fn begin_device_code() -> Result<DeviceCode> {
-    let body = serde_json::json!({ "client_id": CLIENT_ID, "scope": SCOPE });
     let response = agent()
         .post(DEVICE_CODE_URL)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_form(&[
+            ("client_id", CLIENT_ID),
+            ("scope", SCOPE),
+            ("response_type", "device_code"),
+        ])
         .map_err(|e| Error::auth(format!("device code request failed: {e}")))?;
     let json: serde_json::Value = serde_json::from_str(&response.into_string().unwrap_or_default())
         .map_err(|e| Error::auth(format!("device code response was not JSON: {e}")))?;
@@ -84,16 +88,14 @@ pub fn begin_device_code() -> Result<DeviceCode> {
 /// Poll the token endpoint once. `Ok(None)` means the player has not finished
 /// signing in yet.
 pub fn poll_device_code(code: &DeviceCode) -> Result<Option<MsaToken>> {
-    let body = serde_json::json!({
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "client_id": CLIENT_ID,
-        "device_code": code.device_code,
-    });
     match agent()
         .post(TOKEN_URL)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-    {
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_form(&[
+            ("client_id", CLIENT_ID),
+            ("grant_type", "device_code"),
+            ("device_code", &code.device_code),
+        ]) {
         Ok(response) => {
             let json: serde_json::Value =
                 serde_json::from_str(&response.into_string().unwrap_or_default())
@@ -120,16 +122,15 @@ pub fn poll_device_code(code: &DeviceCode) -> Result<Option<MsaToken>> {
 
 /// Refresh an existing MSA token with its refresh token.
 pub fn refresh(refresh_token: &str) -> Result<MsaToken> {
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "client_id": CLIENT_ID,
-        "refresh_token": refresh_token,
-        "scope": SCOPE,
-    });
     let response = agent()
         .post(TOKEN_URL)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_form(&[
+            ("client_id", CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("scope", SCOPE),
+        ])
         .map_err(|e| Error::auth(format!("refresh failed: {e}")))?;
     let json: serde_json::Value = serde_json::from_str(&response.into_string().unwrap_or_default())
         .map_err(|e| Error::auth(format!("refresh response was not JSON: {e}")))?;
@@ -256,15 +257,19 @@ pub struct LoginData {
     pub display_name: String,
 }
 
-/// Run the Xbox Live chain and build the login payloads.
-///
-/// `server_address` is the address the player typed; it is echoed in the skin
-/// JWT (servers compare it). `client_version` is the Bedrock version string.
-pub fn login(
-    msa_access_token: &str,
-    server_address: &str,
-    client_version: &str,
-) -> Result<LoginData> {
+const MULTIPLAYER_RELYING_PARTY: &str = "https://multiplayer.minecraft.net/";
+const PLAYFAB_RELYING_PARTY: &str = "https://b980a380.minecraft.playfabapi.com/";
+
+/// The `XBL3.0 x=<uhs>;<token>` header for the PlayFab relying party. PlayFab
+/// login (then `session/start`, then `multiplayer/session/start`) mints the
+/// NetherNet identity token from it.
+pub fn playfab_xbl3(msa_access_token: &str) -> Result<String> {
+    let (token, uhs) = xsts_for(msa_access_token, PLAYFAB_RELYING_PARTY)?;
+    Ok(format!("XBL3.0 x={uhs};{token}"))
+}
+
+/// Acquire an XSTS token for `relying_party`, returning `(token, uhs)`.
+fn xsts_for(msa_access_token: &str, relying_party: &str) -> Result<(String, String)> {
     let keys = XboxKeys::generate()?;
     let proof_key = keys.proof_key();
 
@@ -316,37 +321,12 @@ pub fn login(
         .ok_or_else(|| Error::auth("no device token"))?
         .to_owned();
 
-    // --- title token -----------------------------------------------------
-    let title_body = serde_json::json!({
-        "RelyingParty": "http://auth.xboxlive.com",
-        "TokenType": "JWT",
-        "Properties": {
-            "AuthMethod": "RPS",
-            "DeviceToken": device_token,
-            "SiteName": "user.auth.xboxlive.com",
-            "RpsTicket": format!("t={msa_access_token}"),
-            "ProofKey": proof_key,
-        }
-    });
-    let title_sig =
-        keys.signature_header("POST", "/title/authenticate", "", &title_body.to_string())?;
-    let title = post_json(
-        TITLE_AUTH_URL,
-        &title_body,
-        &[("x-xbl-contract-version", "1"), ("Signature", &title_sig)],
-    )?;
-    let title_token = title["Token"]
-        .as_str()
-        .ok_or_else(|| Error::auth("no title token"))?
-        .to_owned();
-
-    // --- XSTS ------------------------------------------------------------
+    // --- XSTS (user + device; title tokens are for title-based auth) -----
     let xsts_body = serde_json::json!({
-        "RelyingParty": "https://multiplayer.minecraft.net/",
+        "RelyingParty": relying_party,
         "TokenType": "JWT",
         "Properties": {
             "DeviceToken": device_token,
-            "TitleToken": title_token,
             "UserTokens": [user_token],
             "SandboxId": "RETAIL",
             "ProofKey": proof_key,
@@ -366,6 +346,19 @@ pub fn login(
         .as_str()
         .ok_or_else(|| Error::auth("no XSTS uhs"))?
         .to_owned();
+    Ok((xsts_token, uhs))
+}
+
+/// Run the Xbox Live chain and build the login payloads.
+///
+/// `server_address` is the address the player typed; it is echoed in the skin
+/// JWT (servers compare it). `client_version` is the Bedrock version string.
+pub fn login(
+    msa_access_token: &str,
+    server_address: &str,
+    client_version: &str,
+) -> Result<LoginData> {
+    let (xsts_token, uhs) = xsts_for(msa_access_token, MULTIPLAYER_RELYING_PARTY)?;
 
     // --- Minecraft chain -------------------------------------------------
     let identity = IdentityKey::generate()?;

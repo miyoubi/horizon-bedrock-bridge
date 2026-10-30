@@ -299,13 +299,17 @@ pub fn encode(packet: &Out) -> Vec<u8> {
     let mut w = Writer::new();
     match packet {
         Out::RequestNetworkSettings { protocol } => {
-            w.varint(ids::REQUEST_NETWORK_SETTINGS).i32(*protocol);
+            // Bedrock sends the protocol as a big-endian i32 (unlike its other
+            // integers, which are little-endian).
+            w.varint(ids::REQUEST_NETWORK_SETTINGS);
+            w.bytes(&protocol.to_be_bytes());
         }
         Out::Login {
             chain_json,
             skin_json,
         } => {
-            w.varint(ids::LOGIN).i32(crate::PROTOCOL_VERSION);
+            w.varint(ids::LOGIN);
+            w.bytes(&crate::PROTOCOL_VERSION.to_be_bytes());
             let mut body = Writer::new();
             let chain = chain_json.as_bytes();
             let skin = skin_json.as_bytes();
