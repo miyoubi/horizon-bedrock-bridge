@@ -18,6 +18,7 @@ pub mod http;
 pub mod identity;
 pub mod join;
 pub mod message;
+pub mod sdp;
 pub mod signal;
 
 pub use codec::NetherCodec;
