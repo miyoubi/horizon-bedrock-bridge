@@ -33,7 +33,7 @@ bindings = [
     { name = "address", ty = "&str", value = "address" },
     { name = "name", ty = "&str", value = "name" },
     { name = "auth", ty = "Option<::std::sync::Arc<crate::auth::AuthSession>>", value = "auth" },
-    { name = "view_distance", ty = "i8", value = "view_distance" },
+    { name = "info", ty = "horizon_protocol::packets::configuration::ClientInformation", value = "info" },
     { name = "lang", ty = "::std::sync::Arc<horizon_protocol::text::Language>", value = "lang" },
     { name = "resources", ty = "::std::path::PathBuf", value = "resources" },
 ]
@@ -47,7 +47,7 @@ bindings = [
     { name = "address", ty = "&str", value = "address" },
     { name = "name", ty = "&str", value = "name" },
     { name = "auth", ty = "Option<::std::sync::Arc<crate::auth::AuthSession>>", value = "auth" },
-    { name = "view_distance", ty = "i8", value = "view_distance" },
+    { name = "info", ty = "horizon_protocol::packets::configuration::ClientInformation", value = "info" },
     { name = "lang", ty = "::std::sync::Arc<horizon_protocol::text::Language>", value = "lang" },
     { name = "cookies", ty = "crate::net::Cookies", value = "cookies" },
     { name = "resources", ty = "::std::path::PathBuf", value = "resources" },

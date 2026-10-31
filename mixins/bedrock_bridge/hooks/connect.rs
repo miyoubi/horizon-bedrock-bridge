@@ -4,23 +4,17 @@ fn connect(
     address: &str,
     name: &str,
     auth: Option<::std::sync::Arc<crate::auth::AuthSession>>,
-    view_distance: i8,
+    info: horizon_protocol::packets::configuration::ClientInformation,
     lang: ::std::sync::Arc<horizon_protocol::text::Language>,
     resources: ::std::path::PathBuf,
 ) -> crate::net::Session {
-    if let Some(session) =
-        crate::net::bedrock::try_connect(address, name, view_distance, resources.clone())
-    {
-        return session;
-    }
-    crate::net::Session::start(
+    if let Some(session) = crate::net::bedrock::try_connect(
         address,
         name,
-        auth,
-        view_distance,
-        lang,
-        None,
-        None,
-        resources,
-    )
+        info.view_distance,
+        resources.clone(),
+    ) {
+        return session;
+    }
+    crate::net::Session::start(address, name, auth, info, lang, None, None, resources)
 }

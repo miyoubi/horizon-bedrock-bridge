@@ -44,9 +44,9 @@ def package():
     for path in sorted(bundle.rglob('*')):
         if not path.is_file():
             continue
-        relative = path.relative_to(bundle).as_posix()
-        # What a bundle may hold: Rust and TOML anywhere, other files only under data/.
-        if path.suffix not in ('.rs', '.toml') and not relative.startswith('data/'):
+        # Rust and TOML only: the palette the crate reads is compiled in as source
+        # (tools/embed_blockstates.py), so no bundle file sits outside it.
+        if path.suffix not in ('.rs', '.toml'):
             continue
         if 'target' in path.relative_to(bundle).parts:
             continue

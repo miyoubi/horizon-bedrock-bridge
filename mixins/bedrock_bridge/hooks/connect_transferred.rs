@@ -4,7 +4,7 @@ fn connect_transferred(
     address: &str,
     name: &str,
     auth: Option<::std::sync::Arc<crate::auth::AuthSession>>,
-    view_distance: i8,
+    info: horizon_protocol::packets::configuration::ClientInformation,
     lang: ::std::sync::Arc<horizon_protocol::text::Language>,
     cookies: crate::net::Cookies,
     resources: ::std::path::PathBuf,
@@ -12,14 +12,5 @@ fn connect_transferred(
     if crate::net::bedrock::is_bedrock(address) {
         eprintln!("[bedrock] transfers to a Bedrock address are not supported yet");
     }
-    crate::net::Session::start(
-        address,
-        name,
-        auth,
-        view_distance,
-        lang,
-        None,
-        Some(cookies),
-        resources,
-    )
+    crate::net::Session::start(address, name, auth, info, lang, None, Some(cookies), resources)
 }

@@ -9,8 +9,9 @@ use std::path::Path;
 use crate::error::Result;
 use crate::nbt::Tag;
 
-/// The block-state palette of the Bedrock version this crate targets.
-const BUNDLED: &[u8] = include_bytes!("../../data/blockstates-1.26.60.txt.gz");
+/// The block-state palette of the Bedrock version this crate targets, gzipped
+/// and compiled in: a bundle crate cannot reach a file outside its own folder.
+include!("blockstates_1_26_60.rs");
 
 /// The version's block-state palette, indexed by runtime id.
 pub struct BlockStates {
