@@ -574,6 +574,36 @@ mod translate {
 
         // Light sections run from one below the lowest block section upwards.
         let light_sections = count + 2;
+        // Sky light from the heightmap: the surface of each column and
+        // everything above it is fully lit, below it is dark. This is not the
+        // server's light — that is not in the sub-chunk stream — but it shades
+        // terrain instead of lighting every face equally, which is what made
+        // the shadows look wrong.
+        let sky: Vec<Vec<u8>> = (0..light_sections)
+            .map(|section| {
+                let mut layer = vec![0u8; 2048];
+                // Light section i covers block section i - 1.
+                let base = dimension.min_y + (section as i32 - 1) * 16;
+                for z in 0..16usize {
+                    for x in 0..16usize {
+                        let top = heights[z * 16 + x] + dimension.min_y;
+                        for y in 0..16usize {
+                            if base + (y as i32) < top {
+                                continue;
+                            }
+                            let index = y * 256 + z * 16 + x;
+                            let byte = index >> 1;
+                            if index & 1 == 0 {
+                                layer[byte] |= 15;
+                            } else {
+                                layer[byte] |= 15 << 4;
+                            }
+                        }
+                    }
+                }
+                layer
+            })
+            .collect();
         let light = LightData {
             sky_mask: bitset(light_sections),
             block_mask: Vec::new(),
@@ -581,7 +611,7 @@ mod translate {
             // Block light everywhere is zero, which the empty mask conveys
             // without sending 2048 bytes per section.
             empty_block_mask: bitset(light_sections),
-            sky: vec![vec![0xf0u8; 2048]; light_sections],
+            sky,
             block: Vec::new(),
         };
 
