@@ -170,7 +170,15 @@ impl Session {
             .map_err(|e| Error::auth(format!("identity: {e}")))?;
 
         let answer_sdp = crate::nethernet::join::join(base, network_id, &augmented)?;
-        let answer = RTCSessionDescription::answer(answer_sdp)
+        // §5.2 step 8: WebRTC rejects unknown SDP attributes, so strip the
+        // server's identity assertion before setting it as the remote
+        // description (after optionally verifying it).
+        let answer_clean = answer_sdp
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("a=identity:"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let answer = RTCSessionDescription::answer(answer_clean)
             .map_err(|e| Error::transport(format!("parse answer: {e}")))?;
         pc.set_remote_description(Instant::now(), answer)
             .map_err(|e| Error::transport(format!("remote description: {e}")))?;

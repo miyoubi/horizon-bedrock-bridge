@@ -163,7 +163,7 @@ fn run(
             return;
         }
     };
-    let auth_info = bedrock_core::auth::auth_info(&login.chain_json, &login.multiplayer_token, 0);
+    let auth_info = bedrock_core::auth::auth_info(&login.multiplayer_token, 0);
     if let Err(e) = client.begin_login(login.identity, login.handshake, auth_info, login.skin_json) {
         let _ = events.send(Event::Disconnected {
             reason: format!("Bedrock login failed: {e}"),

@@ -93,13 +93,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         nether_key.try_clone()?,
     )?;
     println!("built chain for {}", data.display_name);
-    // The modern Login authInfo: the chain plus the multiplayer token, Full auth.
-    let auth_info = bedrock_core::auth::auth_info(&data.chain_json, &token, 0);
+    // The modern Login authInfo: just the multiplayer token, Full auth.
+    let auth_info = bedrock_core::auth::auth_info(&token, 0);
+    println!("AUTHINFO {}", &auth_info[..auth_info.len().min(140)]);
+    println!("TOKEN {}", &token[..token.len().min(140)]);
+    println!("SKIN {}", &data.skin_json[..data.skin_json.len().min(200)]);
+    let _ = std::fs::write("/mnt/our-token.txt", &token);
+    let _ = std::fs::write("/mnt/our-skin.jwt", &data.skin_json);
     let identity = ClientIdentity::external(nether_key, token);
-    let Some(network_id) = discover(&discovery_addr) else {
+    let Some(_server_id) = discover(&discovery_addr) else {
         return Err("no discovery reply".into());
     };
-    let mut client = BedrockClient::connect_nethernet(&base, &network_id, &identity)?;
+    // The guide: the POST path carries the *client's* NetworkID.
+    let client_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1)
+        .to_string();
+    let mut client = BedrockClient::connect_nethernet(&base, &client_id, &identity)?;
     println!("netherNet connected, data channel open");
     client.begin_login(data.identity, data.handshake, auth_info, data.skin_json)?;
 

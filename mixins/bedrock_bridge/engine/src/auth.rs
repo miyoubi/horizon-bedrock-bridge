@@ -285,12 +285,13 @@ pub fn self_signed_token(key: &IdentityKey, xuid: &str, name: &str, uuid: &str) 
     key.sign_jwt(&header, &claims.to_string())
 }
 
-/// The modern (1.21.90+) Bedrock `Login` authInfo: the Xbox chain plus the
-/// multiplayer token, with `AuthenticationType` Full.
-pub fn auth_info(chain_json: &str, multiplayer_token: &str, authentication_type: i32) -> String {
+/// The modern (1.21.90+) Bedrock `Login` authInfo. Captured from a real client:
+/// exactly two fields — the multiplayer token *is* the identity (it carries
+/// `cpk`, `xid`, `xname`), so there is no `Certificate`/chain field.
+/// `authentication_type` is 0 for a full (Xbox) login.
+pub fn auth_info(multiplayer_token: &str, authentication_type: i32) -> String {
     serde_json::json!({
         "AuthenticationType": authentication_type,
-        "Certificate": format!("{chain_json}\n"),
         "Token": multiplayer_token,
     })
     .to_string()
@@ -462,7 +463,7 @@ pub fn login_with_identity(
     let chain_json = serde_json::json!({ "chain": full }).to_string();
     let skin_json = skin_jwt(
         &identity,
-        &handshake.public_der(),
+        &identity.public_der(),
         server_address,
         client_version,
         &display_name,
@@ -494,16 +495,17 @@ fn jwt_part(jwt: &str, index: usize) -> Result<serde_json::Value> {
 /// Build the client-data (skin) JWT, signed with the identity key.
 fn skin_jwt(
     identity: &IdentityKey,
-    handshake_public_der: &[u8],
+    identity_public_der: &[u8],
     server_address: &str,
     client_version: &str,
     display_name: &str,
 ) -> Result<String> {
-    // The client-data JWT's `x5u` is the X25519 handshake key (the server reads
-    // it to derive the shared secret); the signature is the ES384 identity key.
+    // Captured from a real client: the client-data JWT's `x5u` is the *identity*
+    // key (the same P-384 key as the multiplayer token's `cpk`), not the X25519
+    // handshake key. The signature is the ES384 identity key.
     let header = serde_json::json!({
         "alg": "ES384",
-        "x5u": B64.encode(handshake_public_der),
+        "x5u": B64.encode(identity_public_der),
     });
     let random_id = random_i64();
     let skin = serde_json::json!({

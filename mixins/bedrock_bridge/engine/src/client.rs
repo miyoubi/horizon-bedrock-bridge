@@ -132,13 +132,24 @@ impl BedrockClient {
     /// Send a batch of packets.
     pub fn send(&mut self, packets: &[Out]) -> Result<()> {
         let mut body = protocol::encode_batch(packets);
+        if std::env::var_os("NETHER_DEBUG").is_some() {
+            eprintln!(
+                "bedrock: raw batch[{}] {:02x?}",
+                body.len(),
+                &body[..body.len().min(64)]
+            );
+        }
         if self.compression {
             // Modern Bedrock prefixes each batch with the compressor id:
             // 0 = deflate, 255 = uncompressed.
-            let compressed = zlib_compress(&body)?;
-            let mut framed = Vec::with_capacity(compressed.len() + 1);
-            framed.push(0); // 0 = deflate
-            framed.extend_from_slice(&compressed);
+            let mut framed = Vec::new();
+            if std::env::var_os("NETHER_PLAIN").is_some() {
+                framed.push(255); // 255 = uncompressed
+                framed.extend_from_slice(&body);
+            } else {
+                framed.push(0); // 0 = deflate
+                framed.extend_from_slice(&zlib_compress(&body)?);
+            }
             body = framed;
         }
         if let Some(cipher) = self.cipher.as_mut() {
