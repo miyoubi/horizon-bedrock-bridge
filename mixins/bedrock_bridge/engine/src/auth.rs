@@ -508,7 +508,11 @@ fn skin_jwt(
         "x5u": B64.encode(identity_public_der),
     });
     let random_id = random_i64();
-    let skin = serde_json::json!({
+    // Fields a real (accepted) client sends; a strict server-side parse rejects
+    // the connection request if any are missing. `ThirdPartyNameOnly` was
+    // removed from the protocol, so it is not sent. Split in two because the
+    // `json!` macro has an expansion-depth limit.
+    let mut skin = serde_json::json!({
         "AnimatedImageData": [],
         "ArmSize": "wide",
         "CapeData": "",
@@ -516,20 +520,32 @@ fn skin_jwt(
         "CapeImageHeight": 0,
         "CapeImageWidth": 0,
         "CapeOnClassicSkin": false,
+        "ClientEditorConnectionIntent": 0,
+        "ClientIsEditorCapable": false,
         "ClientRandomId": random_id,
+        "CompatibleWithClientSideChunkGen": false,
         "CurrentInputMode": 1,
         "DefaultInputMode": 1,
         "DeviceId": uuid_string(random_uuid()),
         "DeviceModel": crate::DEVICE_MODEL,
         "DeviceOS": crate::DEVICE_OS,
+        "FilterProfanity": false,
         "GameVersion": client_version,
-        "GuiScale": 0,
+        "GraphicsMode": 1,
+        "GuiScale": -1,
+        "IsEditorMode": false,
         "LanguageCode": "en_US",
+    });
+    let rest = serde_json::json!({
+        "MaxViewDistance": 0,
+        "MemoryTier": 0,
+        "OverrideSkin": false,
         "PersonaPieces": [],
         "PersonaSkin": false,
         "PieceTintColors": [],
         "PlatformOfflineId": "",
         "PlatformOnlineId": "",
+        "PlatformType": 0,
         "PlayFabId": "",
         "PremiumSkin": false,
         "SelfSignedId": uuid_string(random_uuid()),
@@ -538,15 +554,20 @@ fn skin_jwt(
         "SkinColor": "#0",
         "SkinData": crate::mapping::steve_skin_b64(),
         "SkinGeometryData": B64.encode(crate::mapping::HUMANOID_GEOMETRY),
-        "SkinGeometryDataEngineVersion": "",
+        "SkinGeometryDataEngineVersion": "MS4xNC4w",
         "SkinId": format!("{}.Custom", uuid_string(random_uuid())),
         "SkinImageHeight": 64,
         "SkinImageWidth": 64,
         "SkinResourcePatch": "ewogICAiZ2VvbWV0cnkiIDogewogICAgICAiZGVmYXVsdCIgOiAiZ2VvbWV0cnkuaHVtYW5vaWQuY3VzdG9tIgogICB9Cn0K",
         "ThirdPartyName": display_name,
-        "ThirdPartyNameOnly": false,
+        "TrustedSkin": false,
         "UIProfile": 0,
     });
+    if let (Some(base), Some(extra)) = (skin.as_object_mut(), rest.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
     identity.sign_jwt(&header.to_string(), &skin.to_string())
 }
 

@@ -37,6 +37,9 @@ impl Transport for RakNetClient {
 pub struct BedrockClient {
     transport: Box<dyn Transport>,
     cipher: Option<Cipher>,
+    /// NetherNet disables Bedrock packet encryption (as the reference clients
+    /// do), so `ServerToClientHandshake` only needs to be acknowledged.
+    disable_encryption: bool,
     compression: bool,
     identity: Option<IdentityKey>,
     pending_login: Option<(String, String)>,
@@ -59,6 +62,7 @@ impl BedrockClient {
         Ok(BedrockClient {
             transport,
             cipher: None,
+            disable_encryption: false,
             compression: false,
             identity: None,
             pending_login: None,
@@ -75,6 +79,7 @@ impl BedrockClient {
         BedrockClient {
             transport,
             cipher: None,
+            disable_encryption: false,
             compression: false,
             identity: None,
             pending_login: None,
@@ -96,10 +101,11 @@ impl BedrockClient {
     ) -> Result<Self> {
         let transport =
             crate::nethernet::transport::NetherNetTransport::connect(base, network_id, identity)?;
-        Ok(Self::with_transport(
-            Box::new(transport),
-            format!("{base}/{network_id}"),
-        ))
+        let mut client = Self::with_transport(Box::new(transport), format!("{base}/{network_id}"));
+        // NetherNet sessions skip Bedrock packet encryption, matching the
+        // reference clients (bedrock-protocol sets disableEncryption=true).
+        client.disable_encryption = true;
+        Ok(client)
     }
 
     pub fn server_address(&self) -> &str {
@@ -226,11 +232,26 @@ impl BedrockClient {
                         }
                     }
                 }
-                Packet::ServerToClientHandshake(jwt) => {
-                    if let Err(e) = self.handle_encryption(jwt) {
-                        log::warn!("bedrock: encryption handshake failed: {e}");
+                Packet::ServerToClientHandshake(jwt) if self.disable_encryption => {
+                    // Acknowledge without enabling encryption.
+                    let _ = self.send(&[Out::ClientToServerHandshake]);
+                    if std::env::var_os("NETHER_DEBUG").is_some() {
+                        eprintln!("bedrock: acked ServerToClientHandshake (encryption disabled)");
                     }
                 }
+                Packet::ServerToClientHandshake(jwt) => match self.handle_encryption(jwt) {
+                    Ok(()) => {
+                        if std::env::var_os("NETHER_DEBUG").is_some() {
+                            eprintln!("bedrock: sent ClientToServerHandshake (encrypted)");
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("bedrock: encryption handshake failed: {e}");
+                        if std::env::var_os("NETHER_DEBUG").is_some() {
+                            eprintln!("bedrock: encryption handshake failed: {e}");
+                        }
+                    }
+                },
                 Packet::StartGame(g) => {
                     self.unique_id = g.entity_unique_id;
                     self.runtime_id = g.entity_runtime_id as i64;
@@ -266,11 +287,11 @@ impl BedrockClient {
     pub fn accept_resource_packs(&mut self) -> Result<()> {
         self.send(&[
             Out::ResourcePackClientResponse {
-                status: 3,
+                status: 2, // downloadingfinished
                 pack_ids: Vec::new(),
             },
             Out::ResourcePackClientResponse {
-                status: 4,
+                status: 3, // resourcepackstackfinished
                 pack_ids: Vec::new(),
             },
         ])
@@ -333,8 +354,8 @@ mod tests {
             Out::SetLocalPlayerAsInitialized { runtime_id: 55 },
         ]);
         // Each entry is a uvarint length + `id, body`; two small packets here.
-        assert_eq!(batch[0], 2); // RequestChunkRadius: id + zigzag radius
-        assert_eq!(batch[3], 2); // SetLocalPlayerAsInitialized: id + varlong id
-        assert_eq!(batch.len(), 6);
+        assert_eq!(batch[0], 3); // RequestChunkRadius: id + zigzag radius + max radius
+        assert_eq!(batch[4], 2); // SetLocalPlayerAsInitialized: id + varlong id
+        assert_eq!(batch.len(), 7);
     }
 }

@@ -7,6 +7,7 @@
 //! the Bedrock chain from the same Microsoft account, joins over NetherNet
 //! (WebRTC) and runs the login handshake to `StartGame`.
 
+use base64::Engine as _;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
@@ -75,17 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("signed in");
 
-    // 2. NetherNet identity token: XSTS(PlayFab) -> PlayFab -> session ->
-    //    multiplayer/session/start with our P-384 key.
-    let xbl3 = playfab_xbl3(&msa.access_token)?;
-    let ticket = auth_service::playfab_login(&xbl3)?;
-    let auth_header = auth_service::session_start(&ticket, bedrock_core::MINECRAFT_VERSION)?;
     let nether_key = IdentityKey::generate()?;
-    let token = auth_service::multiplayer_token(&auth_header, &nether_key.public_der())?;
-    println!("got multiplayer identity token ({} bytes)", token.len());
-
-    // 3. Bedrock chain from the same account + the modern Login authInfo, then
-    //    log in over NetherNet.
     let data = login_with_identity(
         &msa.access_token,
         &server_address,
@@ -93,11 +84,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         nether_key.try_clone()?,
     )?;
     println!("built chain for {}", data.display_name);
-    // The modern Login authInfo: just the multiplayer token, Full auth.
-    let auth_info = bedrock_core::auth::auth_info(&token, 0);
-    println!("AUTHINFO {}", &auth_info[..auth_info.len().min(140)]);
-    println!("TOKEN {}", &token[..token.len().min(140)]);
-    println!("SKIN {}", &data.skin_json[..data.skin_json.len().min(200)]);
+
+    let (token, auth_info) = if std::env::var_os("NETHER_SELFSIGNED").is_some() {
+        // bedrock-protocol's offline login (the guide says it joins BDS):
+        // AuthenticationType 2, empty-chain Certificate, self-signed token.
+        let t = bedrock_core::auth::self_signed_token(
+            &data.identity,
+            &data.xuid,
+            &data.display_name,
+            &bedrock_core::auth::uuid_string(data.uuid),
+        )?;
+        let cert = serde_json::json!({ "chain": [""] }).to_string();
+        let ai = serde_json::json!({
+            "AuthenticationType": 2,
+            "Certificate": cert,
+            "Token": t,
+        })
+        .to_string();
+        (t, ai)
+    } else {
+        let xbl3 = playfab_xbl3(&msa.access_token)?;
+        let ticket = auth_service::playfab_login(&xbl3)?;
+        let auth_header = auth_service::session_start(&ticket, bedrock_core::MINECRAFT_VERSION)?;
+        let t = auth_service::multiplayer_token(&auth_header, &data.identity.public_der())?;
+        let ai = bedrock_core::auth::auth_info(&t, 0);
+        (t, ai)
+    };
+    println!("AUTHINFO {}", &auth_info[..auth_info.len().min(160)]);
     let _ = std::fs::write("/mnt/our-token.txt", &token);
     let _ = std::fs::write("/mnt/our-skin.jwt", &data.skin_json);
     let identity = ClientIdentity::external(nether_key, token);
@@ -105,26 +118,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no discovery reply".into());
     };
     // The guide: the POST path carries the *client's* NetworkID.
-    let client_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(1)
-        .to_string();
+    let client_id = std::env::var("NETID").unwrap_or_else(|_| "1".to_string());
     let mut client = BedrockClient::connect_nethernet(&base, &client_id, &identity)?;
     println!("netherNet connected, data channel open");
-    client.begin_login(data.identity, data.handshake, auth_info, data.skin_json)?;
+    let skin_json = if std::env::var_os("NETHER_BPSKIN").is_some() {
+        let payload = std::fs::read_to_string("/mnt/bp-skin-payload.json")?;
+        let header = serde_json::json!({
+            "alg": "ES384",
+            "x5u": bedrock_core::crypto::B64.encode(data.identity.public_der()),
+        })
+        .to_string();
+        data.identity.sign_jwt(&header, &payload)?
+    } else {
+        data.skin_json.clone()
+    };
+    client.begin_login(data.identity, data.handshake, auth_info, skin_json)?;
 
     let deadline = Instant::now() + Duration::from_secs(40);
     while Instant::now() < deadline && !client.is_logged_in() {
         for packet in client.poll()? {
             let debug = format!("{packet:?}");
-            println!("<- {}", &debug[..debug.len().min(220)]);
+            println!("<- {}", &debug[..debug.len().min(1200)]);
             match packet {
                 Packet::NetworkSettings(p) => println!(
                     "  compression threshold={} algorithm={}",
                     p.compression_threshold, p.compression_algorithm
                 ),
-                Packet::ResourcePacksInfo => client.accept_resource_packs()?,
+                Packet::ResourcePacksInfo => {
+                    client.send(&[bedrock_core::protocol::Out::ResourcePackClientResponse {
+                        status: 2, // downloadingfinished
+                        pack_ids: Vec::new(),
+                    }])?
+                }
+                Packet::ResourcePackStack => {
+                    client.send(&[bedrock_core::protocol::Out::ResourcePackClientResponse {
+                        status: 3, // resourcepackstackfinished
+                        pack_ids: Vec::new(),
+                    }])?
+                }
                 Packet::StartGame(_) => client.request_chunks(8)?,
                 _ => {}
             }

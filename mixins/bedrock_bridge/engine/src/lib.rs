@@ -59,4 +59,6 @@ pub const CHAIN_VERSION: i32 = 2;
 
 /// The name Horizon's launcher gives client data / the default device model.
 pub const DEVICE_MODEL: &str = "Horizon";
-pub const DEVICE_OS: i32 = 7; // Android is 7 in Bedrock's DeviceOS enum; a neutral value.
+/// Bedrock `DeviceOS` (8 = Win32). The server rejects some values (7) as an
+/// invalid connection request; 8 is what a real Windows client sends.
+pub const DEVICE_OS: i32 = 8;

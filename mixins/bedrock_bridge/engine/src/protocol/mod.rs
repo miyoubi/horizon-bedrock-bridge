@@ -323,17 +323,22 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(ids::CLIENT_TO_SERVER_HANDSHAKE);
         }
         Out::ResourcePackClientResponse { status, pack_ids } => {
-            w.varint(ids::RESOURCE_PACK_CLIENT_RESPONSE);
-            w.u8(*status);
-            let names: &[&str] = &[
+            // 1.26.40+: varint status (0 refused, 1 send_packs, 2 have_all_packs,
+            // 3 completed), the same status again as a string, then pack ids
+            // only for `send_packs`.
+            // 0-based, with the names the server expects: 2 = downloadingfinished,
+            // 3 = resourcepackstackfinished.
+            let names = [
                 "cancel",
                 "downloading",
                 "downloadingfinished",
                 "resourcepackstackfinished",
             ];
-            w.string(names.get(*status as usize).copied().unwrap_or(""));
-            if *status == 2 {
-                w.varint(pack_ids.len() as u32);
+            w.varint(ids::RESOURCE_PACK_CLIENT_RESPONSE);
+            w.varint(*status as u32);
+            w.string(names.get(*status as usize).copied().unwrap_or("cancel"));
+            if *status == 1 {
+                w.u16(pack_ids.len() as u16);
                 for id in pack_ids {
                     w.string(id);
                 }
@@ -343,7 +348,10 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(ids::CLIENT_CACHE_STATUS).bool(*supported);
         }
         Out::RequestChunkRadius { radius } => {
-            w.varint(ids::REQUEST_CHUNK_RADIUS).zigzag32(*radius);
+            // zigzag32 chunk radius, then the u8 max radius the client supports.
+            w.varint(ids::REQUEST_CHUNK_RADIUS)
+                .zigzag32(*radius)
+                .u8((*radius).clamp(0, 255) as u8);
         }
         Out::SetLocalPlayerAsInitialized { runtime_id } => {
             w.varint(ids::SET_LOCAL_PLAYER_AS_INITIALIZED)
