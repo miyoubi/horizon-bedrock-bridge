@@ -21,14 +21,17 @@ pub struct NetherNetTransport {
 impl NetherNetTransport {
     /// Join `network_id` at `base` and wait for the reliable channel to open.
     pub fn connect(base: &str, network_id: &str, identity: &ClientIdentity) -> Result<Self> {
+        crate::nethernet::trace(format!("joining {base} as network {network_id}"));
         let mut session = Session::connect(base, network_id, identity)?;
         let deadline = Instant::now() + Duration::from_secs(25);
         while !session.is_ready() && Instant::now() < deadline {
             session.pump(Duration::from_millis(250))?;
         }
         if !session.is_ready() {
+            crate::nethernet::trace("data channel did not open within 25s");
             return Err(Error::transport("NetherNet: data channel did not open"));
         }
+        crate::nethernet::trace("data channel open");
         Ok(Self {
             session,
             reassembly: Message::new(),
@@ -41,9 +44,7 @@ impl Transport for NetherNetTransport {
     fn send(&mut self, body: &[u8]) -> Result<()> {
         for segment in Message::split_into_segments(body)? {
             let data = segment.encode();
-            if std::env::var_os("NETHER_DEBUG").is_some() {
-                eprintln!("nether: send segment {} bytes", data.len());
-            }
+            crate::nethernet::trace(format!("send segment {} bytes", data.len()));
             // The connection can report Connected a moment before SCTP marks the
             // channel OPEN; retry while it settles.
             let mut attempts = 0;
@@ -69,13 +70,11 @@ impl Transport for NetherNetTransport {
             return Ok(Some(message));
         }
         for raw in self.session.pump(Duration::from_millis(20))? {
-            if std::env::var_os("NETHER_DEBUG").is_some() {
-                eprintln!(
-                    "nether: received {} bytes on reliable channel {:02x?}",
-                    raw.len(),
-                    &raw[..raw.len().min(24)]
-                );
-            }
+            crate::nethernet::trace(format!(
+                "received {} bytes on reliable channel {:02x?}",
+                raw.len(),
+                &raw[..raw.len().min(24)]
+            ));
             let Ok(segment) = MessageSegment::decode(&raw) else {
                 continue;
             };

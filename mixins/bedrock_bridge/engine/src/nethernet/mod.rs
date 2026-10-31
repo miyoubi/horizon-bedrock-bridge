@@ -71,6 +71,25 @@ impl Transport {
     }
 }
 
+/// Append a line to the NetherNet trace file, and to the log.
+///
+/// The WebRTC state machine fails without saying why, and the engine's records
+/// do not reliably reach the game's log, so the join writes its steps to a file
+/// in the temporary directory too: `horizon-bedrock-nethernet.log`.
+pub fn trace(message: impl AsRef<str>) {
+    use std::io::Write;
+    let message = message.as_ref();
+    log::info!("nethernet: {message}");
+    let path = std::env::temp_dir().join("horizon-bedrock-nethernet.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

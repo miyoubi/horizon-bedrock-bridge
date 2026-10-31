@@ -243,9 +243,7 @@ impl Session {
             while let Some(event) = self.pc.poll_event() {
                 match event {
                     RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
-                        if std::env::var_os("NETHER_DEBUG").is_some() {
-                            eprintln!("nether: connection state {state:?}");
-                        }
+                        crate::nethernet::trace(format!("connection state {state:?}"));
                         if state == RTCPeerConnectionState::Failed {
                             return Err(Error::transport("peer connection failed"));
                         }
@@ -262,9 +260,7 @@ impl Session {
                     RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(id))
                         if self.reliable == Some(id) =>
                     {
-                        if std::env::var_os("NETHER_DEBUG").is_some() {
-                            eprintln!("nether: reliable channel closed by server");
-                        }
+                        crate::nethernet::trace("reliable channel closed by server");
                         self.reliable = None;
                         self.ready = false;
                     }

@@ -211,6 +211,9 @@ impl BedrockClient {
     /// return the packets for the caller.
     fn react(&mut self, packets: Vec<Packet>) -> Vec<Packet> {
         for packet in &packets {
+            // How far the handshake got, in the trace file.
+            let shown: String = format!("{packet:?}").chars().take(80).collect();
+            crate::nethernet::trace(format!("recv {shown}"));
             match packet {
                 Packet::NetworkSettings(p) => {
                     self.compression = p.compression_threshold > 0;
@@ -221,6 +224,7 @@ impl BedrockClient {
                         );
                     }
                     if let Some((auth_info, skin)) = self.pending_login.take() {
+                        crate::nethernet::trace("sending Login");
                         if let Err(e) = self.send(&[Out::Login {
                             auth_info,
                             skin_json: skin,
