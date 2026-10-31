@@ -288,6 +288,7 @@ fn run(
         requests: Vec::new(),
         wanted: std::collections::VecDeque::new(),
         wanted_center: None,
+        entities: std::collections::HashMap::new(),
         runtime_id: 0,
         unique_id: 0,
     };
@@ -405,6 +406,9 @@ mod translate {
         /// Columns still to ask for, and the centre they were queued for.
         pub wanted: std::collections::VecDeque<(i32, i32)>,
         pub wanted_center: Option<(i32, i32)>,
+        /// Where each entity was last put: a Bedrock move carries only the
+        /// components that changed, and the client takes absolute positions.
+        pub entities: std::collections::HashMap<u64, ([f32; 3], f32, f32, f32)>,
         pub runtime_id: u64,
         pub unique_id: i64,
     }
@@ -748,6 +752,15 @@ mod translate {
             bp::Packet::AddEntity(entity) => {
                 let java_name = ctx.mappings.java_entity(&entity.identifier);
                 let kind = entity_type_id(ctx, &java_name);
+                ctx.entities.insert(
+                    entity.runtime_id,
+                    (
+                        entity.position,
+                        entity.yaw,
+                        entity.pitch,
+                        entity.head_yaw,
+                    ),
+                );
                 vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
                     play::AddEntity {
                         id: entity.runtime_id as i32,
@@ -772,6 +785,10 @@ mod translate {
             }
             bp::Packet::AddPlayer(player) => {
                 let uuid = u128::from_be_bytes(player.uuid);
+                ctx.entities.insert(
+                    player.runtime_id,
+                    (player.position, player.yaw, player.pitch, player.yaw),
+                );
                 vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
                     play::AddEntity {
                         id: player.runtime_id as i32,
@@ -816,17 +833,79 @@ mod translate {
                     )))]
                 }
             }
-            bp::Packet::MoveEntityAbsolute(m) => vec![Event::Packet(Box::new(
-                play::Clientbound::TeleportEntity(play::TeleportEntity {
-                    id: m.runtime_id as i32,
-                    position: [m.position[0] as f64, m.position[1] as f64, m.position[2] as f64],
-                    delta: [0.0; 3],
-                    yaw: m.yaw,
-                    pitch: m.pitch,
-                    relatives: 0,
-                    on_ground: m.on_ground,
-                }),
-            ))],
+            // Entities move with this one packet; without it everything stands
+            // still. A delta carries only the components that changed, and the
+            // client takes absolute positions, so the rest comes from where we
+            // last put the entity.
+            bp::Packet::MoveActorDelta(m) => {
+                let Some(&(last, last_yaw, last_pitch, last_head)) =
+                    ctx.entities.get(&m.runtime_id)
+                else {
+                    return Vec::new();
+                };
+                let degrees = |v: Option<u8>, last: f32| {
+                    v.map_or(last, |v| f32::from(v) * (360.0 / 256.0))
+                };
+                // Bedrock sends (pitch, yaw, head yaw).
+                let pitch = degrees(m.rotation[0], last_pitch);
+                let yaw = degrees(m.rotation[1], last_yaw);
+                let head = degrees(m.rotation[2], last_head);
+                let position = [
+                    m.position[0].unwrap_or(last[0]),
+                    m.position[1].unwrap_or(last[1]),
+                    m.position[2].unwrap_or(last[2]),
+                ];
+                let moved = m.position.iter().any(Option::is_some);
+                let turned = m.rotation.iter().any(Option::is_some);
+                ctx.entities
+                    .insert(m.runtime_id, (position, yaw, pitch, head));
+                if moved {
+                    vec![Event::Packet(Box::new(play::Clientbound::TeleportEntity(
+                        play::TeleportEntity {
+                            id: m.runtime_id as i32,
+                            position: [
+                                position[0] as f64,
+                                position[1] as f64,
+                                position[2] as f64,
+                            ],
+                            delta: [0.0; 3],
+                            yaw,
+                            pitch,
+                            relatives: 0,
+                            on_ground: m.on_ground,
+                        },
+                    )))]
+                } else if turned {
+                    // Turning on the spot: a teleport would also move it.
+                    vec![Event::Packet(Box::new(play::Clientbound::RotateHead(
+                        play::RotateHead {
+                            id: m.runtime_id as i32,
+                            head_yaw: (head / (360.0 / 256.0)) as i8,
+                        },
+                    )))]
+                } else {
+                    Vec::new()
+                }
+            }
+            bp::Packet::MoveEntityAbsolute(m) => {
+                ctx.entities
+                    .insert(m.runtime_id, (m.position, m.yaw, m.pitch, m.yaw));
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::TeleportEntity(play::TeleportEntity {
+                        id: m.runtime_id as i32,
+                        position: [
+                            m.position[0] as f64,
+                            m.position[1] as f64,
+                            m.position[2] as f64,
+                        ],
+                        delta: [0.0; 3],
+                        yaw: m.yaw,
+                        pitch: m.pitch,
+                        relatives: 0,
+                        on_ground: m.on_ground,
+                    }),
+                ))]
+            }
             bp::Packet::SetEntityMotion {
                 runtime_id,
                 velocity,
