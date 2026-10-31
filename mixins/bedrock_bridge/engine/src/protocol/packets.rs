@@ -81,7 +81,7 @@ fn read_meta_value(r: &mut Reader, type_id: u32) -> Result<MetaValue> {
         other => {
             return Err(crate::Error::decode(format!(
                 "unknown entity metadata type {other}"
-            )))
+            )));
         }
     })
 }
@@ -194,6 +194,10 @@ pub struct StartGame {
     /// The server's block palette in runtime-id order: `(identifier, state NBT)`.
     /// Chunk runtime ids index this, then map to Java block states.
     pub palette: Vec<(String, crate::nbt::Tag)>,
+    /// The server's item palette: `(identifier, network id)`. The network id is
+    /// what `MobEquipment` and the inventory packets carry, so it is kept
+    /// alongside the identifier the mappings are keyed by.
+    pub items: Vec<(String, i16)>,
 }
 
 impl StartGame {
@@ -306,6 +310,27 @@ impl StartGame {
             palette.push((name, state));
         }
 
+        // The item palette follows the block palette: an entry is the
+        // identifier, a little-endian `i16` network id, and — for items defined
+        // by components — a version and the component list.
+        let item_count = r.varint()?;
+        let mut items = Vec::with_capacity((item_count as usize).min(4096));
+        for _ in 0..item_count {
+            let name = r.string()?;
+            let runtime_id = r.i16()?;
+            if r.bool()? {
+                let version = r.varint()?;
+                if version >= 1 {
+                    let components = r.varint()?;
+                    for _ in 0..components {
+                        let _component = r.string()?;
+                        let _ = crate::nbt::read_named(r)?;
+                    }
+                }
+            }
+            items.push((name, runtime_id));
+        }
+
         Ok(StartGame {
             entity_unique_id,
             entity_runtime_id,
@@ -322,6 +347,7 @@ impl StartGame {
             level_id,
             world_name,
             palette,
+            items,
         })
     }
 
