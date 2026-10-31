@@ -19,6 +19,7 @@ pub const REMOVE_ENTITY: u32 = 0x0e;
 pub const ADD_ITEM_ENTITY: u32 = 0x0f;
 pub const TAKE_ITEM_ENTITY: u32 = 0x11;
 pub const MOVE_ENTITY_ABSOLUTE: u32 = 0x12;
+pub const MOVE_ACTOR_DELTA: u32 = 0x6f;
 pub const MOVE_PLAYER: u32 = 0x13;
 pub const UPDATE_BLOCK: u32 = 0x15;
 pub const LEVEL_EVENT: u32 = 0x19;

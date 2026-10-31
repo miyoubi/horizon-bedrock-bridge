@@ -477,6 +477,49 @@ impl MovePlayer {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// One actor's position/rotation deltas (packet id 111). Each component is
+/// optional and preceded by a presence bool.
+pub struct MoveActorDelta {
+    pub runtime_id: u64,
+    pub position: [Option<f32>; 3],
+    pub rotation: [Option<u8>; 3],
+    pub on_ground: bool,
+    pub force_move: bool,
+    pub force_move_local_entity: bool,
+    pub force_completion: bool,
+    pub ticks: u64,
+}
+
+impl MoveActorDelta {
+    pub fn read(r: &mut Reader) -> Result<MoveActorDelta> {
+        fn opt_f32(r: &mut Reader) -> Result<Option<f32>> {
+            if r.bool()? {
+                Ok(Some(r.f32()?))
+            } else {
+                Ok(None)
+            }
+        }
+        fn opt_u8(r: &mut Reader) -> Result<Option<u8>> {
+            if r.bool()? {
+                Ok(Some(r.u8()?))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(MoveActorDelta {
+            runtime_id: r.varlong()?,
+            position: [opt_f32(r)?, opt_f32(r)?, opt_f32(r)?],
+            rotation: [opt_u8(r)?, opt_u8(r)?, opt_u8(r)?],
+            on_ground: r.bool()?,
+            force_move: r.bool()?,
+            force_move_local_entity: r.bool()?,
+            force_completion: r.bool()?,
+            ticks: r.varlong()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MoveEntityAbsolute {
     pub runtime_id: u64,
     pub on_ground: bool,

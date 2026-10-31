@@ -134,8 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     client.begin_login(data.identity, data.handshake, auth_info, skin_json)?;
 
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while Instant::now() < deadline && !client.is_logged_in() {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
         for packet in client.poll()? {
             let debug = format!("{packet:?}");
             println!("<- {}", &debug[..debug.len().min(1200)]);
