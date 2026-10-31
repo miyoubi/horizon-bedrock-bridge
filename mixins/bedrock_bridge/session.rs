@@ -1165,15 +1165,19 @@ mod translate {
     /// ignored, which is why the player looked like a statue to it). The flag
     /// set is empty for now: no sneaking, sprinting or block actions yet.
     fn auth_input(bridge: &Bridge, position: [f32; 3], yaw: f32, pitch: f32) -> Vec<bp::Out> {
-        let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
-        vec![bp::Out::PlayerAuthInput {
+        // The server rejects the PlayerAuthInput this builds — the session is
+        // dropped while the server still lists the player — so movement goes
+        // out as MovePlayer again, which it ignores harmlessly. The encoder
+        // stays for when the field order has been checked against a capture.
+        let _ = bridge.tick.fetch_add(1, Ordering::Relaxed);
+        vec![bp::Out::MovePlayer {
+            runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
             position,
             pitch,
             yaw,
             head_yaw: yaw,
-            move_vec: [0.0; 2],
-            flags: 0,
-            tick,
+            mode: 0,
+            on_ground: true,
         }]
     }
 
