@@ -77,6 +77,7 @@ pub const ITEM_COMPONENT: u32 = 0xa2;
 pub const SYNC_ENTITY_PROPERTY: u32 = 0xa5;
 pub const UPDATE_SUB_CHUNK_BLOCKS: u32 = 0xac;
 pub const SUB_CHUNK: u32 = 0xae;
+pub const SUB_CHUNK_REQUEST: u32 = 0xaf;
 pub const UPDATE_PLAYER_GAME_TYPE: u32 = 0x97;
 pub const UPDATE_ABILITIES: u32 = 0xbb;
 pub const REQUEST_NETWORK_SETTINGS: u32 = 0xc1;

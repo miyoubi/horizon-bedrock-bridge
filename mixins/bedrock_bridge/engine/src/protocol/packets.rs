@@ -564,6 +564,71 @@ impl UpdateAbilities {
     }
 }
 
+/// One entry of a `SubChunk` (174) reply.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubChunkEntry {
+    pub offset: [i8; 3],
+    pub result: u8,
+    /// The serialized sub-chunk, when `result` is success.
+    pub payload: Vec<u8>,
+    pub blob_hash: Option<u64>,
+}
+
+/// A batch of sub-chunks relative to a center sub-chunk position: id 174.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubChunk {
+    pub cache_enabled: bool,
+    pub dimension: i32,
+    pub position: [i32; 3],
+    pub entries: Vec<SubChunkEntry>,
+}
+
+impl SubChunk {
+    pub fn read(r: &mut Reader) -> Result<SubChunk> {
+        fn skip_heightmap(r: &mut Reader) -> Result<()> {
+            if r.bool()? {
+                for _ in 0..16 {
+                    let n = r.varint()? as usize;
+                    let _ = r.bytes(n)?;
+                }
+            }
+            Ok(())
+        }
+        let cache_enabled = r.bool()?;
+        let dimension = r.zigzag32()?;
+        let position = [r.i32()?, r.i32()?, r.i32()?];
+        let count = r.varint()? as usize;
+        let mut entries = Vec::with_capacity(count.min(8192));
+        for _ in 0..count {
+            let offset = [r.u8()? as i8, r.u8()? as i8, r.u8()? as i8];
+            let result = r.u8()?;
+            let payload = if r.bool()? {
+                let n = r.varint()? as usize;
+                r.bytes(n)?.to_vec()
+            } else {
+                Vec::new()
+            };
+            let _height_type = r.u8()?;
+            skip_heightmap(r)?;
+            let _render_type = r.u8()?;
+            skip_heightmap(r)?;
+            let blob_hash = if r.bool()? { Some(r.u64()?) } else { None };
+            entries.push(SubChunkEntry {
+                offset,
+                result,
+                payload,
+                blob_hash,
+            });
+        }
+        Ok(SubChunk {
+            cache_enabled,
+            dimension,
+            position,
+            entries,
+        })
+    }
+}
+
 /// A world/level event (sounds, particles, …): id 25.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelEvent {

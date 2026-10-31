@@ -29,11 +29,7 @@ pub enum Packet {
     CreativeContent,
     PlayerList,
     LevelChunk(LevelChunk),
-    SubChunk {
-        origin: [i32; 3],
-        dimension: i32,
-        data: Vec<u8>,
-    },
+    SubChunk(SubChunk),
     NetworkChunkPublisherUpdate {
         position: [i32; 3],
         radius: u32,
@@ -124,6 +120,12 @@ pub enum Out {
     ClientCacheStatus {
         supported: bool,
     },
+    /// Ask the server for specific sub-chunks (modern chunk delivery).
+    SubChunkRequest {
+        dimension: i32,
+        center: [i32; 3],
+        offsets: Vec<[i8; 3]>,
+    },
     RequestChunkRadius {
         radius: i32,
     },
@@ -186,18 +188,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::CREATIVE_CONTENT => Packet::CreativeContent,
         ids::PLAYER_LIST => Packet::PlayerList,
         ids::FULL_CHUNK_DATA => Packet::LevelChunk(LevelChunk::read(&mut r)?),
-        ids::SUB_CHUNK => {
-            let _cache = r.bool()?;
-            let dimension = r.zigzag32()?;
-            let origin = [r.zigzag32()?, r.zigzag32()?, r.zigzag32()?];
-            let _count = r.varint()?;
-            let data = r.byte_slice()?.to_vec();
-            Packet::SubChunk {
-                origin,
-                dimension,
-                data,
-            }
-        }
+        ids::SUB_CHUNK => Packet::SubChunk(SubChunk::read(&mut r)?),
         ids::NETWORK_CHUNK_PUBLISHER_UPDATE => {
             let position = [r.zigzag32()?, r.zigzag32()?, r.zigzag32()?];
             let radius = r.varint()?;
@@ -376,6 +367,18 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         }
         Out::ClientCacheStatus { supported } => {
             w.varint(ids::CLIENT_CACHE_STATUS).bool(*supported);
+        }
+        Out::SubChunkRequest {
+            dimension,
+            center,
+            offsets,
+        } => {
+            w.varint(ids::SUB_CHUNK_REQUEST).zigzag32(*dimension);
+            w.varint(offsets.len() as u32);
+            for o in offsets {
+                w.u8(o[0] as u8).u8(o[1] as u8).u8(o[2] as u8);
+            }
+            w.i32(center[0]).i32(center[1]).i32(center[2]);
         }
         Out::RequestChunkRadius { radius } => {
             // zigzag32 chunk radius, then the u8 max radius the client supports.

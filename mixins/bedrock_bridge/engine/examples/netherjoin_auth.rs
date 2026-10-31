@@ -165,11 +165,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }])?
                 }
                 Packet::StartGame(g) => {
+                    let cx = (g.position[0] / 16.0).floor() as i32;
+                    let cz = (g.position[2] / 16.0).floor() as i32;
+                    let offsets: Vec<[i8; 3]> = (-2..=4).map(|sy| [0i8, sy, 0]).collect();
+                    let _ = client.send(&[bedrock_core::protocol::Out::SubChunkRequest {
+                        dimension: 0,
+                        center: [cx, 4, cz],
+                        offsets,
+                    }]);
                     game = Some(g);
                     client.send(&[bedrock_core::protocol::Out::ClientCacheStatus {
                         supported: false,
                     }])?;
                     client.request_chunks(8)?;
+                }
+                Packet::SubChunk(sc) => {
+                    for e in &sc.entries {
+                        if e.result != 1 || e.payload.is_empty() {
+                            continue;
+                        }
+                        let mut r = bedrock_core::stream::Reader::new(&e.payload[1..]);
+                        match bedrock_core::subchunk::SubChunk::read(&mut r, e.payload[0]) {
+                            Ok(sub) => {
+                                let mut non_air = 0usize;
+                                let mut sample = 0u32;
+                                let mut rid_nonzero = 0usize;
+                                let mut sample_rid = -1i32;
+                                if let (Some(g), Some(m)) = (game.as_ref(), mappings.as_ref()) {
+                                    for y in 0..16 {
+                                        for z in 0..16 {
+                                            for x in 0..16 {
+                                                let rid = sub.top_runtime_id(x, y, z).unwrap_or(0);
+                                                if rid != 0 {
+                                                    rid_nonzero += 1;
+                                                    sample_rid = rid;
+                                                }
+                                                let j = bedrock_core::chunk::java_block_state(
+                                                    g, m, rid,
+                                                );
+                                                if j != 0 {
+                                                    non_air += 1;
+                                                    sample = j;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                println!(
+                                    "SUBCHUNK hdr={:02x?}",
+                                    &e.payload[..e.payload.len().min(16)]
+                                );
+                                println!(
+                                    "SUBCHUNK pos={:?} off={:?} bytes={} non_air={} rid_nonzero={} sample_rid={} name={:?} sample_java={}",
+                                    sc.position,
+                                    e.offset,
+                                    e.payload.len(),
+                                    non_air,
+                                    rid_nonzero,
+                                    sample_rid,
+                                    game.as_ref().and_then(|g| g.block(sample_rid).map(|(n, _)| n.clone())),
+                                    sample
+                                );
+                            }
+                            Err(err) => println!("SUBCHUNK decode err: {err}"),
+                        }
+                    }
                 }
                 Packet::LevelChunk(c) => {
                     chunk_seen += 1;

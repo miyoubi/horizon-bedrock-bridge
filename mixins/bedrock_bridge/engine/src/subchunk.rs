@@ -83,7 +83,10 @@ impl SubChunk {
         let storage_count = match version_byte {
             8 => r.u8()? as usize,
             9 => {
-                return Ok(SubChunk::air());
+                // 1-byte storage count, then the sub-chunk's Y index.
+                let count = r.u8()? as usize;
+                let _y = r.u8()?;
+                count
             }
             n => n as usize,
         };
@@ -99,7 +102,18 @@ impl SubChunk {
         for _ in 0..storage_count {
             let header = r.u8()?;
             let runtime = header & 1 == 1;
-            let bits = (header | 1) >> 1;
+            let bits = header >> 1;
+            if bits == 0 {
+                // Single-value storage: one zigzag palette id, no packed words.
+                let id = r.zigzag32()?;
+                storages.push(BlockStorage {
+                    storage: BitStorage::new(1, 4096)?,
+                    palette: Palette::Runtime(vec![id]),
+                    layer,
+                });
+                layer = layer.saturating_add(1);
+                continue;
+            }
             let storage = BitStorage::read(r, bits, 4096)?;
             let palette_size = r.zigzag32()?;
             if palette_size < 0 {
@@ -126,8 +140,8 @@ impl SubChunk {
             layer = layer.saturating_add(1);
         }
         Ok(SubChunk {
+            empty: storages.is_empty(),
             storages,
-            empty: false,
         })
     }
 
@@ -219,7 +233,8 @@ mod tests {
 
     #[test]
     fn all_air_version_is_empty() {
-        let mut r = Reader::new(&[]);
+        // Version 9: a storage count (0) then the sub-chunk Y index.
+        let mut r = Reader::new(&[0u8, 0u8]);
         let section = SubChunk::read(&mut r, 9).unwrap();
         assert!(section.empty);
         assert_eq!(section.top_runtime_id(0, 0, 0), None);

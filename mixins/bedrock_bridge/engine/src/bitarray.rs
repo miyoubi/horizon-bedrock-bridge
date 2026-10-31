@@ -22,7 +22,10 @@ impl BitArrayVersion {
     /// The number of `u32` words a storage of `size` entries occupies. For the
     /// sub-chunk size (4096) every supported width divides evenly.
     pub fn words_for_size(&self, size: usize) -> usize {
-        (size * self.bits as usize).div_ceil(32)
+        // Bedrock packs each word with `32 / bits` entries (padded), not a
+        // continuous bitstream, so the count rounds by that block size.
+        let per_word = 32 / self.bits as usize;
+        size.div_ceil(per_word)
     }
 
     pub fn max_entry(&self) -> u32 {
@@ -86,14 +89,10 @@ impl BitStorage {
             return 0;
         }
         let bits = self.version.bits as usize;
-        let bit = index * bits;
-        let word = bit / 32;
-        let offset = bit % 32;
-        let mut value = (self.words[word] as u64) >> offset;
-        if offset + bits > 32 && word + 1 < self.words.len() {
-            value |= (self.words[word + 1] as u64) << (32 - offset);
-        }
-        (value as u32) & self.version.max_entry()
+        let per_word = 32 / bits;
+        let word = index / per_word;
+        let offset = (index % per_word) * bits;
+        (self.words[word] >> offset) & self.version.max_entry()
     }
 
     /// Set the entry at `index`, ignoring out-of-range writes.
@@ -104,16 +103,10 @@ impl BitStorage {
         let bits = self.version.bits as usize;
         let mask = self.version.max_entry();
         let value = value & mask;
-        let bit = index * bits;
-        let word = bit / 32;
-        let offset = bit % 32;
+        let per_word = 32 / bits;
+        let word = index / per_word;
+        let offset = (index % per_word) * bits;
         self.words[word] = (self.words[word] & !(mask << offset)) | (value << offset);
-        if offset + bits > 32 && word + 1 < self.words.len() {
-            let spill = bits - (32 - offset);
-            let low_mask = (1u32 << spill) - 1;
-            self.words[word + 1] =
-                (self.words[word + 1] & !low_mask) | ((value >> (32 - offset)) & low_mask);
-        }
     }
 }
 
@@ -126,10 +119,10 @@ mod tests {
         for (bits, words) in [
             (1u8, 128),
             (2, 256),
-            (3, 384),
+            (3, 410),
             (4, 512),
-            (5, 640),
-            (6, 768),
+            (5, 683),
+            (6, 820),
             (8, 1024),
             (16, 2048),
         ] {
