@@ -17,9 +17,25 @@ use crate::error::{Error, Result};
 use crate::protocol::{self, Out, Packet};
 use crate::raknet::RakNetClient;
 
+/// A byte-oriented transport that carries (compressed/encrypted) Bedrock
+/// batches: RakNet datagrams, or a NetherNet WebRTC data channel.
+pub trait Transport: Send {
+    fn send(&mut self, body: &[u8]) -> Result<()>;
+    fn recv(&mut self) -> Result<Option<Vec<u8>>>;
+}
+
+impl Transport for RakNetClient {
+    fn send(&mut self, body: &[u8]) -> Result<()> {
+        RakNetClient::send(self, body)
+    }
+    fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        RakNetClient::recv(self)
+    }
+}
+
 /// A live Bedrock connection.
 pub struct BedrockClient {
-    transport: RakNetClient,
+    transport: Box<dyn Transport>,
     cipher: Option<Cipher>,
     compression: bool,
     identity: Option<IdentityKey>,
@@ -39,7 +55,7 @@ impl BedrockClient {
             .map_err(|e| Error::transport(format!("could not resolve {host}:{port}: {e}")))?
             .next()
             .ok_or_else(|| Error::transport(format!("no address for {host}:{port}")))?;
-        let transport = RakNetClient::connect(addr, mtu)?;
+        let transport: Box<dyn Transport> = Box::new(RakNetClient::connect(addr, mtu)?);
         Ok(BedrockClient {
             transport,
             cipher: None,
@@ -52,6 +68,38 @@ impl BedrockClient {
             unique_id: 0,
             server_address: format!("{host}:{port}"),
         })
+    }
+
+    /// Build a client over an arbitrary transport (e.g. a NetherNet session).
+    pub fn with_transport(transport: Box<dyn Transport>, server_address: String) -> Self {
+        BedrockClient {
+            transport,
+            cipher: None,
+            compression: false,
+            identity: None,
+            pending_login: None,
+            pending_handshake: None,
+            logged_in: false,
+            runtime_id: 0,
+            unique_id: 0,
+            server_address,
+        }
+    }
+
+    /// Connect to a Bedrock server over NetherNet (WebRTC), completing the
+    /// offer/join handshake with the given identity.
+    #[cfg(feature = "nethernet-webrtc")]
+    pub fn connect_nethernet(
+        base: &str,
+        network_id: &str,
+        identity: &crate::nethernet::identity::ClientIdentity,
+    ) -> Result<Self> {
+        let transport =
+            crate::nethernet::transport::NetherNetTransport::connect(base, network_id, identity)?;
+        Ok(Self::with_transport(
+            Box::new(transport),
+            format!("{base}/{network_id}"),
+        ))
     }
 
     pub fn server_address(&self) -> &str {
@@ -70,12 +118,12 @@ impl BedrockClient {
         &mut self,
         identity: IdentityKey,
         handshake: HandshakeKey,
-        chain_json: String,
+        auth_info: String,
         skin_json: String,
     ) -> Result<()> {
         self.identity = Some(identity);
         self.pending_handshake = Some(handshake);
-        self.pending_login = Some((chain_json, skin_json));
+        self.pending_login = Some((auth_info, skin_json));
         self.send(&[Out::RequestNetworkSettings {
             protocol: crate::PROTOCOL_VERSION,
         }])
@@ -85,10 +133,23 @@ impl BedrockClient {
     pub fn send(&mut self, packets: &[Out]) -> Result<()> {
         let mut body = protocol::encode_batch(packets);
         if self.compression {
-            body = zlib_compress(&body)?;
+            // Modern Bedrock prefixes each batch with the compressor id:
+            // 0 = deflate, 255 = uncompressed.
+            let compressed = zlib_compress(&body)?;
+            let mut framed = Vec::with_capacity(compressed.len() + 1);
+            framed.push(0); // 0 = deflate
+            framed.extend_from_slice(&compressed);
+            body = framed;
         }
         if let Some(cipher) = self.cipher.as_mut() {
             cipher.encrypt(&mut body)?;
+        }
+        if std::env::var_os("NETHER_DEBUG").is_some() {
+            eprintln!(
+                "bedrock: send {} bytes (compression={})",
+                body.len(),
+                self.compression
+            );
         }
         self.transport.send(&body)
     }
@@ -98,18 +159,33 @@ impl BedrockClient {
         let Some(mut body) = self.transport.recv()? else {
             return Ok(Vec::new());
         };
+        if std::env::var_os("NETHER_DEBUG").is_some() {
+            eprintln!(
+                "bedrock: recv {} bytes (compression={})",
+                body.len(),
+                self.compression
+            );
+        }
         if let Some(cipher) = self.cipher.as_mut() {
             cipher.decrypt(&mut body)?;
         }
         let batch = if self.compression {
-            match zlib_decompress(&body) {
-                Ok(plain) => plain,
-                // The first NetworkSettings packet is not compressed.
-                Err(_) => body,
+            // After NetworkSettings every batch starts with the compressor id.
+            match body.first().copied() {
+                Some(0) => zlib_decompress(&body[1..]).unwrap_or_else(|_| body[1..].to_vec()),
+                Some(255) | None => body[1..].to_vec(),
+                _ => body,
             }
         } else {
             body
         };
+        if std::env::var_os("NETHER_DEBUG").is_some() {
+            eprintln!(
+                "bedrock: batch[{}] {:02x?}",
+                batch.len(),
+                &batch[..batch.len().min(96)]
+            );
+        }
         let packets = protocol::parse_batch(&batch)?;
         Ok(self.react(packets))
     }
@@ -121,11 +197,22 @@ impl BedrockClient {
             match packet {
                 Packet::NetworkSettings(p) => {
                     self.compression = p.compression_threshold > 0;
-                    if let Some((chain, skin)) = self.pending_login.take() {
-                        let _ = self.send(&[Out::Login {
-                            chain_json: chain,
+                    if std::env::var_os("NETHER_DEBUG").is_some() {
+                        eprintln!(
+                            "bedrock: NetworkSettings threshold={} algorithm={}",
+                            p.compression_threshold, p.compression_algorithm
+                        );
+                    }
+                    if let Some((auth_info, skin)) = self.pending_login.take() {
+                        if let Err(e) = self.send(&[Out::Login {
+                            auth_info,
                             skin_json: skin,
-                        }]);
+                        }]) {
+                            log::warn!("bedrock: Login send failed: {e}");
+                            if std::env::var_os("NETHER_DEBUG").is_some() {
+                                eprintln!("bedrock: Login send failed: {e}");
+                            }
+                        }
                     }
                 }
                 Packet::ServerToClientHandshake(jwt) => {
@@ -190,15 +277,16 @@ impl BedrockClient {
 }
 
 fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(4));
+    // Bedrock's "zlib" is raw deflate: no zlib header or Adler-32 trailer.
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(4));
     enc.write_all(data)?;
     Ok(enc.finish()?)
 }
 
 fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
-    // Bedrock historically used raw deflate; try zlib first, then raw.
+    // Raw deflate first (what Bedrock sends); fall back to zlib-wrapped.
     let mut out = Vec::new();
-    if flate2::read::ZlibDecoder::new(data)
+    if flate2::read::DeflateDecoder::new(data)
         .read_to_end(&mut out)
         .is_ok()
         && !out.is_empty()
@@ -206,7 +294,7 @@ fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
         return Ok(out);
     }
     let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(data)
+    flate2::read::ZlibDecoder::new(data)
         .read_to_end(&mut out)
         .map_err(|e| Error::decode(format!("zlib: {e}")))?;
     Ok(out)

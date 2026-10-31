@@ -108,7 +108,7 @@ pub enum Out {
         protocol: i32,
     },
     Login {
-        chain_json: String,
+        auth_info: String,
         skin_json: String,
     },
     ClientToServerHandshake,
@@ -305,15 +305,17 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.bytes(&protocol.to_be_bytes());
         }
         Out::Login {
-            chain_json,
+            auth_info,
             skin_json,
         } => {
+            // protocol (big-endian), then the varint-framed, length-prefixed
+            // (little-endian) authInfo and skin strings.
             w.varint(ids::LOGIN);
             w.bytes(&crate::PROTOCOL_VERSION.to_be_bytes());
             let mut body = Writer::new();
-            let chain = chain_json.as_bytes();
+            let auth = auth_info.as_bytes();
             let skin = skin_json.as_bytes();
-            body.i32(chain.len() as i32).bytes(chain);
+            body.i32(auth.len() as i32).bytes(auth);
             body.i32(skin.len() as i32).bytes(skin);
             w.byte_slice(&body.data);
         }

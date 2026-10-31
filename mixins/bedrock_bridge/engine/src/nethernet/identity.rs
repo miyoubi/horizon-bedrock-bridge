@@ -79,7 +79,12 @@ impl Jws {
     }
 
     fn sign_parts(key: &IdentityKey, payload: &str) -> Result<(String, String, String)> {
-        let header = B64URL.encode(r#"{"alg":"ES384"}"#);
+        // Bedrock JWTs carry the signing key in the `x5u` header; servers use it
+        // to tell a self-signed token from a service-issued one.
+        let header = B64URL.encode(format!(
+            r#"{{"alg":"ES384","x5u":"{}"}}"#,
+            crate::crypto::B64.encode(key.public_der())
+        ));
         let encoded = B64URL.encode(payload);
         let signature = key.sign(format!("{header}.{encoded}").as_bytes())?;
         Ok((header, encoded, B64URL.encode(signature)))

@@ -63,6 +63,11 @@ impl IdentityKey {
         &self.pkcs8
     }
 
+    /// An independent copy (ring's key type is not `Clone`).
+    pub fn try_clone(&self) -> Result<Self> {
+        Self::from_pkcs8(&self.pkcs8)
+    }
+
     /// The uncompressed EC point `0x04 || X || Y` (97 bytes for P-384).
     pub fn public_point(&self) -> &[u8] {
         &self.public_p384

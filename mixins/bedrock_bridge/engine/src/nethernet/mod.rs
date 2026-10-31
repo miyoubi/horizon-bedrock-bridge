@@ -22,6 +22,8 @@ pub mod message;
 pub mod sdp;
 pub mod signal;
 #[cfg(feature = "nethernet-webrtc")]
+pub mod transport;
+#[cfg(feature = "nethernet-webrtc")]
 pub mod webrtc;
 
 pub use codec::NetherCodec;

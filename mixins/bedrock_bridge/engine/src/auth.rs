@@ -260,6 +260,42 @@ pub struct LoginData {
 const MULTIPLAYER_RELYING_PARTY: &str = "https://multiplayer.minecraft.net/";
 const PLAYFAB_RELYING_PARTY: &str = "https://b980a380.minecraft.playfabapi.com/";
 
+/// A self-signed multiplayer token for offline logins (`AuthenticationType` 2).
+/// The server reads the player identity from it and binds `cpk` to the NetherNet
+/// transport identity, so `key` must be the session's identity key.
+pub fn self_signed_token(key: &IdentityKey, xuid: &str, name: &str, uuid: &str) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cpk = crate::crypto::B64.encode(key.public_der());
+    let claims = serde_json::json!({
+        "cpk": cpk,
+        "xid": xuid,
+        "xname": name,
+        "identity": uuid,
+        "leguuid": uuid,
+        "mid": "",
+        "iss": "self",
+        "aud": "api://auth-minecraft-services/multiplayer",
+        "iat": now,
+        "exp": now + 3600,
+    });
+    let header = format!(r#"{{"alg":"ES384","x5u":"{}"}}"#, cpk);
+    key.sign_jwt(&header, &claims.to_string())
+}
+
+/// The modern (1.21.90+) Bedrock `Login` authInfo: the Xbox chain plus the
+/// multiplayer token, with `AuthenticationType` Full.
+pub fn auth_info(chain_json: &str, multiplayer_token: &str, authentication_type: i32) -> String {
+    serde_json::json!({
+        "AuthenticationType": authentication_type,
+        "Certificate": format!("{chain_json}\n"),
+        "Token": multiplayer_token,
+    })
+    .to_string()
+}
+
 /// The `XBL3.0 x=<uhs>;<token>` header for the PlayFab relying party. PlayFab
 /// login (then `session/start`, then `multiplayer/session/start`) mints the
 /// NetherNet identity token from it.
@@ -358,10 +394,25 @@ pub fn login(
     server_address: &str,
     client_version: &str,
 ) -> Result<LoginData> {
+    login_with_identity(
+        msa_access_token,
+        server_address,
+        client_version,
+        IdentityKey::generate()?,
+    )
+}
+
+/// Like [`login`], but with a caller-supplied identity key, so the same key can
+/// back both the chain's `identityPublicKey` and the multiplayer token's `cpk`.
+pub fn login_with_identity(
+    msa_access_token: &str,
+    server_address: &str,
+    client_version: &str,
+    identity: IdentityKey,
+) -> Result<LoginData> {
     let (xsts_token, uhs) = xsts_for(msa_access_token, MULTIPLAYER_RELYING_PARTY)?;
 
     // --- Minecraft chain -------------------------------------------------
-    let identity = IdentityKey::generate()?;
     let identity_public = B64.encode(identity.public_der());
     let chain_request = serde_json::json!({ "identityPublicKey": identity_public });
     let chain = post_json(
@@ -521,7 +572,7 @@ fn random_i64() -> i64 {
     i64::from_le_bytes(bytes).abs()
 }
 
-fn uuid_string(u: [u8; 16]) -> String {
+pub fn uuid_string(u: [u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]

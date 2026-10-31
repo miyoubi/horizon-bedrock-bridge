@@ -163,12 +163,8 @@ fn run(
             return;
         }
     };
-    if let Err(e) = client.begin_login(
-        login.identity,
-        login.handshake,
-        login.chain_json,
-        login.skin_json,
-    ) {
+    let auth_info = bedrock_core::auth::auth_info(&login.chain_json, &login.multiplayer_token, 0);
+    if let Err(e) = client.begin_login(login.identity, login.handshake, auth_info, login.skin_json) {
         let _ = events.send(Event::Disconnected {
             reason: format!("Bedrock login failed: {e}"),
             from_server: false,
@@ -583,6 +579,7 @@ mod auth {
         pub handshake: bedrock_core::crypto::HandshakeKey,
         pub chain_json: String,
         pub skin_json: String,
+        pub multiplayer_token: String,
     }
 
     fn token_path() -> std::path::PathBuf {
@@ -615,11 +612,20 @@ mod auth {
         }
         let data = core_auth::login(&msa.access_token, &address, bedrock_core::MINECRAFT_VERSION)
             .map_err(|e| e.to_string())?;
+        // The multiplayer identity token, signed over the chain's own key.
+        use bedrock_core::nethernet::auth_service;
+        let xbl3 = core_auth::playfab_xbl3(&msa.access_token).map_err(|e| e.to_string())?;
+        let ticket = auth_service::playfab_login(&xbl3).map_err(|e| e.to_string())?;
+        let auth_header = auth_service::session_start(&ticket, bedrock_core::MINECRAFT_VERSION)
+            .map_err(|e| e.to_string())?;
+        let multiplayer_token = auth_service::multiplayer_token(&auth_header, &data.identity.public_der())
+            .map_err(|e| e.to_string())?;
         Ok(SignedIn {
             identity: data.identity,
             handshake: data.handshake,
             chain_json: data.chain_json,
             skin_json: data.skin_json,
+            multiplayer_token,
         })
     }
 }

@@ -1,21 +1,22 @@
-//! End-to-end NetherNet join using a Minecraft-authorization-service identity.
+//! End-to-end NetherNet login.
 //!
 //!   cargo run -p bedrock-core --features nethernet-webrtc --example netherjoin_auth -- \
-//!     http://127.0.0.1:19132 127.0.0.1:7551
+//!     http://127.0.0.1:19132 127.0.0.1:7551 127.0.0.1:19132
 //!
-//! Signs in with a Microsoft account via device code, mints the multiplayer
-//! identity token (PlayFab -> session/start -> multiplayer/session/start), then
-//! discovers, joins over WebRTC, and sends RequestNetworkSettings.
+//! Signs in (device code, cached), mints the multiplayer identity token, builds
+//! the Bedrock chain from the same Microsoft account, joins over NetherNet
+//! (WebRTC) and runs the login handshake to `StartGame`.
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use bedrock_core::auth::{begin_device_code, playfab_xbl3, poll_device_code};
+use bedrock_core::auth::{begin_device_code, login_with_identity, playfab_xbl3, poll_device_code};
+use bedrock_core::client::BedrockClient;
 use bedrock_core::crypto::IdentityKey;
 use bedrock_core::nethernet::auth_service;
+use bedrock_core::nethernet::discovery;
 use bedrock_core::nethernet::identity::ClientIdentity;
-use bedrock_core::nethernet::{discovery, webrtc::Session};
-use bedrock_core::protocol::{self, Out};
+use bedrock_core::protocol::Packet;
 
 fn discover(addr: &str) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -54,6 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let discovery_addr = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "127.0.0.1:7551".into());
+    let server_address = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "127.0.0.1:19132".into());
 
     // 1. Microsoft sign-in: reuse a cached refresh token, else device code.
     let cache = std::path::Path::new("/tmp/nnauth-msa.json");
@@ -71,57 +75,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("signed in");
 
-    // 2. PlayFab -> session -> multiplayer token.
+    // 2. NetherNet identity token: XSTS(PlayFab) -> PlayFab -> session ->
+    //    multiplayer/session/start with our P-384 key.
     let xbl3 = playfab_xbl3(&msa.access_token)?;
-    println!("got PlayFab XSTS");
     let ticket = auth_service::playfab_login(&xbl3)?;
-    println!("got PlayFab session ticket");
     let auth_header = auth_service::session_start(&ticket, bedrock_core::MINECRAFT_VERSION)?;
-    println!("got session authorization header");
-    let key = IdentityKey::generate()?;
-    let token = auth_service::multiplayer_token(&auth_header, &key.public_der())?;
+    let nether_key = IdentityKey::generate()?;
+    let token = auth_service::multiplayer_token(&auth_header, &nether_key.public_der())?;
     println!("got multiplayer identity token ({} bytes)", token.len());
-    let identity = ClientIdentity::external(key, token);
 
-    // 3. Discover + join.
+    // 3. Bedrock chain from the same account + the modern Login authInfo, then
+    //    log in over NetherNet.
+    let data = login_with_identity(
+        &msa.access_token,
+        &server_address,
+        bedrock_core::MINECRAFT_VERSION,
+        nether_key.try_clone()?,
+    )?;
+    println!("built chain for {}", data.display_name);
+    // The modern Login authInfo: the chain plus the multiplayer token, Full auth.
+    let auth_info = bedrock_core::auth::auth_info(&data.chain_json, &token, 0);
+    let identity = ClientIdentity::external(nether_key, token);
     let Some(network_id) = discover(&discovery_addr) else {
         return Err("no discovery reply".into());
     };
-    let mut session = Session::connect(&base, &network_id, &identity)?;
-    println!("offer sent, local udp {}", session.local_addr());
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while !session.is_ready() && Instant::now() < deadline {
-        session.pump(Duration::from_millis(250))?;
-    }
-    if !session.is_ready() {
-        println!("data channel did not open");
-        return Ok(());
-    }
-    println!("data channel open");
+    let mut client = BedrockClient::connect_nethernet(&base, &network_id, &identity)?;
+    println!("netherNet connected, data channel open");
+    client.begin_login(data.identity, data.handshake, auth_info, data.skin_json)?;
 
-    let batch = protocol::encode_batch(&[Out::RequestNetworkSettings {
-        protocol: bedrock_core::PROTOCOL_VERSION,
-    }]);
-    for segment in bedrock_core::nethernet::message::Message::split_into_segments(&batch)? {
-        session.send_reliable(&segment.encode())?;
-    }
-    println!("sent RequestNetworkSettings");
-
-    let mut reassembly = bedrock_core::nethernet::message::Message::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        for raw in session.pump(Duration::from_millis(250))? {
-            let Ok(seg) = bedrock_core::nethernet::message::MessageSegment::decode(&raw) else {
-                continue;
-            };
-            let Ok(Some(msg)) = reassembly.add_segment(seg) else {
-                continue;
-            };
-            for packet in protocol::parse_batch(&msg)? {
-                println!("<- {:?}", std::mem::discriminant(&packet));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while Instant::now() < deadline && !client.is_logged_in() {
+        for packet in client.poll()? {
+            let debug = format!("{packet:?}");
+            println!("<- {}", &debug[..debug.len().min(220)]);
+            match packet {
+                Packet::NetworkSettings(p) => println!(
+                    "  compression threshold={} algorithm={}",
+                    p.compression_threshold, p.compression_algorithm
+                ),
+                Packet::ResourcePacksInfo => client.accept_resource_packs()?,
+                Packet::StartGame(_) => client.request_chunks(8)?,
+                _ => {}
             }
         }
     }
-    session.close();
+    println!("logged in: {}", client.is_logged_in());
     Ok(())
 }
