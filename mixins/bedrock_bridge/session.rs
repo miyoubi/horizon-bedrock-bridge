@@ -25,6 +25,10 @@ const PREFIX: &str = "bedrock:";
 const RAKNET_PREFIX: &str = "bedrock+raknet:";
 const DEFAULT_PORT: u16 = 19132;
 
+/// How many columns one publisher update asks for. Each is a Bedrock round trip
+/// and the loop also pumps the WebRTC session, so it is spread out.
+const REQUESTS_PER_TICK: usize = 6;
+
 /// How many received packets one loop iteration translates. The loop also
 /// pumps the WebRTC session, so it must not spend long in translation.
 const TRANSLATE_PER_TICK: usize = 4;
@@ -280,6 +284,10 @@ fn run(
         spawn_yaw: 0.0,
         spawn_pitch: 0.0,
         published: 0,
+        sections: std::collections::HashMap::new(),
+        requests: Vec::new(),
+        wanted: std::collections::VecDeque::new(),
+        wanted_center: None,
         runtime_id: 0,
         unique_id: 0,
     };
@@ -312,6 +320,13 @@ fn run(
         }
         if !alive || bridge.shutdown.load(Ordering::Relaxed) {
             break;
+        }
+        // Sub-chunk requests queued while translating.
+        if !ctx.requests.is_empty() {
+            let batch: Vec<bedrock_core::protocol::Out> = ctx.requests.drain(..).collect();
+            if let Err(e) = client.send(&batch) {
+                log::warn!("bedrock: sub-chunk request failed: {e}");
+            }
         }
         // Bedrock → Java.
         match client.poll() {
@@ -379,6 +394,17 @@ mod translate {
         pub spawn_pitch: f32,
         /// How many times the position has been repeated since `StartGame`.
         pub published: u8,
+        /// The runtime ids of every section received for a column, by Java
+        /// section index. A partial chunk carries no blocks, so the column is
+        /// built from these as the sub-chunk replies arrive.
+        pub sections:
+            std::collections::HashMap<(i32, i32), std::collections::BTreeMap<i8, Vec<u32>>>,
+        /// Sub-chunk requests queued while translating; the session loop sends
+        /// them.
+        pub requests: Vec<bedrock_core::protocol::Out>,
+        /// Columns still to ask for, and the centre they were queued for.
+        pub wanted: std::collections::VecDeque<(i32, i32)>,
+        pub wanted_center: Option<(i32, i32)>,
         pub runtime_id: u64,
         pub unique_id: i64,
     }
@@ -467,12 +493,12 @@ mod translate {
     /// Bedrock sends only the sections it has, at their own indices, and no
     /// light, so the column is padded with air and lit uniformly. Real light
     /// needs the server's light data, which NetherNet does not forward.
-    fn column(
-        ctx: &mut Context,
-        chunk: &bedrock_core::protocol::packets::LevelChunk,
-    ) -> Option<play::LevelChunkWithLight> {
-        let decoded = bedrock_core::chunk::decode_sections(chunk).ok()?;
-        if decoded.is_empty() {
+    fn column(ctx: &mut Context, x: i32, z: i32) -> Option<play::LevelChunkWithLight> {
+        // Taken out of the map so the block registry can be borrowed while
+        // building from it, and put back before returning.
+        let known = ctx.sections.remove(&(x, z))?;
+        if known.is_empty() {
+            ctx.sections.insert((x, z), known);
             return None;
         }
         let blocks = ctx.blocks.as_mut()?;
@@ -480,8 +506,8 @@ mod translate {
         let count = dimension.sections();
         let mut filled: Vec<Option<Section>> = (0..count).map(|_| None).collect();
         let mut heights = [0i32; 256];
-        for section in &decoded {
-            let base = i32::from(section.y) * 16;
+        for (&y, ids) in &known {
+            let base = i32::from(y) * 16;
             let Some(slot) = usize::try_from((base - dimension.min_y) / 16)
                 .ok()
                 .filter(|i| *i < count)
@@ -490,7 +516,7 @@ mod translate {
             };
             let mut values = [0i32; 4096];
             let mut non_empty = 0i16;
-            for (i, runtime_id) in section.blocks.iter().enumerate() {
+            for (i, runtime_id) in ids.iter().enumerate() {
                 let id = blocks.java(*runtime_id as i32);
                 values[i] = id as i32;
                 if id == blocks.air {
@@ -555,9 +581,10 @@ mod translate {
             block: Vec::new(),
         };
 
+        ctx.sections.insert((x, z), known);
         Some(play::LevelChunkWithLight {
-            x: chunk.chunk_x,
-            z: chunk.chunk_z,
+            x,
+            z,
             chunk: ChunkData {
                 heightmaps,
                 buffer: ChunkData::from_sections(&sections),
@@ -602,6 +629,16 @@ mod translate {
 
     fn text_component(message: &str) -> JTag {
         JTag::compound([("text", JTag::String(JavaString::from(message)))])
+    }
+
+    /// The column as an event, once it has any blocks.
+    fn emit_column(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
+        match column(ctx, x, z) {
+            Some(chunk) => vec![Event::Packet(Box::new(
+                play::Clientbound::LevelChunkWithLight(chunk),
+            ))],
+            None => Vec::new(),
+        }
     }
 
     pub fn clientbound(ctx: &mut Context, packet: &bp::Packet) -> Vec<Event> {
@@ -823,26 +860,96 @@ mod translate {
             // The client creates its own player from a position packet, and that
             // is what ends the loading screen. At StartGame its chunk area is not
             // there yet, so the position is repeated while the server publishes
-            // chunks — a few times, then never again.
-            bp::Packet::NetworkChunkPublisherUpdate { .. } if ctx.published < 4 => {
-                ctx.published += 1;
-                vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
-                    play::PlayerPosition {
-                        teleport: 0,
-                        position: ctx.spawn,
-                        delta: [0.0; 3],
-                        yaw: ctx.spawn_yaw,
-                        pitch: ctx.spawn_pitch,
-                        relatives: 0,
-                    },
-                )))]
+            // chunks — a few times, then never again. The same update says which
+            // columns to ask for.
+            bp::Packet::NetworkChunkPublisherUpdate { position, radius } => {
+                let mut out = Vec::new();
+                if ctx.published < 4 {
+                    ctx.published += 1;
+                    out.push(Event::Packet(Box::new(play::Clientbound::PlayerPosition(
+                        play::PlayerPosition {
+                            teleport: 0,
+                            position: ctx.spawn,
+                            delta: [0.0; 3],
+                            yaw: ctx.spawn_yaw,
+                            pitch: ctx.spawn_pitch,
+                            relatives: 0,
+                        },
+                    ))));
+                }
+                let center = (position[0] >> 4, position[2] >> 4);
+                if ctx.wanted_center != Some(center) {
+                    ctx.wanted_center = Some(center);
+                    ctx.wanted.clear();
+                    let r = i32::try_from((*radius).min(12)).unwrap_or(4);
+                    for dx in -r..=r {
+                        for dz in -r..=r {
+                            ctx.wanted.push_back((center.0 + dx, center.1 + dz));
+                        }
+                    }
+                }
+                for _ in 0..super::REQUESTS_PER_TICK {
+                    let Some((cx, cz)) = ctx.wanted.pop_front() else {
+                        break;
+                    };
+                    // Every section of the column: the client meshes what it has.
+                    let offsets: Vec<[i8; 3]> = (-4..=19).map(|sy| [0i8, sy as i8, 0]).collect();
+                    ctx.requests
+                        .push(bedrock_core::protocol::Out::SubChunkRequest {
+                            dimension: 0,
+                            center: [cx, 4, cz],
+                            offsets,
+                        });
+                }
+                out
             }
-            bp::Packet::LevelChunk(c) => match column(ctx, c) {
-                Some(chunk) => vec![Event::Packet(Box::new(
-                    play::Clientbound::LevelChunkWithLight(chunk),
-                ))],
-                None => Vec::new(),
-            },
+            bp::Packet::LevelChunk(c) => {
+                // Whatever blocks the payload carries; the rest arrive as
+                // sub-chunk replies.
+                if let Ok(decoded) = bedrock_core::chunk::decode_sections(c) {
+                    let entry = ctx.sections.entry((c.chunk_x, c.chunk_z)).or_default();
+                    for section in decoded {
+                        entry.insert(section.y, section.blocks);
+                    }
+                }
+                emit_column(ctx, c.chunk_x, c.chunk_z)
+            }
+            // A column's blocks. A server running with client-side chunk
+            // generation sends partial chunks and answers these requests, so
+            // without this every column stays empty and never lights.
+            bp::Packet::SubChunk(sub) => {
+                let mut any = false;
+                for entry in &sub.entries {
+                    if entry.result != 1 || entry.payload.is_empty() {
+                        continue;
+                    }
+                    let mut r = bedrock_core::stream::Reader::new(&entry.payload[1..]);
+                    let Ok(sc) = bedrock_core::subchunk::SubChunk::read(&mut r, entry.payload[0])
+                    else {
+                        continue;
+                    };
+                    let y = (sub.position[1] + i32::from(entry.offset[1]) - 4) as i8;
+                    let mut ids = vec![0u32; 4096];
+                    for sy in 0..16usize {
+                        for sz in 0..16usize {
+                            for sx in 0..16usize {
+                                let id = sc.top_runtime_id(sx, sy, sz).unwrap_or(0);
+                                ids[(sy * 16 + sz) * 16 + sx] = u32::try_from(id).unwrap_or(0);
+                            }
+                        }
+                    }
+                    ctx.sections
+                        .entry((sub.position[0], sub.position[2]))
+                        .or_default()
+                        .insert(y, ids);
+                    any = true;
+                }
+                if any {
+                    emit_column(ctx, sub.position[0], sub.position[2])
+                } else {
+                    Vec::new()
+                }
+            }
             // Block updates, block entities, inventories and the rest still
             // need their own translation; see the README.
             _ => Vec::new(),

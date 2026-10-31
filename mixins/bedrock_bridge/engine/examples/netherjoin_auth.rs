@@ -339,7 +339,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         non_air
                                     );
                                 }
-                                Err(e) => println!("CHUNK decode error: {e}"),
+                                Err(e) => {
+                                    // Keep the payload: a column that fails to
+                                    // decode is never sent to the client, and the
+                                    // player's own column is what ends the
+                                    // loading screen.
+                                    let path = capture_dir().join(format!(
+                                        "chunk-fail-{}-{}.bin",
+                                        c.chunk_x, c.chunk_z
+                                    ));
+                                    let _ = std::fs::write(&path, &c.data);
+                                    println!("CHUNK decode error: {e} (payload at {path:?})");
+                                }
                             }
                         }
                     }
