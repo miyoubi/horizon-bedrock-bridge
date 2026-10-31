@@ -276,6 +276,10 @@ fn run(
         builtin: &builtin,
         mappings: &mappings,
         blocks,
+        spawn: [0.0; 3],
+        spawn_yaw: 0.0,
+        spawn_pitch: 0.0,
+        published: 0,
         runtime_id: 0,
         unique_id: 0,
     };
@@ -369,6 +373,12 @@ mod translate {
         /// Block-state resolution; absent if the game's registry could not be
         /// read, in which case chunks are skipped rather than sent as air.
         pub blocks: Option<Blocks>,
+        /// The position the client should hold, from `StartGame`.
+        pub spawn: [f64; 3],
+        pub spawn_yaw: f32,
+        pub spawn_pitch: f32,
+        /// How many times the position has been repeated since `StartGame`.
+        pub published: u8,
         pub runtime_id: u64,
         pub unique_id: i64,
     }
@@ -609,6 +619,16 @@ mod translate {
                     portal_cooldown: 0,
                     sea_level: 63,
                 };
+                // Remembered so the position can be sent again once the client
+                // has chunks: it is the packet that creates its own player, and
+                // that is what ends the loading screen.
+                ctx.spawn = [
+                    g.position[0] as f64,
+                    g.position[1] as f64,
+                    g.position[2] as f64,
+                ];
+                ctx.spawn_yaw = g.yaw;
+                ctx.spawn_pitch = g.pitch;
                 vec![
                     Event::Status("Bedrock login accepted".into()),
                     Event::Joined {
@@ -800,6 +820,23 @@ mod translate {
                 },
                 from_server: true,
             }],
+            // The client creates its own player from a position packet, and that
+            // is what ends the loading screen. At StartGame its chunk area is not
+            // there yet, so the position is repeated while the server publishes
+            // chunks — a few times, then never again.
+            bp::Packet::NetworkChunkPublisherUpdate { .. } if ctx.published < 4 => {
+                ctx.published += 1;
+                vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
+                    play::PlayerPosition {
+                        teleport: 0,
+                        position: ctx.spawn,
+                        delta: [0.0; 3],
+                        yaw: ctx.spawn_yaw,
+                        pitch: ctx.spawn_pitch,
+                        relatives: 0,
+                    },
+                )))]
+            }
             bp::Packet::LevelChunk(c) => match column(ctx, c) {
                 Some(chunk) => vec![Event::Packet(Box::new(
                     play::Clientbound::LevelChunkWithLight(chunk),
