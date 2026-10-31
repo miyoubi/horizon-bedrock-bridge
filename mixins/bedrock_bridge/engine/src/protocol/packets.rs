@@ -939,6 +939,7 @@ pub struct MobEquipment {
     pub runtime_id: u64,
     pub new_item: NetworkItem,
     pub slot: u8,
+    pub selected_slot: u8,
     pub window_id: u8,
 }
 
@@ -947,11 +948,13 @@ impl MobEquipment {
         let runtime_id = r.varlong()?;
         let new_item = NetworkItem::read(r)?;
         let slot = r.u8()?;
+        let selected_slot = r.u8()?;
         let window_id = r.u8()?;
         Ok(MobEquipment {
             runtime_id,
             new_item,
             slot,
+            selected_slot,
             window_id,
         })
     }
