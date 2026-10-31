@@ -244,9 +244,29 @@ impl BedrockBlockMappings {
     /// an empty/absent query, and an entry with no `bedrock_identifier` is
     /// skipped (its Bedrock name is the Java name, unknown to this table alone).
     pub fn by_bedrock_state(&self, name: &str, states: Option<&crate::nbt::Tag>) -> Option<usize> {
+        // NBT compound field order is not significant, so compare canonical forms.
+        let want = states.map(canonical_states);
         self.entries.iter().position(|e| {
-            e.bedrock_identifier.as_deref() == Some(name) && e.states.as_ref() == states
+            e.bedrock_identifier.as_deref() == Some(name)
+                && e.states.as_ref().map(canonical_states) == want
         })
+    }
+}
+
+/// Sort every compound's fields so equivalent state maps compare equal.
+fn canonical_states(tag: &crate::nbt::Tag) -> crate::nbt::Tag {
+    use crate::nbt::Tag as B;
+    match tag {
+        B::Compound(fields) => {
+            let mut sorted: Vec<(String, B)> = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), canonical_states(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            B::Compound(sorted)
+        }
+        B::List(items) => B::List(items.iter().map(canonical_states).collect()),
+        other => other.clone(),
     }
 }
 

@@ -7,8 +7,7 @@
 //! block-state id Horizon expects.
 
 use crate::error::Result;
-use crate::mapping::BedrockBlockMappings;
-use crate::protocol::packets::{LevelChunk, StartGame};
+use crate::protocol::packets::LevelChunk;
 use crate::stream::Reader;
 use crate::subchunk::SubChunk;
 
@@ -25,21 +24,20 @@ pub fn java_index(x: usize, y: usize, z: usize) -> usize {
     (y * 16 + z) * 16 + x
 }
 
-/// Resolve a Bedrock runtime id to a Java block-state id through the world's
-/// palette and the Bedrock→Java table.
-pub fn java_block_state(game: &StartGame, mappings: &BedrockBlockMappings, runtime_id: i32) -> u32 {
-    game.block(runtime_id)
-        .and_then(|(name, states)| mappings.by_bedrock_state(name, Some(states)))
-        .map(|id| id as u32)
-        .unwrap_or(0)
+/// A runtime id's Bedrock identity. Turning this into the game's block-state id
+/// is the mod's job: the Java name (and property spelling) comes from Horizon's
+/// block registry, which the engine cannot see.
+pub fn bedrock_block(
+    table: &crate::blockstates::BlockStates,
+    runtime_id: i32,
+) -> Option<(String, crate::nbt::Tag)> {
+    let (name, states) = table.get(runtime_id)?;
+    let tag = crate::blockstates::states_to_tag(states);
+    Some((name, tag.unwrap_or(crate::nbt::Tag::End)))
 }
 
 /// Decode every sub-chunk of `chunk` into Java block states.
-pub fn decode_sections(
-    game: &StartGame,
-    chunk: &LevelChunk,
-    mappings: &BedrockBlockMappings,
-) -> Result<Vec<ChunkSection>> {
+pub fn decode_sections(chunk: &LevelChunk) -> Result<Vec<ChunkSection>> {
     // The serialized chunk data starts with its own sub-chunk count; the
     // packet's `sub_chunk_count` field reads 0 from a modern server.
     let (count, offset) = if chunk.sub_chunk_count == 0 && !chunk.data.is_empty() {
@@ -58,7 +56,9 @@ pub fn decode_sections(
             for z in 0..16 {
                 for x in 0..16 {
                     let runtime_id = sub.top_runtime_id(x, y, z).unwrap_or(0);
-                    blocks[java_index(x, y, z)] = java_block_state(game, mappings, runtime_id);
+                    // Runtime ids are the Bedrock block identity; the mod maps
+                    // them to the game's block-state ids.
+                    blocks[java_index(x, y, z)] = u32::try_from(runtime_id).unwrap_or(0);
                 }
             }
         }
@@ -73,6 +73,27 @@ pub fn decode_sections(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_known_palette_ids() {
+        let table = crate::blockstates::BlockStates::load_gz(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("data/blockstates-1.26.60.txt.gz"),
+        )
+        .unwrap();
+        // Palette ids captured from a real section.
+        assert_eq!(bedrock_block(&table, 18894).unwrap().0, "minecraft:air");
+        assert_eq!(bedrock_block(&table, 1899).unwrap().0, "minecraft:oak_log");
+        assert_eq!(
+            bedrock_block(&table, 3596).unwrap().0,
+            "minecraft:oak_leaves"
+        );
+        assert_eq!(
+            bedrock_block(&table, 9659).unwrap().0,
+            "minecraft:birch_leaves"
+        );
+        assert!(bedrock_block(&table, -1).is_none());
+    }
 
     #[test]
     fn java_index_matches_minecraft_ordering() {

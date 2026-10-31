@@ -150,8 +150,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     let mappings = bedrock_core::mapping::BedrockBlockMappings::load(&blocks_path).ok();
     println!("block mappings: {:?}", mappings.as_ref().map(|m| m.len()));
-    let mut game: Option<bedrock_core::protocol::packets::StartGame> = None;
+    let states_path = std::env::var_os("BEDROCK_BLOCKSTATES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new("mixins/bedrock_bridge/engine/data/blockstates-1.26.60.txt.gz")
+                .to_path_buf()
+        });
+    let table = bedrock_core::blockstates::BlockStates::load_gz(&states_path).ok();
+    println!("block states: {:?}", table.as_ref().map(|t| t.len()));
     let mut chunk_seen = 0usize;
+    let mut pub_seen = 0usize;
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -184,7 +192,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         center: [cx, 4, cz],
                         offsets,
                     }]);
-                    game = Some(g);
                     client.send(&[bedrock_core::protocol::Out::ClientCacheStatus {
                         supported: false,
                     }])?;
@@ -210,11 +217,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut r = bedrock_core::stream::Reader::new(&e.payload[1..]);
                         match bedrock_core::subchunk::SubChunk::read(&mut r, e.payload[0]) {
                             Ok(sub) => {
+                                if let Some(s0) = sub.storages.first() {
+                                    println!(
+                                        "DBG bits={} words={} idx0={} idx1240={} idx2480={}",
+                                        s0.storage.bits(),
+                                        s0.storage.words().len(),
+                                        s0.storage.get(0),
+                                        s0.storage.get(1240),
+                                        s0.storage.get(2480)
+                                    );
+                                    if let bedrock_core::subchunk::Palette::Runtime(ids) =
+                                        &s0.palette
+                                    {
+                                        println!("DBG palette={:?}", &ids[..ids.len().min(12)]);
+                                        if let Some(t) = table.as_ref() {
+                                            for id in ids.iter().take(8) {
+                                                let (n, st) = t.get(*id).unwrap_or_default();
+                                                println!("DBG id={id} name={n} states={st}");
+                                            }
+                                        }
+                                    }
+                                }
                                 let mut non_air = 0usize;
                                 let mut sample = 0u32;
                                 let mut rid_nonzero = 0usize;
                                 let mut sample_rid = -1i32;
-                                if let (Some(g), Some(m)) = (game.as_ref(), mappings.as_ref()) {
+                                if let Some(t) = table.as_ref() {
                                     for y in 0..16 {
                                         for z in 0..16 {
                                             for x in 0..16 {
@@ -223,12 +251,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     rid_nonzero += 1;
                                                     sample_rid = rid;
                                                 }
-                                                let j = bedrock_core::chunk::java_block_state(
-                                                    g, m, rid,
-                                                );
-                                                if j != 0 {
+                                                if t.get(rid)
+                                                    .map(|(n, _)| n != "minecraft:air")
+                                                    .unwrap_or(false)
+                                                {
                                                     non_air += 1;
-                                                    sample = j;
+                                                    sample = rid as u32;
                                                 }
                                             }
                                         }
@@ -246,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     non_air,
                                     rid_nonzero,
                                     sample_rid,
-                                    game.as_ref().and_then(|g| g.block(sample_rid).map(|(n, _)| n.clone())),
+                                    table.as_ref().and_then(|t| t.get(sample_rid).map(|(n, _)| n)),
                                     sample
                                 );
                             }
@@ -254,6 +282,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // Ask for the centre column's sections once the server has
+                // published the chunk area (a few times, then stop).
+                Packet::NetworkChunkPublisherUpdate { position, .. } if pub_seen < 3 => {
+                    pub_seen += 1;
+                    let cx = position[0] >> 4;
+                    let cz = position[2] >> 4;
+                    let offsets: Vec<[i8; 3]> = (-2..=4).map(|sy| [0i8, sy, 0]).collect();
+                    let _ = client.send(&[bedrock_core::protocol::Out::SubChunkRequest {
+                        dimension: 0,
+                        center: [cx, 4, cz],
+                        offsets,
+                    }]);
+                }
+                Packet::NetworkChunkPublisherUpdate { .. } => {}
                 Packet::LevelChunk(c) => {
                     chunk_seen += 1;
                     if chunk_seen <= 3 {
@@ -268,15 +310,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     if chunk_seen <= 3 {
-                        if let (Some(g), Some(m)) = (game.as_ref(), mappings.as_ref()) {
-                            match bedrock_core::chunk::decode_sections(g, &c, m) {
+                        if let Some(t) = table.as_ref() {
+                            match bedrock_core::chunk::decode_sections(&c) {
                                 Ok(sections) => {
                                     let total: usize =
                                         sections.iter().map(|s| s.blocks.len()).sum();
                                     let non_air = sections
                                         .iter()
                                         .flat_map(|s| s.blocks.iter())
-                                        .filter(|b| **b != 0)
+                                        .filter(|b| {
+                                            t.get(**b as i32)
+                                                .map(|(n, _)| n != "minecraft:air")
+                                                .unwrap_or(false)
+                                        })
                                         .count();
                                     println!(
                                         "CHUNK({},{}) sections={} blocks={} non_air={}",
