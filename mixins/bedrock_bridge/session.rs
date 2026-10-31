@@ -1044,13 +1044,20 @@ mod translate {
                 let entries: Vec<play::PlayerInfo> = list
                     .entries
                     .iter()
-                    .filter(|entry| entry.skin.is_some())
-                    .map(|entry| play::PlayerInfo {
-                        uuid: u128::from_be_bytes(entry.uuid),
-                        name: Some(entry.username.clone()),
-                        listed: Some(true),
-                        latency: Some(0),
-                        ..Default::default()
+                    .filter_map(|entry| {
+                        let skin = entry.skin.as_ref()?;
+                        Some(play::PlayerInfo {
+                            uuid: u128::from_be_bytes(entry.uuid),
+                            name: Some(entry.username.clone()),
+                            properties: vec![horizon_protocol::packets::login::Property {
+                                name: "textures".into(),
+                                value: bedrock_core::png::textures_value(skin),
+                                signature: None,
+                            }],
+                            listed: Some(true),
+                            latency: Some(0),
+                            ..Default::default()
+                        })
                     })
                     .collect();
                 if entries.is_empty() {

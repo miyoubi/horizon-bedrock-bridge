@@ -78,3 +78,16 @@ mod tests {
         assert_eq!(raw, [0, 255, 0, 0, 255, 0, 255, 0, 255]);
     }
 }
+
+/// The value of Java's `textures` profile property for a Bedrock skin: base64
+/// JSON whose `SKIN` entry is the image as a PNG data URL. Bedrock sends the
+/// pixels, so the image travels inside the property rather than behind a URL
+/// the client would have to fetch.
+pub fn textures_value(skin: &crate::protocol::packets::Skin) -> String {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let png = encode_rgba(skin.width, skin.height, &skin.data);
+    let url = format!("data:image/png;base64,{}", engine.encode(&png));
+    let json = format!(r#"{{"textures":{{"SKIN":{{"url":"{url}"}}}}}}"#);
+    engine.encode(json.as_bytes())
+}
