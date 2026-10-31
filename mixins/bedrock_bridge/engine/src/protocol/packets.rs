@@ -102,7 +102,9 @@ impl NetworkItem {
         let count = r.i16()?;
         let damage = r.varint()?;
         if r.bool()? {
-            let _net_id = r.zigzag32()?;
+            // Both references read this unsigned; it is only reached for stacks
+            // that carry a stack id, and its value is unused.
+            let _net_id = r.varint()?;
         }
         let block_runtime_id = r.varint()?;
         let mut nbt = None;
