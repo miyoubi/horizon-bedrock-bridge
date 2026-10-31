@@ -184,6 +184,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if e.result != 1 || e.payload.is_empty() {
                             continue;
                         }
+                        let _ = std::fs::write(
+                            format!(
+                                "/mnt/sub-{}-{}-{}-{}-{}-{}.bin",
+                                sc.position[0],
+                                sc.position[1],
+                                sc.position[2],
+                                e.offset[0],
+                                e.offset[1],
+                                e.offset[2]
+                            ),
+                            &e.payload,
+                        );
                         let mut r = bedrock_core::stream::Reader::new(&e.payload[1..]);
                         match bedrock_core::subchunk::SubChunk::read(&mut r, e.payload[0]) {
                             Ok(sub) => {
