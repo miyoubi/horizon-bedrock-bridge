@@ -703,6 +703,14 @@ mod translate {
                             z: g.position[2] as i32 >> 4,
                         },
                     ))),
+                    // LEVEL_CHUNKS_LOAD_START: the level tracker sits in
+                    // `WaitingForServer` until this arrives, and its tick does
+                    // nothing before that — so without it the loading screen
+                    // never closes, however much of the world has arrived.
+                    Event::Packet(Box::new(play::Clientbound::GameEvent(play::GameEvent {
+                        event: 13,
+                        param: 0.0,
+                    }))),
                 ]
             }
             bp::Packet::Text(t) => {
