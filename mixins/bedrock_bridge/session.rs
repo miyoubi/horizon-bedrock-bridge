@@ -543,7 +543,10 @@ mod translate {
                         },
                     ))),
                     Event::Packet(Box::new(play::Clientbound::SetChunkCacheCenter(
-                        play::SetChunkCacheCenter { x: 0, z: 0 },
+                        play::SetChunkCacheCenter {
+                            x: g.position[0] as i32 >> 4,
+                            z: g.position[2] as i32 >> 4,
+                        },
                     ))),
                 ]
             }
