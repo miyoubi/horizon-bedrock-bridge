@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::nbt::Tag;
 
 /// The block-state palette of the Bedrock version this crate targets.
-const BUNDLED: &[u8] = include_bytes!("../data/blockstates-1.26.60.txt.gz");
+const BUNDLED: &[u8] = include_bytes!("../../data/blockstates-1.26.60.txt.gz");
 
 /// The version's block-state palette, indexed by runtime id.
 pub struct BlockStates {

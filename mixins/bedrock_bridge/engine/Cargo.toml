@@ -27,8 +27,10 @@ subtle = "2.6.1"
 zeroize = "1.9.1"
 log = "0.4.34"
 # WebRTC (webrtc-rs, sans-I/O), for the NetherNet transport. Off unless the
-# `nethernet-webrtc` feature is on; it is in Horizon's Cargo.lock (enabled there
-# via the same optional `rtc` dependency), so a staged native build accepts it.
+# `nethernet-webrtc` feature is on. Horizon's Cargo.lock has no WebRTC crate and
+# horizon-mixins allows a bundle crate only what that lock holds, so `tools/package.py`
+# strips this line from the shipped bundle: NetherNet builds and tests here, the
+# bundle ships RakNet. Add `rtc` to Horizon's lock to ship both.
 rtc = { version = "0.21", optional = true }
 bytes = { version = "1.12.1", optional = true }
 

@@ -16,6 +16,27 @@ ROOT = Path(__file__).resolve().parents[1]
 GAME = '26.3'
 
 
+def lock_safe_engine(text):
+    """The engine manifest as the bundle ships it: without the WebRTC dependency.
+
+    horizon-mixins takes Horizon's `Cargo.lock` as the allow list for a bundle
+    crate's dependencies, and it walks every entry of every dependency table,
+    `optional` ones included. Horizon's lock carries no WebRTC crate, so the
+    NetherNet driver cannot be declared and the bundle ships the RakNet
+    transport; put `rtc` in Horizon's lock to ship both. The repository keeps
+    the dependency, so NetherNet still builds and tests here.
+    """
+    kept = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith('rtc = '):
+            continue
+        if line.startswith('nethernet-webrtc = '):
+            kept.append('nethernet-webrtc = ["dep:bytes"]\n')
+            continue
+        kept.append(line)
+    return ''.join(kept)
+
+
 def package():
     compat = json.loads((ROOT / 'compatibility.json').read_text())
     manifests = sorted((ROOT / 'mixins').glob('*/horizon-mixin.toml'))
@@ -32,15 +53,28 @@ def package():
         raise SystemExit('horizon-mixin.toml and compatibility.json pin different Horizon revisions')
     manifest = dict(schema=1, id=mod['id'], version=mod['version'], game=GAME,
                     horizon=compat['horizon_revision'], mixins=compat['horizon_mixins_revision'])
-    files = {'horizon-native.json': (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()}
+    text = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
+    # At the repo root too: a folder with a `horizon-mixin.toml` at the top is read as a plain
+    # source mod and its pins are dropped (horizon_mixins::bundle_in passes `mixins: None`), so a
+    # mod installed straight from the repository would get the launcher's built-in horizon-mixins.
+    # The root manifest marks the repository as an unpacked `.hnmod`, which keeps the pins.
+    (ROOT / 'horizon-native.json').write_bytes(text)
+    files = {'horizon-native.json': text}
     # Recurse into the bundle: hooks live in hooks/ and the bundle crate in
     # engine/ (its Cargo.toml and src/*.rs), so a flat scan would drop them.
     for path in sorted(bundle.rglob('*')):
-        if not path.is_file() or path.suffix not in ('.rs', '.toml'):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(bundle).as_posix()
+        # What a bundle may hold: Rust and TOML anywhere, other files only under data/.
+        if path.suffix not in ('.rs', '.toml') and not relative.startswith('data/'):
             continue
         if 'target' in path.relative_to(bundle).parts:
             continue
-        files[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+        content = path.read_bytes()
+        if relative == 'engine/Cargo.toml':
+            content = lock_safe_engine(content.decode()).encode()
+        files[path.relative_to(ROOT).as_posix()] = content
     out = ROOT / 'target' / f"{mod['id']}-{mod['version']}.hnmod"
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as archive:

@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let states_path = std::env::var_os("BEDROCK_BLOCKSTATES")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::path::Path::new("mixins/bedrock_bridge/engine/data/blockstates-1.26.60.txt.gz")
+            std::path::Path::new("mixins/bedrock_bridge/data/blockstates-1.26.60.txt.gz")
                 .to_path_buf()
         });
     let table = bedrock_core::blockstates::BlockStates::load_gz(&states_path).ok();

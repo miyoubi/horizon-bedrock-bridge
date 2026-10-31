@@ -78,7 +78,7 @@ mod tests {
     fn resolves_known_palette_ids() {
         let table = crate::blockstates::BlockStates::load_gz(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("data/blockstates-1.26.60.txt.gz"),
+                .join("../data/blockstates-1.26.60.txt.gz"),
         )
         .unwrap();
         // Palette ids captured from a real section.
