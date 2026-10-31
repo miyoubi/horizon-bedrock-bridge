@@ -256,7 +256,8 @@ impl BedrockClient {
                     self.unique_id = g.entity_unique_id;
                     self.runtime_id = g.entity_runtime_id as i64;
                 }
-                Packet::PlayStatus(status) if *status == 3 => {
+                // 0 = LoginSuccess, 3 = PlayerSpawn.
+                Packet::PlayStatus(status) if *status == 0 || *status == 3 => {
                     self.logged_in = true;
                 }
                 _ => {}

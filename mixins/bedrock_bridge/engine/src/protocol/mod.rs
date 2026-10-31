@@ -289,7 +289,13 @@ pub fn parse_batch(data: &[u8]) -> Result<Vec<Packet>> {
         let entry = r.bytes(len)?;
         let mut e = Reader::new(entry);
         let id = e.varint()?;
-        out.push(decode(id, e.rest())?);
+        let body = e.rest().to_vec();
+        // A packet we cannot decode yet must not abort the whole stream: keep
+        // the raw body so the caller can log it and carry on.
+        match decode(id, &body) {
+            Ok(packet) => out.push(packet),
+            Err(_) => out.push(Packet::Raw(id, body)),
+        }
     }
     Ok(out)
 }
