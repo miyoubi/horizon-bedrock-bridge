@@ -166,6 +166,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Packet::StartGame(g) => {
                     game = Some(g);
+                    client.send(&[bedrock_core::protocol::Out::ClientCacheStatus {
+                        supported: false,
+                    }])?;
                     client.request_chunks(8)?;
                 }
                 Packet::LevelChunk(c) => {
