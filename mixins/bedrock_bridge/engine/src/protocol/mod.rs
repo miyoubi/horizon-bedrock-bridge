@@ -295,10 +295,13 @@ pub fn parse_batch(data: &[u8]) -> Result<Vec<Packet>> {
             let want = dump == "all" || dump.parse::<u32>().ok() == Some(id);
             if want {
                 use std::io::Write as _;
+                let path = std::env::var_os("NETHER_DUMP_FILE")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::temp_dir().join("nether-raw-packets.log"));
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("/mnt/raw-packets.log")
+                    .open(path)
                 {
                     let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
                     let _ = writeln!(f, "{id} {} {hex}", body.len());

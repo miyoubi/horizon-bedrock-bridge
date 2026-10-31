@@ -35,6 +35,14 @@ fn discover(addr: &str) -> Option<String> {
     Some(sender.to_string())
 }
 
+/// Where this diagnostic example writes captures: `NETHER_CAPTURE_DIR`, else
+/// the OS temp directory.
+fn capture_dir() -> std::path::PathBuf {
+    std::env::var_os("NETHER_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn sign_in() -> Result<bedrock_core::auth::MsaToken, Box<dyn std::error::Error>> {
     let code = begin_device_code()?;
     println!(
@@ -111,8 +119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (t, ai)
     };
     println!("AUTHINFO {}", &auth_info[..auth_info.len().min(160)]);
-    let _ = std::fs::write("/mnt/our-token.txt", &token);
-    let _ = std::fs::write("/mnt/our-skin.jwt", &data.skin_json);
+    let _ = std::fs::write(capture_dir().join("our-token.txt"), &token);
+    let _ = std::fs::write(capture_dir().join("our-skin.jwt"), &data.skin_json);
     let identity = ClientIdentity::external(nether_key, token);
     let Some(_server_id) = discover(&discovery_addr) else {
         return Err("no discovery reply".into());
@@ -122,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = BedrockClient::connect_nethernet(&base, &client_id, &identity)?;
     println!("netherNet connected, data channel open");
     let skin_json = if std::env::var_os("NETHER_BPSKIN").is_some() {
-        let payload = std::fs::read_to_string("/mnt/bp-skin-payload.json")?;
+        let payload = std::fs::read_to_string(capture_dir().join("bp-skin-payload.json"))?;
         let header = serde_json::json!({
             "alg": "ES384",
             "x5u": bedrock_core::crypto::B64.encode(data.identity.public_der()),
@@ -134,10 +142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     client.begin_login(data.identity, data.handshake, auth_info, skin_json)?;
 
-    let mappings = bedrock_core::mapping::BedrockBlockMappings::load(std::path::Path::new(
-        "/mnt/project/references/mappings-master/blocks.nbt",
-    ))
-    .ok();
+    // `BEDROCK_BLOCKS_NBT` names the block table; default to the reference dump.
+    let blocks_path = std::env::var_os("BEDROCK_BLOCKS_NBT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new("references/mappings-master/blocks.nbt").to_path_buf()
+        });
+    let mappings = bedrock_core::mapping::BedrockBlockMappings::load(&blocks_path).ok();
     println!("block mappings: {:?}", mappings.as_ref().map(|m| m.len()));
     let mut game: Option<bedrock_core::protocol::packets::StartGame> = None;
     let mut chunk_seen = 0usize;
@@ -185,15 +196,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         let _ = std::fs::write(
-                            format!(
-                                "/mnt/sub-{}-{}-{}-{}-{}-{}.bin",
+                            capture_dir().join(format!(
+                                "sub-{}-{}-{}-{}-{}-{}.bin",
                                 sc.position[0],
                                 sc.position[1],
                                 sc.position[2],
                                 e.offset[0],
                                 e.offset[1],
                                 e.offset[2]
-                            ),
+                            )),
                             &e.payload,
                         );
                         let mut r = bedrock_core::stream::Reader::new(&e.payload[1..]);
