@@ -43,6 +43,7 @@ pub mod error;
 pub mod mapping;
 pub mod nbt;
 pub mod nethernet;
+pub mod png;
 pub mod protocol;
 pub mod raknet;
 pub mod stream;
