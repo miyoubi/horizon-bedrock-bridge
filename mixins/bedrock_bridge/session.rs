@@ -17,21 +17,52 @@ use horizon_protocol::registry::Builtin;
 
 use super::{Cookies, Event, Session};
 
-/// Addresses the bridge handles: `bedrock:host[:port]` (default port 19132).
+/// Addresses the bridge handles: `bedrock:host[:port]`, which is NetherNet —
+/// the transport the Bedrock client itself uses, and what a Bedrock server
+/// serves by default — or `bedrock+raknet:host[:port]` for a server started
+/// with `transport=raknet`. Both default to port 19132.
 const PREFIX: &str = "bedrock:";
+const RAKNET_PREFIX: &str = "bedrock+raknet:";
 const DEFAULT_PORT: u16 = 19132;
 
 /// Whether `address` names a Bedrock server rather than a Java one.
 pub fn is_bedrock(address: &str) -> bool {
-    address.starts_with(PREFIX)
+    address.starts_with(PREFIX) || address.starts_with(RAKNET_PREFIX)
+}
+
+/// Whether the address asks for RakNet; NetherNet is the default.
+fn over_raknet(address: &str) -> bool {
+    address.starts_with(RAKNET_PREFIX)
+}
+
+/// The address without its scheme.
+fn bare(address: &str) -> &str {
+    address
+        .strip_prefix(RAKNET_PREFIX)
+        .or_else(|| address.strip_prefix(PREFIX))
+        .unwrap_or(address)
+}
+
+/// NetherNet's signalling base: a URL when the address carries one, else the
+/// server's own HTTP service, which is what a Bedrock server answers on.
+fn base(address: &str, host: &str, port: u16) -> String {
+    let rest = bare(address);
+    if rest.starts_with("http://") || rest.starts_with("https://") {
+        rest.trim_end_matches('/').to_owned()
+    } else {
+        format!("http://{host}:{port}")
+    }
 }
 
 fn split(address: &str) -> (String, u16) {
-    let rest = address.strip_prefix(PREFIX).unwrap_or(address);
+    let rest = bare(address);
     match rest.rsplit_once(':') {
-        Some((host, port)) if port.parse::<u16>().is_ok() => {
-            (host.to_owned(), port.parse().unwrap())
-        }
+        Some((host, port)) if port.parse::<u16>().is_ok() => (
+            host.trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_owned(),
+            port.parse().unwrap(),
+        ),
         _ => (rest.to_owned(), DEFAULT_PORT),
     }
 }
@@ -126,6 +157,30 @@ pub fn on_disconnect(address: &str) {
     }
 }
 
+/// The Bedrock client for an address: NetherNet by default, which is what the
+/// Bedrock client itself speaks and what a server serves unless it was started
+/// with `transport=raknet`, which `bedrock+raknet:` asks for.
+fn connect(
+    address: &str,
+    host: &str,
+    port: u16,
+    login: &auth::SignedIn,
+) -> Result<bedrock_core::client::BedrockClient, String> {
+    if over_raknet(address) {
+        return bedrock_core::client::BedrockClient::connect(host, port, 1400)
+            .map_err(|e| e.to_string());
+    }
+    // The identity key the chain was built on, with the multiplayer token the
+    // authorization service signed over it: what the join asserts.
+    let identity = bedrock_core::nethernet::identity::ClientIdentity::external(
+        login.identity.try_clone().map_err(|e| e.to_string())?,
+        login.multiplayer_token.clone(),
+    );
+    // The join path carries the client's own NetworkID, per the onboarding guide.
+    bedrock_core::client::BedrockClient::connect_nethernet(&base(address, host, port), "1", &identity)
+        .map_err(|e| e.to_string())
+}
+
 fn run(
     address: &str,
     name: &str,
@@ -139,25 +194,30 @@ fn run(
         let _ = events.send(Event::Status(text));
     };
     let (host, port) = split(address);
-    status(format!("Connecting to Bedrock server {host}:{port}"));
+    let raknet = over_raknet(address);
+    status(format!(
+        "Connecting to Bedrock server {host}:{port} over {}",
+        if raknet { "RakNet" } else { "NetherNet" }
+    ));
 
-    let mut client = match bedrock_core::client::BedrockClient::connect(&host, port, 1400) {
-        Ok(c) => c,
+    // Sign-in comes first: over NetherNet the identity key and the multiplayer
+    // token signed over it are what the WebRTC join asserts.
+    let login = match auth::sign_in(&host, port, &status) {
+        Ok(l) => l,
         Err(e) => {
             let _ = events.send(Event::Disconnected {
-                reason: format!("Bedrock connection failed: {e}"),
+                reason: format!("Xbox sign-in failed: {e}"),
                 from_server: false,
             });
             return;
         }
     };
 
-    // Xbox sign-in (device code), then the Minecraft JWT chain.
-    let login = match auth::sign_in(&host, port) {
-        Ok(l) => l,
+    let mut client = match connect(address, &host, port, &login) {
+        Ok(c) => c,
         Err(e) => {
             let _ = events.send(Event::Disconnected {
-                reason: format!("Xbox sign-in failed: {e}"),
+                reason: format!("Bedrock connection failed: {e}"),
                 from_server: false,
             });
             return;
@@ -789,7 +849,7 @@ mod auth {
         std::env::temp_dir().join("horizon-bedrock-msa.json")
     }
 
-    pub fn sign_in(host: &str, port: u16) -> Result<SignedIn, String> {
+    pub fn sign_in(host: &str, port: u16, status: &dyn Fn(String)) -> Result<SignedIn, String> {
         let address = format!("{host}:{port}");
         // Reuse a refresh token when we have one.
         let cached = std::fs::read_to_string(token_path())
@@ -799,6 +859,11 @@ mod auth {
             core_auth::refresh(&refresh).map_err(|e| e.to_string())?
         } else {
             let code = core_auth::begin_device_code().map_err(|e| e.to_string())?;
+            // The status line too: the game shows it, the console may not be read.
+            status(format!(
+                "Sign in at {} with code {}",
+                code.verification_uri, code.user_code
+            ));
             eprintln!(
                 "[bedrock] sign in at {} with code {}",
                 code.verification_uri, code.user_code
