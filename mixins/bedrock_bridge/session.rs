@@ -1035,6 +1035,35 @@ mod translate {
                 }
                 out
             }
+            // Other players' names. A player is only listed — and its avatar
+            // only drawn — once the client has an info entry for its UUID, so
+            // this goes out before the entity that uses it. The skin pixels are
+            // carried in the entry but not sent yet: Java wants a PNG behind a
+            // textures property, and Bedrock hands over raw RGBA.
+            bp::Packet::PlayerList(list) => {
+                let entries: Vec<play::PlayerInfo> = list
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.skin.is_some())
+                    .map(|entry| play::PlayerInfo {
+                        uuid: u128::from_be_bytes(entry.uuid),
+                        name: Some(entry.username.clone()),
+                        listed: Some(true),
+                        latency: Some(0),
+                        ..Default::default()
+                    })
+                    .collect();
+                if entries.is_empty() {
+                    return Vec::new();
+                }
+                vec![Event::Packet(Box::new(play::Clientbound::PlayerInfoUpdate(
+                    play::PlayerInfoUpdate {
+                        // ADD_PLAYER, UPDATE_LISTED, UPDATE_LATENCY.
+                        actions: 0b0001_1001,
+                        entries,
+                    },
+                )))]
+            }
             bp::Packet::LevelChunk(c) => {
                 // Whatever blocks the payload carries; the rest arrive as
                 // sub-chunk replies.

@@ -968,3 +968,149 @@ pub fn write_move_player(
     w.bool(false); // no teleport cause (mode != teleport)
     w.varlong(0); // tick
 }
+
+/// One entry of a `PlayerList` (63) update.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerListEntry {
+    pub uuid: [u8; 16],
+    /// Zero for a removal, which carries only the UUID.
+    pub unique_id: i64,
+    pub username: String,
+    pub xuid: String,
+    pub skin: Option<Skin>,
+}
+
+/// A `PlayerList` entry's skin: the pixels and the geometry, which is what the
+/// Java client needs before it can draw the player.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Skin {
+    pub id: String,
+    pub resource_patch: String,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    pub cape_width: u32,
+    pub cape_height: u32,
+    pub cape: Vec<u8>,
+    pub geometry: String,
+    pub animation: String,
+}
+
+impl Skin {
+    fn read(r: &mut Reader) -> Result<Skin> {
+        let id = r.string()?;
+        let _playfab_id = r.string()?;
+        let resource_patch = r.string()?;
+        let (width, height, data) = image(r)?;
+        // Animations: an image, then its type, frame count and expression.
+        let animations = r.i32()?;
+        for _ in 0..animations.max(0) {
+            image(r)?;
+            r.i32()?;
+            r.f32()?;
+            r.i32()?;
+        }
+        let (cape_width, cape_height, cape) = image(r)?;
+        let geometry = r.string()?;
+        let _geometry_version = r.string()?;
+        let animation = r.string()?;
+        let _cape_id = r.string()?;
+        let _full_skin_id = r.string()?;
+        let _arm_size = r.string()?;
+        let _skin_colour = r.string()?;
+        // Persona pieces: five strings and a flag each.
+        let pieces = r.i32()?;
+        for _ in 0..pieces.max(0) {
+            for _ in 0..5 {
+                r.string()?;
+            }
+            r.bool()?;
+        }
+        // Persona tint colours: a piece name and its colours.
+        let tints = r.i32()?;
+        for _ in 0..tints.max(0) {
+            r.string()?;
+            let colours = r.i32()?;
+            for _ in 0..colours.max(0) {
+                r.string()?;
+            }
+        }
+        // premium, persona, cape-on-classic, primary user, override.
+        for _ in 0..5 {
+            r.bool()?;
+        }
+        Ok(Skin {
+            id,
+            resource_patch,
+            width,
+            height,
+            data,
+            cape_width,
+            cape_height,
+            cape,
+            geometry,
+            animation,
+        })
+    }
+}
+
+/// A skin or cape image: its size, then length-prefixed RGBA bytes.
+fn image(r: &mut Reader) -> Result<(u32, u32, Vec<u8>)> {
+    let width = r.i32()? as u32;
+    let height = r.i32()? as u32;
+    let len = r.varint()? as usize;
+    Ok((width, height, r.bytes(len)?.to_vec()))
+}
+
+/// A `PlayerList` (63) update: the server's players, their names and skins.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerList {
+    pub entries: Vec<PlayerListEntry>,
+}
+
+impl PlayerList {
+    pub fn read(r: &mut Reader) -> Result<PlayerList> {
+        let kind = r.u8()?;
+        let count = r.varint()? as usize;
+        let mut entries = Vec::with_capacity(count.min(256));
+        for _ in 0..count {
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(r.bytes(16)?);
+            if kind != 0 {
+                entries.push(PlayerListEntry {
+                    uuid,
+                    unique_id: 0,
+                    username: String::new(),
+                    xuid: String::new(),
+                    skin: None,
+                });
+                continue;
+            }
+            let unique_id = r.zigzag64()?;
+            let username = r.string()?;
+            let xuid = r.string()?;
+            let _platform_chat_id = r.string()?;
+            let _build_platform = r.i32()?;
+            let skin = Skin::read(r)?;
+            // is teacher, is host, is sub-client.
+            for _ in 0..3 {
+                r.bool()?;
+            }
+            let _colour = r.i32()?;
+            entries.push(PlayerListEntry {
+                uuid,
+                unique_id,
+                username,
+                xuid,
+                skin: Some(skin),
+            });
+        }
+        // One verified flag per entry, after them all.
+        if kind == 0 {
+            for _ in 0..count {
+                r.bool()?;
+            }
+        }
+        Ok(PlayerList { entries })
+    }
+}

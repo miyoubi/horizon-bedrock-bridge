@@ -27,7 +27,7 @@ pub enum Packet {
     AvailableEntityIdentifiers(crate::nbt::Tag),
     BiomeDefinitionList,
     CreativeContent,
-    PlayerList,
+    PlayerList(packets::PlayerList),
     LevelChunk(LevelChunk),
     SubChunk(SubChunk),
     NetworkChunkPublisherUpdate {
@@ -200,7 +200,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         }
         ids::BIOME_DEFINITION_LIST => Packet::BiomeDefinitionList,
         ids::CREATIVE_CONTENT => Packet::CreativeContent,
-        ids::PLAYER_LIST => Packet::PlayerList,
+        ids::PLAYER_LIST => Packet::PlayerList(packets::PlayerList::read(&mut r)?),
         ids::FULL_CHUNK_DATA => Packet::LevelChunk(LevelChunk::read(&mut r)?),
         ids::SUB_CHUNK => Packet::SubChunk(SubChunk::read(&mut r)?),
         ids::NETWORK_CHUNK_PUBLISHER_UPDATE => {
