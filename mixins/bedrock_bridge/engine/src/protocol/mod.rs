@@ -55,9 +55,10 @@ pub enum Packet {
         runtime_id: u32,
         flags: u32,
     },
+    /// The batched form of `UpdateBlock`: several blocks in one section.
     UpdateSubChunkBlocks {
         sub_chunk: [i32; 3],
-        blocks: usize,
+        blocks: Vec<SubChunkBlock>,
     },
     InventoryContent(InventoryContent),
     InventorySlot(InventorySlot),
@@ -100,6 +101,14 @@ pub enum Packet {
     Raw(u32, Vec<u8>),
     /// The packet id is unknown to this build.
     Unknown(u32, Vec<u8>),
+}
+
+/// One entry of a batched `UpdateSubChunkBlocks`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubChunkBlock {
+    pub position: [i32; 3],
+    pub runtime_id: u32,
+    pub flags: u32,
 }
 
 /// A client→server packet the bridge can build.
@@ -241,10 +250,20 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::UPDATE_SUB_CHUNK_BLOCKS => {
             let sub_chunk = [r.zigzag32()?, r.zigzag32()?, r.zigzag32()?];
             let count = r.varint()? as usize;
-            Packet::UpdateSubChunkBlocks {
-                sub_chunk,
-                blocks: count,
+            let mut blocks = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let position = [r.zigzag32()?, r.zigzag32()?, r.zigzag32()?];
+                let runtime_id = r.varint()?;
+                let flags = r.varint()?;
+                let _actor = r.zigzag64()?;
+                let _message_actor = r.zigzag64()?;
+                blocks.push(SubChunkBlock {
+                    position,
+                    runtime_id,
+                    flags,
+                });
             }
+            Packet::UpdateSubChunkBlocks { sub_chunk, blocks }
         }
         ids::INVENTORY_CONTENT => Packet::InventoryContent(InventoryContent::read(&mut r)?),
         ids::INVENTORY_SLOT => Packet::InventorySlot(InventorySlot::read(&mut r)?),

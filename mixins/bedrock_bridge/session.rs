@@ -1100,6 +1100,24 @@ mod translate {
                     },
                 )))]
             }
+            // The batched form of the change above.
+            bp::Packet::UpdateSubChunkBlocks { blocks, .. } => {
+                let Some(registry) = ctx.blocks.as_mut() else {
+                    return Vec::new();
+                };
+                blocks
+                    .iter()
+                    .map(|block| {
+                        let state = registry.java(block.runtime_id as i32);
+                        Event::Packet(Box::new(play::Clientbound::BlockUpdate(
+                            play::BlockUpdate {
+                                pos: block.position,
+                                state: state as i32,
+                            },
+                        )))
+                    })
+                    .collect()
+            }
             // A column's blocks. A server running with client-side chunk
             // generation sends partial chunks and answers these requests, so
             // without this every column stays empty and never lights.
