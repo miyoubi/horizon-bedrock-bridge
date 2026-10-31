@@ -1,7 +1,7 @@
 {
-  "horizon_revision": "ba6344a59cb9e755b730dcf02285fc0d33b97d3c",
+  "horizon_revision": "9a64e65635973adcabea5cccce5e0c8abe899375",
   "source_sha256": {
-    "crates/horizon-client/src/game.rs": "043c7853552104e8250b89987f0ff5de86cbcec0abece1d319c268e66644015f"
+    "crates/horizon-client/src/game.rs": "a135431d172adacf34e8feda7e4342ebb5e565edb64c9fa0c4168ffccb2a7e71"
   },
   "horizon_repository": "https://github.com/horizon-rust/horizon",
   "horizon_mixins_repository": "https://github.com/horizon-rust/horizon-mixins",
@@ -10,8 +10,8 @@
   "bedrock_protocol_version": 2225,
   "bedrock_version": "1.26.60",
   "notes": [
-    "Pins Nightly 2026-10-30 (ba6344a5) and horizon-mixins d9c83d7, matching horizon-native-mod-template.",
-    "mixin_schema 6 is required for the bundle [[crate]] (the engine dependency).",
+    "Pins the WebRTC-enabled Horizon (miyoubi/horizon 9a64e6563, 'build: allow native mods to use WebRTC') so a bundle crate may declare rtc, plus horizon-mixins d9c83d7 for the [[crate]] schema.",
+    "That revision is not in horizon-rust/horizon, so the launcher must reuse a cached native/source/<revision> tree.",
     "When moving to a newer Nightly, update horizon_revision here and in the manifest, and refresh source_sha256."
   ]
 }

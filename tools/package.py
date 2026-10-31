@@ -16,27 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 GAME = '26.3'
 
 
-def lock_safe_engine(text):
-    """The engine manifest as the bundle ships it: without the WebRTC dependency.
-
-    horizon-mixins takes Horizon's `Cargo.lock` as the allow list for a bundle
-    crate's dependencies, and it walks every entry of every dependency table,
-    `optional` ones included. Horizon's lock carries no WebRTC crate, so the
-    NetherNet driver cannot be declared and the bundle ships the RakNet
-    transport; put `rtc` in Horizon's lock to ship both. The repository keeps
-    the dependency, so NetherNet still builds and tests here.
-    """
-    kept = []
-    for line in text.splitlines(keepends=True):
-        if line.startswith('rtc = '):
-            continue
-        if line.startswith('nethernet-webrtc = '):
-            kept.append('nethernet-webrtc = ["dep:bytes"]\n')
-            continue
-        kept.append(line)
-    return ''.join(kept)
-
-
 def package():
     compat = json.loads((ROOT / 'compatibility.json').read_text())
     manifests = sorted((ROOT / 'mixins').glob('*/horizon-mixin.toml'))
@@ -72,8 +51,6 @@ def package():
         if 'target' in path.relative_to(bundle).parts:
             continue
         content = path.read_bytes()
-        if relative == 'engine/Cargo.toml':
-            content = lock_safe_engine(content.decode()).encode()
         files[path.relative_to(ROOT).as_posix()] = content
     out = ROOT / 'target' / f"{mod['id']}-{mod['version']}.hnmod"
     out.parent.mkdir(parents=True, exist_ok=True)

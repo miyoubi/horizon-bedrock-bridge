@@ -26,17 +26,17 @@ hkdf = "0.12.4"
 subtle = "2.6.1"
 zeroize = "1.9.1"
 log = "0.4.34"
-# WebRTC (webrtc-rs, sans-I/O), for the NetherNet transport. Off unless the
-# `nethernet-webrtc` feature is on. Horizon's Cargo.lock has no WebRTC crate and
-# horizon-mixins allows a bundle crate only what that lock holds, so `tools/package.py`
-# strips this line from the shipped bundle: NetherNet builds and tests here, the
-# bundle ships RakNet. Add `rtc` to Horizon's lock to ship both.
+# WebRTC (webrtc-rs, sans-I/O), for the NetherNet transport. Horizon's lock has
+# carried this since the revision that permits native mods to use WebRTC, and
+# horizon-mixins allows a bundle crate only what that lock holds. A bundle's
+# crate is added to the dependent without features, so this is on by default;
+# `--no-default-features` keeps the portable layers light for local testing.
 rtc = { version = "0.21", optional = true }
 bytes = { version = "1.12.1", optional = true }
 
 [features]
-# Builds the WebRTC driver. Default off so the portable layers test offline
-# without the heavy webrtc tree.
+# Builds the WebRTC driver alongside the RakNet one, so the mod speaks both.
+default = ["nethernet-webrtc"]
 nethernet-webrtc = ["dep:rtc", "dep:bytes"]
 
 [[example]]
