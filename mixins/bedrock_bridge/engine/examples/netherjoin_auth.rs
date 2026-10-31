@@ -134,6 +134,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     client.begin_login(data.identity, data.handshake, auth_info, skin_json)?;
 
+    let mappings = bedrock_core::mapping::BedrockBlockMappings::load(std::path::Path::new(
+        "/mnt/project/references/mappings-master/blocks.nbt",
+    ))
+    .ok();
+    println!("block mappings: {:?}", mappings.as_ref().map(|m| m.len()));
+    let mut game: Option<bedrock_core::protocol::packets::StartGame> = None;
+    let mut chunk_seen = 0usize;
+
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         for packet in client.poll()? {
@@ -156,7 +164,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pack_ids: Vec::new(),
                     }])?
                 }
-                Packet::StartGame(_) => client.request_chunks(8)?,
+                Packet::StartGame(g) => {
+                    game = Some(g);
+                    client.request_chunks(8)?;
+                }
+                Packet::LevelChunk(c) => {
+                    chunk_seen += 1;
+                    if chunk_seen <= 3 {
+                        println!(
+                            "RAW CHUNK({},{}) dim={} sub_chunks={} data_len={} first={:02x?}",
+                            c.chunk_x,
+                            c.chunk_z,
+                            c.dimension,
+                            c.sub_chunk_count,
+                            c.data.len(),
+                            &c.data[..c.data.len().min(24)]
+                        );
+                    }
+                    if chunk_seen <= 3 {
+                        if let (Some(g), Some(m)) = (game.as_ref(), mappings.as_ref()) {
+                            match bedrock_core::chunk::decode_sections(g, &c, m) {
+                                Ok(sections) => {
+                                    let total: usize =
+                                        sections.iter().map(|s| s.blocks.len()).sum();
+                                    let non_air = sections
+                                        .iter()
+                                        .flat_map(|s| s.blocks.iter())
+                                        .filter(|b| **b != 0)
+                                        .count();
+                                    println!(
+                                        "CHUNK({},{}) sections={} blocks={} non_air={}",
+                                        c.chunk_x,
+                                        c.chunk_z,
+                                        sections.len(),
+                                        total,
+                                        non_air
+                                    );
+                                }
+                                Err(e) => println!("CHUNK decode error: {e}"),
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }

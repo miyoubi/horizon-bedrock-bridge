@@ -821,10 +821,8 @@ impl LevelChunk {
         let chunk_z = r.zigzag32()?;
         let dimension = r.zigzag32()?;
         let sub_chunk_count = r.varint()?;
-        // requestSubChunks
-        if r.bool()? {
-            let _limit = r.zigzag32()?;
-        }
+        // Client request sub-chunk limit (int32, always present).
+        let _limit = r.i32()?;
         let cache_enabled = r.bool()?;
         let blobs = r.varint()?;
         for _ in 0..blobs {
