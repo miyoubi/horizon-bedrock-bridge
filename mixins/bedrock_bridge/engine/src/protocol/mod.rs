@@ -300,6 +300,20 @@ pub fn parse_batch(data: &[u8]) -> Result<Vec<Packet>> {
         let mut e = Reader::new(entry);
         let id = e.varint()?;
         let body = e.rest().to_vec();
+        if let Ok(dump) = std::env::var("NETHER_DUMP") {
+            let want = dump == "all" || dump.parse::<u32>().ok() == Some(id);
+            if want {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/mnt/raw-packets.log")
+                {
+                    let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+                    let _ = writeln!(f, "{id} {} {hex}", body.len());
+                }
+            }
+        }
         // A packet we cannot decode yet must not abort the whole stream: keep
         // the raw body so the caller can log it and carry on.
         match decode(id, &body) {
