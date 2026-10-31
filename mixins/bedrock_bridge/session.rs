@@ -25,6 +25,10 @@ const PREFIX: &str = "bedrock:";
 const RAKNET_PREFIX: &str = "bedrock+raknet:";
 const DEFAULT_PORT: u16 = 19132;
 
+/// How many received packets one loop iteration translates. The loop also
+/// pumps the WebRTC session, so it must not spend long in translation.
+const TRANSLATE_PER_TICK: usize = 4;
+
 /// Whether `address` names a Bedrock server rather than a Java one.
 pub fn is_bedrock(address: &str) -> bool {
     address.starts_with(PREFIX) || address.starts_with(RAKNET_PREFIX)
@@ -276,6 +280,14 @@ fn run(
         unique_id: 0,
     };
 
+    // Received packets waiting to be translated. Translation is heavy — a
+    // column is 24 sections through the block registry — and it runs on the
+    // same loop that pumps the WebRTC session, so only a few are translated per
+    // iteration and the rest wait. A long stall lets ICE consent lapse, which
+    // drops the peer connection mid-load.
+    let mut queued: std::collections::VecDeque<bedrock_core::protocol::Packet> =
+        std::collections::VecDeque::new();
+
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
         // shutdown) ends the thread.
@@ -299,31 +311,33 @@ fn run(
         }
         // Bedrock → Java.
         match client.poll() {
-            Ok(packets) => {
-                for packet in packets {
-                    for event in translate::clientbound(&mut ctx, &packet) {
-                        let _ = events.send(event);
-                    }
-                    // React to the resource-pack phase automatically.
-                    if let bedrock_core::protocol::Packet::PlayStatus(s) = &packet {
-                        if *s == 0 {
-                            let _ = client.accept_resource_packs();
-                        }
-                    }
-                    if let bedrock_core::protocol::Packet::StartGame(g) = &packet {
-                        ctx.runtime_id = g.entity_runtime_id;
-                        ctx.unique_id = g.entity_unique_id;
-                        bridge.runtime_id.store(g.entity_runtime_id as i64, Ordering::Relaxed);
-                        let _ = client.request_chunks(i32::from(view_distance));
-                    }
-                }
-            }
+            Ok(packets) => queued.extend(packets),
             Err(e) => {
                 let _ = events.send(Event::Disconnected {
                     reason: format!("Bedrock read failed: {e}"),
                     from_server: false,
                 });
                 return;
+            }
+        }
+        for _ in 0..TRANSLATE_PER_TICK {
+            let Some(packet) = queued.pop_front() else {
+                break;
+            };
+            for event in translate::clientbound(&mut ctx, &packet) {
+                let _ = events.send(event);
+            }
+            // React to the resource-pack phase automatically.
+            if let bedrock_core::protocol::Packet::PlayStatus(s) = &packet {
+                if *s == 0 {
+                    let _ = client.accept_resource_packs();
+                }
+            }
+            if let bedrock_core::protocol::Packet::StartGame(g) = &packet {
+                ctx.runtime_id = g.entity_runtime_id;
+                ctx.unique_id = g.entity_unique_id;
+                bridge.runtime_id.store(g.entity_runtime_id as i64, Ordering::Relaxed);
+                let _ = client.request_chunks(i32::from(view_distance));
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(2));

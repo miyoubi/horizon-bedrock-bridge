@@ -161,7 +161,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chunk_seen = 0usize;
     let mut pub_seen = 0usize;
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // How long to hold the session; the ICE failure that kills an in-game
+    // session shows up past half a minute, so it is worth waiting longer.
+    let seconds = std::env::var("NETHER_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < deadline {
         for packet in client.poll()? {
             let debug = format!("{packet:?}");
