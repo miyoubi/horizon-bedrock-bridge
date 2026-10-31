@@ -30,7 +30,31 @@ pub fn is_bedrock(address: &str) -> bool {
     address.starts_with(PREFIX) || address.starts_with(RAKNET_PREFIX)
 }
 
-/// Whether the address asks for RakNet; NetherNet is the default.
+/// A server-list status for a Bedrock address, so the entry renders instead of
+/// reporting the failed Java ping. Cosmetic: NetherNet has no status exchange,
+/// and a RakNet server's own MOTD would take its unconnected ping. The protocol
+/// is this game's, which is what makes the entry read as reachable.
+pub fn status(address: &str) -> Option<serde_json::Value> {
+    if !is_bedrock(address) {
+        return None;
+    }
+    let (host, port) = split(address);
+    let transport = if over_raknet(address) {
+        "RakNet"
+    } else {
+        "NetherNet"
+    };
+    Some(serde_json::json!({
+        "version": {
+            "name": format!("Bedrock via {transport}"),
+            "protocol": horizon_protocol::PROTOCOL_VERSION,
+        },
+        "players": { "max": 100, "online": 0, "sample": [] },
+        "description": { "text": format!("Bedrock server {host}:{port} ({transport})") },
+    }))
+}
+
+/// Whether `address` asks for RakNet; NetherNet is the default.
 fn over_raknet(address: &str) -> bool {
     address.starts_with(RAKNET_PREFIX)
 }

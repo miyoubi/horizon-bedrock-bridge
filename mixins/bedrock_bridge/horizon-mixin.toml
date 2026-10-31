@@ -53,6 +53,20 @@ bindings = [
     { name = "resources", ty = "::std::path::PathBuf", value = "resources" },
 ]
 
+# The server list pings a Java status protocol, which a Bedrock server does not
+# speak, so every Bedrock entry showed as unreachable. A Bedrock address answers
+# with a synthesized status instead.
+[[injection]]
+id = "ping"
+target = "horizon_client::net::ping"
+kind = "HEAD"
+cancellable = true
+helper = "hooks/ping.rs"
+bindings = [
+    { name = "address", ty = "&str", value = "address" },
+    { name = "timeout", ty = "::std::time::Duration", value = "timeout" },
+]
+
 # Outgoing play packets for a Bedrock session are translated instead of encoded
 # over the Java socket. A cancellable HEAD returns Break(()) after handing the
 # packet to the bridge, so the original encoder never runs.
