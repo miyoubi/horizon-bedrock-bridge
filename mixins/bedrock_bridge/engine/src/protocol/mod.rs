@@ -49,6 +49,7 @@ pub enum Packet {
     LevelEvent(LevelEvent),
     UpdateAttributes(UpdateAttributes),
     SetCommandsEnabled(bool),
+    UpdateAbilities(UpdateAbilities),
     SetEntityMotion {
         runtime_id: u64,
         velocity: [f32; 3],
@@ -213,6 +214,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::LEVEL_EVENT => Packet::LevelEvent(LevelEvent::read(&mut r)?),
         ids::UPDATE_ATTRIBUTES => Packet::UpdateAttributes(UpdateAttributes::read(&mut r)?),
         ids::SET_COMMANDS_ENABLED => Packet::SetCommandsEnabled(r.bool()?),
+        ids::UPDATE_ABILITIES => Packet::UpdateAbilities(UpdateAbilities::read(&mut r)?),
         ids::SET_ENTITY_MOTION => {
             let runtime_id = r.varlong()?;
             let velocity = [r.f32()?, r.f32()?, r.f32()?];

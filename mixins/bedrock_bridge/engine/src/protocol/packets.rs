@@ -519,6 +519,51 @@ impl MoveActorDelta {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AbilityLayer {
+    pub kind: u16,
+    pub allowed: u32,
+    pub enabled: u32,
+    pub fly_speed: f32,
+    pub vertical_fly_speed: f32,
+    pub walk_speed: f32,
+}
+
+/// Player abilities: id 187.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateAbilities {
+    pub unique_id: i64,
+    pub permission_level: u8,
+    pub command_permission: u8,
+    pub layers: Vec<AbilityLayer>,
+}
+
+impl UpdateAbilities {
+    pub fn read(r: &mut Reader) -> Result<UpdateAbilities> {
+        let unique_id = r.i64()?;
+        let permission_level = r.u8()?;
+        let command_permission = r.u8()?;
+        let count = r.u8()? as usize;
+        let mut layers = Vec::with_capacity(count.min(8));
+        for _ in 0..count {
+            layers.push(AbilityLayer {
+                kind: r.u16()?,
+                allowed: r.i32()? as u32,
+                enabled: r.i32()? as u32,
+                fly_speed: r.f32()?,
+                vertical_fly_speed: r.f32()?,
+                walk_speed: r.f32()?,
+            });
+        }
+        Ok(UpdateAbilities {
+            unique_id,
+            permission_level,
+            command_permission,
+            layers,
+        })
+    }
+}
+
 /// A world/level event (sounds, particles, …): id 25.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelEvent {
