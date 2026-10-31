@@ -519,6 +519,98 @@ impl MoveActorDelta {
     }
 }
 
+/// A world/level event (sounds, particles, …): id 25.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LevelEvent {
+    pub event: i32,
+    pub position: [f32; 3],
+    pub data: i32,
+}
+
+impl LevelEvent {
+    pub fn read(r: &mut Reader) -> Result<LevelEvent> {
+        Ok(LevelEvent {
+            event: r.zigzag32()?,
+            position: [r.f32()?, r.f32()?, r.f32()?],
+            data: r.zigzag32()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttributeModifier {
+    pub id: String,
+    pub name: String,
+    pub amount: f32,
+    pub operation: i32,
+    pub operand: i32,
+    pub serializable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attribute {
+    pub name: String,
+    pub min: f32,
+    pub max: f32,
+    pub current: f32,
+    pub default_min: f32,
+    pub default_max: f32,
+    pub default: f32,
+    pub modifiers: Vec<AttributeModifier>,
+}
+
+/// Entity attribute values: id 29.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateAttributes {
+    pub runtime_id: u64,
+    pub attributes: Vec<Attribute>,
+    pub tick: u64,
+}
+
+impl UpdateAttributes {
+    pub fn read(r: &mut Reader) -> Result<UpdateAttributes> {
+        let runtime_id = r.varlong()?;
+        let count = r.varint()? as usize;
+        let mut attributes = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let min = r.f32()?;
+            let max = r.f32()?;
+            let current = r.f32()?;
+            let default_min = r.f32()?;
+            let default_max = r.f32()?;
+            let default = r.f32()?;
+            let name = r.string()?;
+            let mcount = r.varint()? as usize;
+            let mut modifiers = Vec::with_capacity(mcount.min(64));
+            for _ in 0..mcount {
+                modifiers.push(AttributeModifier {
+                    id: r.string()?,
+                    name: r.string()?,
+                    amount: r.f32()?,
+                    operation: r.i32()?,
+                    operand: r.i32()?,
+                    serializable: r.bool()?,
+                });
+            }
+            attributes.push(Attribute {
+                name,
+                min,
+                max,
+                current,
+                default_min,
+                default_max,
+                default,
+                modifiers,
+            });
+        }
+        Ok(UpdateAttributes {
+            runtime_id,
+            attributes,
+            tick: r.varlong()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoveEntityAbsolute {
     pub runtime_id: u64,

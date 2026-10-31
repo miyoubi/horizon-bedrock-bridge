@@ -25,6 +25,7 @@ pub const UPDATE_BLOCK: u32 = 0x15;
 pub const LEVEL_EVENT: u32 = 0x19;
 pub const MOB_EFFECT: u32 = 0x1c;
 pub const UPDATE_ATTRIBUTES: u32 = 0x1d;
+pub const SET_COMMANDS_ENABLED: u32 = 0x3b;
 pub const INVENTORY_TRANSACTION: u32 = 0x1e;
 pub const MOB_EQUIPMENT: u32 = 0x1f;
 pub const MOB_ARMOR_EQUIPMENT: u32 = 0x20;
