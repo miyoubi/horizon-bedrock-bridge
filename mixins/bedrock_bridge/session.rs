@@ -1082,6 +1082,24 @@ mod translate {
                 }
                 emit_column(ctx, c.chunk_x, c.chunk_z)
             }
+            // A changed block. Without it, nothing built or broken shows up
+            // until the column is sent again.
+            bp::Packet::UpdateBlock {
+                position,
+                runtime_id,
+                flags: _,
+            } => {
+                let Some(blocks) = ctx.blocks.as_mut() else {
+                    return Vec::new();
+                };
+                let state = blocks.java(*runtime_id as i32);
+                vec![Event::Packet(Box::new(play::Clientbound::BlockUpdate(
+                    play::BlockUpdate {
+                        pos: *position,
+                        state: state as i32,
+                    },
+                )))]
+            }
             // A column's blocks. A server running with client-side chunk
             // generation sends partial chunks and answers these requests, so
             // without this every column stays empty and never lights.
