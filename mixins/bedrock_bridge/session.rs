@@ -511,6 +511,14 @@ mod translate {
         }
         let blocks = ctx.blocks.as_mut()?;
         let dimension = DimensionType::vanilla("minecraft:overworld");
+        // Where the column's sections were put, so a vertical offset against
+        // the entities can be read off rather than guessed.
+        bedrock_core::nethernet::trace(format!(
+            "column ({x},{z}) min_y={} sections={} first_y={:?}",
+            dimension.min_y,
+            dimension.sections(),
+            known.keys().next(),
+        ));
         let count = dimension.sections();
         let mut filled: Vec<Option<Section>> = (0..count).map(|_| None).collect();
         let mut heights = [0i32; 256];
@@ -786,6 +794,10 @@ mod translate {
             bp::Packet::AddEntity(entity) => {
                 let java_name = ctx.mappings.java_entity(&entity.identifier);
                 let kind = entity_type_id(ctx, &java_name);
+                bedrock_core::nethernet::trace(format!(
+                    "add entity {} {} at {:?}",
+                    entity.runtime_id, entity.identifier, entity.position
+                ));
                 ctx.entities.insert(
                     entity.runtime_id,
                     (
