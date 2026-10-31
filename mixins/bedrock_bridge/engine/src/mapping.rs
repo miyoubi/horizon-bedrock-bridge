@@ -30,6 +30,8 @@ pub struct Mappings {
     biomes_java_to_bedrock: HashMap<String, i32>,
     /// Bedrock entity identifier → preferred Java entity identifier.
     entities: HashMap<String, String>,
+    /// Bedrock item identifier → Java item identifier.
+    items: HashMap<String, String>,
 }
 
 /// The Bedrock block used when nothing maps (matches TunnelMC's fallback).
@@ -79,16 +81,18 @@ impl Mappings {
             for (java_id, entry) in obj {
                 let first = entry.get("firstBlockRuntimeId").and_then(|v| v.as_i64());
                 let last = entry.get("lastBlockRuntimeId").and_then(|v| v.as_i64());
+                let bedrock = entry
+                    .get("bedrock_identifier")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(java_id)
+                    .to_owned();
+                self.items.insert(bedrock.clone(), java_id.clone());
                 if let (Some(first), Some(last)) = (first, last) {
                     self.blocks.push(BlockRange {
                         first: first as i32,
                         last: last as i32,
                         java_id: java_id.clone(),
-                        bedrock_identifier: entry
-                            .get("bedrock_identifier")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(java_id)
-                            .to_owned(),
+                        bedrock_identifier: bedrock,
                     });
                 }
             }
@@ -135,9 +139,36 @@ impl Mappings {
             .unwrap_or(FALLBACK_BIOME)
     }
 
+    /// The Java item identifier for a Bedrock item identifier, or the input
+    /// unchanged when nothing maps (the names agree for most items).
+    pub fn java_item(&self, bedrock_id: &str) -> String {
+        self.items
+            .get(bedrock_id)
+            .cloned()
+            .unwrap_or_else(|| bedrock_id.to_owned())
+    }
+
     /// Register (or override) a Bedrock entity identifier's Java counterpart.
     pub fn insert_entity(&mut self, bedrock: impl Into<String>, java: impl Into<String>) {
         self.entities.insert(bedrock.into(), java.into());
+    }
+
+    /// Register (or override) a Bedrock item identifier's Java counterpart.
+    pub fn insert_item(&mut self, bedrock: impl Into<String>, java: impl Into<String>) {
+        self.items.insert(bedrock.into(), java.into());
+    }
+
+    /// The Java item identifier for a Bedrock network id from the server's item
+    /// palette, or `None` when the palette never named it.
+    pub fn java_item_by_network_id(
+        &self,
+        palette: &[(String, i16)],
+        network_id: i16,
+    ) -> Option<String> {
+        palette
+            .iter()
+            .find(|(_, id)| *id == network_id)
+            .map(|(name, _)| self.java_item(name))
     }
 
     /// The Java entity identifier for a Bedrock one.
@@ -335,6 +366,18 @@ mod tests {
     #[test]
     fn custom_entities_are_passed_through() {
         let m = Mappings::defaults();
+        assert_eq!(m.java_item("minecraft:apple"), "minecraft:apple");
+        m.insert_item("minecraft:wooden_sword", "minecraft:wooden_sword");
+        assert_eq!(
+            m.java_item("minecraft:wooden_sword"),
+            "minecraft:wooden_sword"
+        );
+        let palette = vec![("minecraft:apple".to_owned(), 257i16)];
+        assert_eq!(
+            m.java_item_by_network_id(&palette, 257).as_deref(),
+            Some("minecraft:apple")
+        );
+        assert_eq!(m.java_item_by_network_id(&palette, 999), None);
         assert_eq!(m.java_entity("minecraft:cow"), "minecraft:cow");
         assert_eq!(
             m.java_entity("minecraft:xp_orb"),
