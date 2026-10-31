@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use horizon_protocol::packets::play;
 use horizon_protocol::registry::Builtin;
@@ -150,7 +150,15 @@ pub fn try_connect(
     let thread = std::thread::Builder::new()
         .name("horizon-bedrock".into())
         .spawn(move || {
-            run(&addr, &thread_name, view_distance, &resources, &send, out_rx, &bridge);
+            run(
+                &addr,
+                &thread_name,
+                view_distance,
+                &resources,
+                &send,
+                out_rx,
+                &bridge,
+            );
         })
         .ok();
 
@@ -213,8 +221,12 @@ fn connect(
         login.multiplayer_token.clone(),
     );
     // The join path carries the client's own NetworkID, per the onboarding guide.
-    bedrock_core::client::BedrockClient::connect_nethernet(&base(address, host, port), "1", &identity)
-        .map_err(|e| e.to_string())
+    bedrock_core::client::BedrockClient::connect_nethernet(
+        &base(address, host, port),
+        "1",
+        &identity,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn run(
@@ -260,7 +272,8 @@ fn run(
         }
     };
     let auth_info = bedrock_core::auth::auth_info(&login.multiplayer_token, 0);
-    if let Err(e) = client.begin_login(login.identity, login.handshake, auth_info, login.skin_json) {
+    if let Err(e) = client.begin_login(login.identity, login.handshake, auth_info, login.skin_json)
+    {
         let _ = events.send(Event::Disconnected {
             reason: format!("Bedrock login failed: {e}"),
             from_server: false,
@@ -277,7 +290,10 @@ fn run(
 
     let blocks = translate::Blocks::new(&resources);
     if blocks.is_none() {
-        log::warn!("bedrock: no block registry at {}; chunks will be skipped", resources.display());
+        log::warn!(
+            "bedrock: no block registry at {}; chunks will be skipped",
+            resources.display()
+        );
     }
 
     let mut ctx = translate::Context {
@@ -360,7 +376,9 @@ fn run(
             if let bedrock_core::protocol::Packet::StartGame(g) = &packet {
                 ctx.runtime_id = g.entity_runtime_id;
                 ctx.unique_id = g.entity_unique_id;
-                bridge.runtime_id.store(g.entity_runtime_id as i64, Ordering::Relaxed);
+                bridge
+                    .runtime_id
+                    .store(g.entity_runtime_id as i64, Ordering::Relaxed);
                 let _ = client.request_chunks(i32::from(view_distance));
             }
         }
@@ -384,8 +402,8 @@ mod translate {
     use horizon_protocol::packets::play;
     use horizon_protocol::registry::{Builtin, DimensionType, Dynamic};
     use horizon_world::nbt::{JavaString, Tag as JTag};
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     pub struct Context<'a> {
         pub builtin: &'a Builtin,
@@ -573,12 +591,9 @@ mod translate {
             heights
                 .chunks(per)
                 .map(|chunk| {
-                    chunk
-                        .iter()
-                        .enumerate()
-                        .fold(0u64, |word, (k, v)| {
-                            word | ((*v as u64) << (k * bits as usize))
-                        }) as i64
+                    chunk.iter().enumerate().fold(0u64, |word, (k, v)| {
+                        word | ((*v as u64) << (k * bits as usize))
+                    }) as i64
                 })
                 .collect()
         };
@@ -644,6 +659,24 @@ mod translate {
         ctx.builtin
             .get("minecraft:entity_type")
             .and_then(|ids| ids.id(java_name))
+            .unwrap_or(0)
+    }
+
+    /// A Bedrock item identifier → Horizon's numeric item id (0 when unknown).
+    #[allow(dead_code)]
+    fn item_id(ctx: &Context, java_name: &str) -> i32 {
+        ctx.builtin
+            .get("minecraft:item")
+            .and_then(|ids| ids.id(java_name))
+            .unwrap_or(0)
+    }
+
+    /// A network id from the server's item palette → Horizon's numeric item id.
+    #[allow(dead_code)]
+    fn item_by_network_id(ctx: &Context, palette: &[(String, i16)], network_id: i16) -> i32 {
+        ctx.mappings
+            .java_item_by_network_id(palette, network_id)
+            .map(|name| item_id(ctx, &name))
             .unwrap_or(0)
     }
 
@@ -736,7 +769,11 @@ mod translate {
                     Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                         play::PlayerPosition {
                             teleport: 0,
-                            position: [g.position[0] as f64, g.position[1] as f64, g.position[2] as f64],
+                            position: [
+                                g.position[0] as f64,
+                                g.position[1] as f64,
+                                g.position[2] as f64,
+                            ],
                             delta: [0.0; 3],
                             yaw: g.yaw,
                             pitch: g.pitch,
@@ -772,12 +809,12 @@ mod translate {
                     },
                 )))]
             }
-            bp::Packet::SetTime(time) => vec![Event::Packet(Box::new(
-                play::Clientbound::SetTime(play::SetTime {
+            bp::Packet::SetTime(time) => vec![Event::Packet(Box::new(play::Clientbound::SetTime(
+                play::SetTime {
                     game_time: i64::from(*time),
                     clocks: Vec::new(),
-                }),
-            ))],
+                },
+            )))],
             bp::Packet::SetDifficulty(difficulty) => vec![Event::Packet(Box::new(
                 play::Clientbound::ChangeDifficulty(play::ChangeDifficulty {
                     difficulty: *difficulty,
@@ -800,12 +837,7 @@ mod translate {
                 ));
                 ctx.entities.insert(
                     entity.runtime_id,
-                    (
-                        entity.position,
-                        entity.yaw,
-                        entity.pitch,
-                        entity.head_yaw,
-                    ),
+                    (entity.position, entity.yaw, entity.pitch, entity.head_yaw),
                 );
                 vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
                     play::AddEntity {
@@ -858,7 +890,11 @@ mod translate {
                     vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                         play::PlayerPosition {
                             teleport: 0,
-                            position: [m.position[0] as f64, m.position[1] as f64, m.position[2] as f64],
+                            position: [
+                                m.position[0] as f64,
+                                m.position[1] as f64,
+                                m.position[2] as f64,
+                            ],
                             delta: [0.0; 3],
                             yaw: m.yaw,
                             pitch: m.pitch,
@@ -869,7 +905,11 @@ mod translate {
                     vec![Event::Packet(Box::new(play::Clientbound::TeleportEntity(
                         play::TeleportEntity {
                             id: m.runtime_id as i32,
-                            position: [m.position[0] as f64, m.position[1] as f64, m.position[2] as f64],
+                            position: [
+                                m.position[0] as f64,
+                                m.position[1] as f64,
+                                m.position[2] as f64,
+                            ],
                             delta: [0.0; 3],
                             yaw: m.yaw,
                             pitch: m.pitch,
@@ -889,9 +929,8 @@ mod translate {
                 else {
                     return Vec::new();
                 };
-                let degrees = |v: Option<u8>, last: f32| {
-                    v.map_or(last, |v| f32::from(v) * (360.0 / 256.0))
-                };
+                let degrees =
+                    |v: Option<u8>, last: f32| v.map_or(last, |v| f32::from(v) * (360.0 / 256.0));
                 // Bedrock sends (pitch, yaw, head yaw).
                 let pitch = degrees(m.rotation[0], last_pitch);
                 let yaw = degrees(m.rotation[1], last_yaw);
@@ -909,11 +948,7 @@ mod translate {
                     vec![Event::Packet(Box::new(play::Clientbound::TeleportEntity(
                         play::TeleportEntity {
                             id: m.runtime_id as i32,
-                            position: [
-                                position[0] as f64,
-                                position[1] as f64,
-                                position[2] as f64,
-                            ],
+                            position: [position[0] as f64, position[1] as f64, position[2] as f64],
                             delta: [0.0; 3],
                             yaw,
                             pitch,
@@ -936,8 +971,8 @@ mod translate {
             bp::Packet::MoveEntityAbsolute(m) => {
                 ctx.entities
                     .insert(m.runtime_id, (m.position, m.yaw, m.pitch, m.yaw));
-                vec![Event::Packet(Box::new(
-                    play::Clientbound::TeleportEntity(play::TeleportEntity {
+                vec![Event::Packet(Box::new(play::Clientbound::TeleportEntity(
+                    play::TeleportEntity {
                         id: m.runtime_id as i32,
                         position: [
                             m.position[0] as f64,
@@ -949,8 +984,8 @@ mod translate {
                         pitch: m.pitch,
                         relatives: 0,
                         on_ground: m.on_ground,
-                    }),
-                ))]
+                    },
+                )))]
             }
             bp::Packet::SetEntityMotion {
                 runtime_id,
@@ -1075,13 +1110,13 @@ mod translate {
                 if entries.is_empty() {
                     return Vec::new();
                 }
-                vec![Event::Packet(Box::new(play::Clientbound::PlayerInfoUpdate(
-                    play::PlayerInfoUpdate {
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::PlayerInfoUpdate(play::PlayerInfoUpdate {
                         // ADD_PLAYER, UPDATE_LISTED, UPDATE_LATENCY.
                         actions: 0b0001_1001,
                         entries,
-                    },
-                )))]
+                    }),
+                ))]
             }
             bp::Packet::LevelChunk(c) => {
                 // Whatever blocks the payload carries; the rest arrive as
@@ -1271,7 +1306,10 @@ mod auth {
             }
         };
         if let Some(refresh) = &msa.refresh_token {
-            let _ = std::fs::write(token_path(), serde_json::to_string(refresh).unwrap_or_default());
+            let _ = std::fs::write(
+                token_path(),
+                serde_json::to_string(refresh).unwrap_or_default(),
+            );
         }
         let data = core_auth::login(&msa.access_token, &address, bedrock_core::MINECRAFT_VERSION)
             .map_err(|e| e.to_string())?;
@@ -1281,8 +1319,9 @@ mod auth {
         let ticket = auth_service::playfab_login(&xbl3).map_err(|e| e.to_string())?;
         let auth_header = auth_service::session_start(&ticket, bedrock_core::MINECRAFT_VERSION)
             .map_err(|e| e.to_string())?;
-        let multiplayer_token = auth_service::multiplayer_token(&auth_header, &data.identity.public_der())
-            .map_err(|e| e.to_string())?;
+        let multiplayer_token =
+            auth_service::multiplayer_token(&auth_header, &data.identity.public_der())
+                .map_err(|e| e.to_string())?;
         Ok(SignedIn {
             identity: data.identity,
             handshake: data.handshake,
