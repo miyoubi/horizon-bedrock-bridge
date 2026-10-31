@@ -878,9 +878,20 @@ mod translate {
                     ))));
                 }
                 let center = (position[0] >> 4, position[2] >> 4);
-                if ctx.wanted_center != Some(center) {
+                // Only refill once the player has really moved on, or the queue
+                // is emptied again before it is ever drained. The player's own
+                // column goes first: the client lights a column only when it
+                // receives it, and that is the one the loading screen wants.
+                let moved = ctx.wanted_center.is_none_or(|last| {
+                    (last.0 - center.0).abs() > 2 || (last.1 - center.1).abs() > 2
+                });
+                if moved {
                     ctx.wanted_center = Some(center);
                     ctx.wanted.clear();
+                    ctx.wanted.push_back((
+                        (ctx.spawn[0].floor() as i32) >> 4,
+                        (ctx.spawn[2].floor() as i32) >> 4,
+                    ));
                     let r = i32::try_from((*radius).min(12)).unwrap_or(4);
                     for dx in -r..=r {
                         for dz in -r..=r {
