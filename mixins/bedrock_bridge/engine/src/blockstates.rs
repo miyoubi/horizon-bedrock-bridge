@@ -9,6 +9,9 @@ use std::path::Path;
 use crate::error::Result;
 use crate::nbt::Tag;
 
+/// The block-state palette of the Bedrock version this crate targets.
+const BUNDLED: &[u8] = include_bytes!("../data/blockstates-1.26.60.txt.gz");
+
 /// The version's block-state palette, indexed by runtime id.
 pub struct BlockStates {
     entries: Vec<(String, serde_json::Value)>,
@@ -30,13 +33,23 @@ impl BlockStates {
 
     /// Load a gzip-compressed table.
     pub fn load_gz(path: &Path) -> Result<Self> {
+        Self::parse_gz(&std::fs::read(path)?)
+    }
+
+    /// Parse a gzip-compressed table from memory.
+    pub fn parse_gz(compressed: &[u8]) -> Result<Self> {
         use std::io::Read;
-        let compressed = std::fs::read(path)?;
         let mut data = Vec::new();
-        flate2::read::GzDecoder::new(compressed.as_slice())
+        flate2::read::GzDecoder::new(compressed)
             .read_to_end(&mut data)
             .map_err(|e| crate::Error::other(format!("blockstates gzip: {e}")))?;
         Ok(Self::parse(&String::from_utf8_lossy(&data)))
+    }
+
+    /// The palette for the pinned Bedrock version, compiled into the binary so
+    /// the mod does not have to find it on disk.
+    pub fn bundled() -> Self {
+        Self::parse_gz(BUNDLED).expect("bundled block-state palette")
     }
 
     pub fn len(&self) -> usize {

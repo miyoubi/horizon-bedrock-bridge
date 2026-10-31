@@ -34,6 +34,7 @@
 pub mod aes;
 pub mod auth;
 pub mod bitarray;
+pub mod blockmap;
 pub mod blockstates;
 pub mod chunk;
 pub mod client;

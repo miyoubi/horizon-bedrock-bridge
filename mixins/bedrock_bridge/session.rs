@@ -179,9 +179,15 @@ fn run(
         .unwrap_or_default();
     let mappings = bedrock_core::mapping::Mappings::defaults();
 
+    let blocks = translate::Blocks::new(&resources);
+    if blocks.is_none() {
+        log::warn!("bedrock: no block registry at {}; chunks will be skipped", resources.display());
+    }
+
     let mut ctx = translate::Context {
         builtin: &builtin,
         mappings: &mappings,
+        blocks,
         runtime_id: 0,
         unique_id: 0,
     };
@@ -252,8 +258,9 @@ fn run(
 mod translate {
     use super::{Bridge, Event};
     use bedrock_core::protocol as bp;
+    use horizon_protocol::chunk::{ChunkData, LightData, Paletted, Section, Strategy};
     use horizon_protocol::packets::play;
-    use horizon_protocol::registry::{Builtin, Dynamic};
+    use horizon_protocol::registry::{Builtin, DimensionType, Dynamic};
     use horizon_world::nbt::{JavaString, Tag as JTag};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -261,8 +268,195 @@ mod translate {
     pub struct Context<'a> {
         pub builtin: &'a Builtin,
         pub mappings: &'a bedrock_core::mapping::Mappings,
+        /// Block-state resolution; absent if the game's registry could not be
+        /// read, in which case chunks are skipped rather than sent as air.
+        pub blocks: Option<Blocks>,
         pub runtime_id: u64,
         pub unique_id: i64,
+    }
+
+    /// Resolves Bedrock runtime ids to the game's block-state ids.
+    ///
+    /// The Bedrock side is the palette bundled with the engine; the Java side is
+    /// the game's own block registry, read from the same prepared resources the
+    /// session started with. Results are cached, since chunks repeat blocks
+    /// heavily and a full column is 24 × 4096 lookups.
+    pub struct Blocks {
+        registry: horizon_world::registry::BlockRegistry,
+        table: bedrock_core::blockstates::BlockStates,
+        cache: std::collections::HashMap<i32, u32>,
+        pub air: u32,
+    }
+
+    impl Blocks {
+        pub fn new(resources: &std::path::Path) -> Option<Self> {
+            let file = std::fs::File::open(resources.join("facts.json")).ok()?;
+            let registry = horizon_world::registry::BlockRegistry::from_facts_json(file).ok()?;
+            let air = registry.default_state("minecraft:air")?.0;
+            Some(Self {
+                registry,
+                table: bedrock_core::blockstates::BlockStates::bundled(),
+                cache: std::collections::HashMap::new(),
+                air,
+            })
+        }
+
+        /// The game's state id for a Bedrock runtime id.
+        pub fn java(&mut self, runtime_id: i32) -> u32 {
+            if let Some(&id) = self.cache.get(&runtime_id) {
+                return id;
+            }
+            let id = self.resolve(runtime_id);
+            self.cache.insert(runtime_id, id);
+            id
+        }
+
+        fn resolve(&self, runtime_id: i32) -> u32 {
+            let Some((name, states)) = self.table.get(runtime_id) else {
+                return self.air;
+            };
+            let tag = bedrock_core::blockstates::states_to_tag(states);
+            let java = bedrock_core::blockmap::to_java(&name, tag.as_ref());
+            let Some(default) = self.registry.default_state(&java.name) else {
+                return self.air;
+            };
+            // Apply each candidate only where the block declares that property
+            // and the value is valid, so one wrong property cannot void the
+            // rest of them.
+            let mut current = default;
+            for (key, value) in &java.properties {
+                let Some(known) = self.registry.state(current) else {
+                    break;
+                };
+                if !known.properties.contains_key(key) {
+                    continue;
+                }
+                let mut candidate = known.clone();
+                candidate.properties.insert(key.clone(), value.clone());
+                if let Some(next) = self.registry.id(&candidate) {
+                    current = next;
+                }
+            }
+            current.0
+        }
+    }
+
+    /// A little-endian bit set, as the packet's `BitSet` codec writes it.
+    fn bitset(bits: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.div_ceil(8)];
+        for i in 0..bits {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        bytes
+    }
+
+    /// One Bedrock chunk column as the Java client wants it: every section of
+    /// the dimension in order, its heightmaps, and full sky light.
+    ///
+    /// Bedrock sends only the sections it has, at their own indices, and no
+    /// light, so the column is padded with air and lit uniformly. Real light
+    /// needs the server's light data, which NetherNet does not forward.
+    fn column(
+        ctx: &mut Context,
+        chunk: &bedrock_core::protocol::packets::LevelChunk,
+    ) -> Option<play::LevelChunkWithLight> {
+        let decoded = bedrock_core::chunk::decode_sections(chunk).ok()?;
+        if decoded.is_empty() {
+            return None;
+        }
+        let blocks = ctx.blocks.as_mut()?;
+        let dimension = DimensionType::vanilla("minecraft:overworld");
+        let count = dimension.sections();
+        let mut filled: Vec<Option<Section>> = (0..count).map(|_| None).collect();
+        let mut heights = [0i32; 256];
+        for section in &decoded {
+            let base = i32::from(section.y) * 16;
+            let Some(slot) = usize::try_from((base - dimension.min_y) / 16)
+                .ok()
+                .filter(|i| *i < count)
+            else {
+                continue;
+            };
+            let mut values = [0i32; 4096];
+            let mut non_empty = 0i16;
+            for (i, runtime_id) in section.blocks.iter().enumerate() {
+                let id = blocks.java(*runtime_id as i32);
+                values[i] = id as i32;
+                if id == blocks.air {
+                    continue;
+                }
+                non_empty += 1;
+                // Column order matches `chunk::java_index`.
+                let column = ((i >> 4) & 15) * 16 + (i & 15);
+                let height = base + (i >> 8) as i32 - dimension.min_y + 1;
+                if height > heights[column] {
+                    heights[column] = height;
+                }
+            }
+            filled[slot] = Some(Section {
+                non_empty,
+                fluids: 0,
+                states: Paletted::from_values(&values, Strategy::Blocks, 16),
+                biomes: Paletted::from_values(&[1i32; 64], Strategy::Biomes, 7),
+            });
+        }
+        let air = blocks.air;
+        let air_section = move || Section {
+            non_empty: 0,
+            fluids: 0,
+            states: Paletted::from_values(&[air as i32; 4096], Strategy::Blocks, 16),
+            biomes: Paletted::from_values(&[1i32; 64], Strategy::Biomes, 7),
+        };
+        let sections: Vec<Section> = filled
+            .into_iter()
+            .map(|section| section.unwrap_or_else(air_section))
+            .collect();
+
+        // WORLD_SURFACE (1) and MOTION_BLOCKING (4); this decoder does not
+        // distinguish them, since it sees no fluids or leaf shapes.
+        let bits = (dimension.height as u32 + 1).ilog2() as u8 + 1;
+        let packed = |heights: &[i32; 256]| -> Vec<i64> {
+            let per = 64 / bits as usize;
+            heights
+                .chunks(per)
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |word, (k, v)| {
+                            word | ((*v as u64) << (k * bits as usize))
+                        }) as i64
+                })
+                .collect()
+        };
+        let heightmaps = vec![(1, packed(&heights)), (4, packed(&heights))];
+
+        // Light sections run from one below the lowest block section upwards.
+        let light_sections = count + 2;
+        let light = LightData {
+            sky_mask: bitset(light_sections),
+            block_mask: Vec::new(),
+            empty_sky_mask: Vec::new(),
+            // Block light everywhere is zero, which the empty mask conveys
+            // without sending 2048 bytes per section.
+            empty_block_mask: bitset(light_sections),
+            sky: vec![vec![0xf0u8; 2048]; light_sections],
+            block: Vec::new(),
+        };
+
+        Some(play::LevelChunkWithLight {
+            x: chunk.chunk_x,
+            z: chunk.chunk_z,
+            chunk: ChunkData {
+                heightmaps,
+                buffer: ChunkData::from_sections(&sections),
+                block_entities: Vec::new(),
+            },
+            light,
+        })
     }
 
     fn entity_type_id(ctx: &Context, java_name: &str) -> i32 {
@@ -505,8 +699,14 @@ mod translate {
                 },
                 from_server: true,
             }],
-            // Chunks, block updates, inventories and the rest need the
-            // Java↔Bedrock block-state resolver; see the README.
+            bp::Packet::LevelChunk(c) => match column(ctx, c) {
+                Some(chunk) => vec![Event::Packet(Box::new(
+                    play::Clientbound::LevelChunkWithLight(chunk),
+                ))],
+                None => Vec::new(),
+            },
+            // Block updates, block entities, inventories and the rest still
+            // need their own translation; see the README.
             _ => Vec::new(),
         }
     }
