@@ -4,7 +4,7 @@ version = "0.1.0"
 priority = 100
 
 [compatibility]
-horizon_revision = "9a64e65635973adcabea5cccce5e0c8abe899375"
+horizon_revision = "4c3bf94376193082c08c4e80443affc719598fd5"
 
 # The Bedrock stack (RakNet, codecs, Xbox auth, crypto, mappings) is this
 # bundle's own crate; the game glue in the two modules below is thin.
