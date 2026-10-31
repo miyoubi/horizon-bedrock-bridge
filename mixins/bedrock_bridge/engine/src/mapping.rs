@@ -367,9 +367,10 @@ mod tests {
     fn custom_entities_are_passed_through() {
         let m = Mappings::defaults();
         assert_eq!(m.java_item("minecraft:apple"), "minecraft:apple");
-        m.insert_item("minecraft:wooden_sword", "minecraft:wooden_sword");
+        let mut named = Mappings::default();
+        named.insert_item("minecraft:wooden_sword", "minecraft:wooden_sword");
         assert_eq!(
-            m.java_item("minecraft:wooden_sword"),
+            named.java_item("minecraft:wooden_sword"),
             "minecraft:wooden_sword"
         );
         let palette = vec![("minecraft:apple".to_owned(), 257i16)];
