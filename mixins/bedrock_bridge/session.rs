@@ -107,6 +107,9 @@ struct Bridge {
     /// Last position sent to the server; rotation-only updates reuse it, so a
     /// MovePlayerRot never looks like a teleport to (0,0,0).
     position: Mutex<[f32; 3]>,
+    /// The `PlayerAuthInput` tick id: it advances with every input packet, and
+    /// the server pairs corrections with the id they answer.
+    tick: AtomicI64,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -133,6 +136,7 @@ pub fn try_connect(
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
         position: Mutex::new([0.0; 3]),
+        tick: AtomicI64::new(1),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1084,48 +1088,41 @@ mod translate {
         }
     }
 
-    /// Java serverbound → Bedrock. Only the movement/keepalive core for now.
+    /// A `PlayerAuthInput` from a Java movement packet — the packet the server
+    /// actually simulates from (id 144; `MovePlayer`, 19, is deprecated and
+    /// ignored, which is why the player looked like a statue to it). The flag
+    /// set is empty for now: no sneaking, sprinting or block actions yet.
+    fn auth_input(bridge: &Bridge, position: [f32; 3], yaw: f32, pitch: f32) -> Vec<bp::Out> {
+        let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
+        vec![bp::Out::PlayerAuthInput {
+            position,
+            pitch,
+            yaw,
+            head_yaw: yaw,
+            move_vec: [0.0; 2],
+            flags: 0,
+            tick,
+        }]
+    }
+
+    /// Java serverbound → Bedrock.
     pub fn serverbound(bridge: &Bridge, packet: &play::Serverbound) -> Vec<bp::Out> {
         let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
         match packet {
             play::Serverbound::MovePlayerPos(p) => {
                 let pos = [p.x as f32, p.y as f32, p.z as f32];
                 *bridge.position.lock().unwrap() = pos;
-                vec![bp::Out::MovePlayer {
-                    runtime_id,
-                    position: pos,
-                    pitch: 0.0,
-                    yaw: 0.0,
-                    head_yaw: 0.0,
-                    mode: 0,
-                    on_ground: p.flags & 1 != 0,
-                }]
+                auth_input(bridge, pos, 0.0, 0.0)
             }
             play::Serverbound::MovePlayerPosRot(p) => {
                 let pos = [p.x as f32, p.y as f32, p.z as f32];
                 *bridge.position.lock().unwrap() = pos;
-                vec![bp::Out::MovePlayer {
-                    runtime_id,
-                    position: pos,
-                    pitch: p.pitch,
-                    yaw: p.yaw,
-                    head_yaw: p.yaw,
-                    mode: 0,
-                    on_ground: p.flags & 1 != 0,
-                }]
+                auth_input(bridge, pos, p.yaw, p.pitch)
             }
             play::Serverbound::MovePlayerRot(p) => {
                 // Rotation only: keep the last position so it is not a teleport.
                 let pos = *bridge.position.lock().unwrap();
-                vec![bp::Out::MovePlayer {
-                    runtime_id,
-                    position: pos,
-                    pitch: p.pitch,
-                    yaw: p.yaw,
-                    head_yaw: p.yaw,
-                    mode: 0,
-                    on_ground: p.flags & 1 != 0,
-                }]
+                auth_input(bridge, pos, p.yaw, p.pitch)
             }
             play::Serverbound::Chat(c) => vec![bp::Out::Text {
                 kind: 1,

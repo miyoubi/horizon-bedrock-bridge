@@ -136,6 +136,20 @@ pub enum Out {
         request: i64,
         response: i64,
     },
+    /// Modern client→server movement and input. `MovePlayer` above is the old
+    /// form, which a current server no longer reads: without this the server
+    /// treats the player as standing still and keeps correcting them.
+    PlayerAuthInput {
+        position: [f32; 3],
+        pitch: f32,
+        yaw: f32,
+        head_yaw: f32,
+        /// Horizontal analog move vector, -1..1.
+        move_vec: [f32; 2],
+        /// `PlayerAuthInputFlags` bits.
+        flags: u64,
+        tick: u64,
+    },
     MovePlayer {
         runtime_id: u64,
         position: [f32; 3],
@@ -395,6 +409,50 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         }
         Out::TickSync { request, response } => {
             w.varint(ids::TICK_SYNC).i64(*request).i64(*response);
+        }
+        Out::PlayerAuthInput {
+            position,
+            pitch,
+            yaw,
+            head_yaw,
+            move_vec,
+            flags,
+            tick,
+        } => {
+            w.varint(ids::PLAYER_AUTH_INPUT);
+            w.f32(*pitch);
+            w.f32(*yaw);
+            w.f32(position[0]);
+            w.f32(position[1]);
+            w.f32(position[2]);
+            w.f32(move_vec[0]);
+            w.f32(move_vec[1]);
+            w.f32(*head_yaw);
+            // The 65 input flags go seven bits per byte, every byte but the
+            // last carrying a continuation bit.
+            for group in 0..10u32 {
+                let mut byte = ((flags >> (group * 7)) & 0x7f) as u8;
+                if group < 9 {
+                    byte |= 0x80;
+                }
+                w.u8(byte);
+            }
+            w.varint(1); // InputMode: mouse and keyboard
+            w.varint(0); // PlayMode: normal
+            w.varint(1); // InteractionModel: crosshair
+            w.f32(0.0);
+            w.f32(0.0); // interact rotation
+            w.varint(*tick as u32);
+            w.f32(0.0);
+            w.f32(0.0);
+            w.f32(0.0); // delta
+            w.f32(0.0);
+            w.f32(0.0); // analog move vector
+            w.f32(*pitch);
+            w.f32(*yaw);
+            w.f32(0.0); // camera orientation
+            w.f32(0.0);
+            w.f32(0.0); // raw move
         }
         Out::MovePlayer {
             runtime_id,
