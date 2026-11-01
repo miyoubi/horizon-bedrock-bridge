@@ -751,6 +751,11 @@ mod translate {
         })
     }
 
+    /// A standing player's eye height above its feet. Bedrock player positions
+    /// (`PlayerAuthInput` mPos and `MovePlayer`) are eye-based, while Java's
+    /// entity positions are feet-based, so the two directions need this offset.
+    const PLAYER_EYE: f32 = 1.62;
+
     /// The Java entity-type id for a name, or `None` when the client has no
     /// such entity. A miss must not fall back to 0: id 0 is `acacia_boat`, which
     /// is what turned every unrecognised entity into a boat.
@@ -1043,15 +1048,18 @@ mod translate {
                 )))]
             }
             bp::Packet::MovePlayer(m) => {
+                // Bedrock reports a player's position at the eye; Java entity
+                // positions are feet. Without the offset the player floats ~1.6.
+                let position = [
+                    m.position[0] as f64,
+                    (m.position[1] - PLAYER_EYE) as f64,
+                    m.position[2] as f64,
+                ];
                 if m.runtime_id as i64 == ctx.runtime_id as i64 {
                     vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                         play::PlayerPosition {
                             teleport: 0,
-                            position: [
-                                m.position[0] as f64,
-                                m.position[1] as f64,
-                                m.position[2] as f64,
-                            ],
+                            position,
                             delta: [0.0; 3],
                             yaw: m.yaw,
                             pitch: m.pitch,
@@ -1062,11 +1070,7 @@ mod translate {
                     vec![Event::Packet(Box::new(play::Clientbound::TeleportEntity(
                         play::TeleportEntity {
                             id: m.runtime_id as i32,
-                            position: [
-                                m.position[0] as f64,
-                                m.position[1] as f64,
-                                m.position[2] as f64,
-                            ],
+                            position,
                             delta: [0.0; 3],
                             yaw: m.yaw,
                             pitch: m.pitch,
@@ -1405,6 +1409,8 @@ mod translate {
             *last = position;
             d
         };
+        // Bedrock's mPos is the eye position; the game tracks feet.
+        let position = [position[0], position[1] + PLAYER_EYE, position[2]];
         vec![bp::Out::PlayerAuthInput {
             position,
             pitch,
