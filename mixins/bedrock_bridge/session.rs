@@ -1018,6 +1018,34 @@ mod translate {
                     },
                 )))]
             }
+            // Entity metadata. Bedrock's actor flags (index 0, a long) become
+            // Java's shared-flags byte: on-fire, sneaking, sprinting and
+            // invisible occupy the same bit positions in both, so the rest of
+            // the long is dropped. Without this a crouching player never
+            // crouches on the Java client.
+            bp::Packet::SetEntityData(d) => {
+                let mut flags: Option<i8> = None;
+                for (k, v) in &d.metadata {
+                    if *k == 0 {
+                        if let bp::MetaValue::Long(f) = v {
+                            flags = Some((*f as u64 & 0x2B) as i8);
+                        }
+                    }
+                }
+                match flags {
+                    Some(f) => vec![Event::Packet(Box::new(play::Clientbound::SetEntityData(
+                        play::SetEntityData {
+                            id: d.runtime_id as i32,
+                            values: vec![(
+                                0,
+                                horizon_protocol::entity_data::serializer::BYTE,
+                                horizon_protocol::entity_data::Value::Byte(f),
+                            )],
+                        },
+                    )))],
+                    None => Vec::new(),
+                }
+            }
             // The item registry: the network ids every inventory and equipment
             // packet names an item by. It arrives once, after `StartGame`.
             bp::Packet::ItemRegistry(items) => {
