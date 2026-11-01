@@ -107,6 +107,16 @@ struct Bridge {
     /// Last position sent to the server; rotation-only updates reuse it, so a
     /// MovePlayerRot never looks like a teleport to (0,0,0).
     position: Mutex<[f32; 3]>,
+    /// Last (yaw, pitch) the game sent, so a block action can carry the view
+    /// it was aimed with.
+    rotation: Mutex<[f32; 2]>,
+    /// The game's `PlayerInput` flags (Java bitfield): forward 1, back 2, left
+    /// 4, right 8, jump 16, sneak 32, sprint 64. The server simulates movement
+    /// from this and the move vector, not from the position we claim.
+    input: AtomicI64,
+    /// The position sent with the previous input, so the input's `delta`
+    /// (movement this tick) is real rather than zero.
+    last_sent: Mutex<[f32; 3]>,
     /// The `PlayerAuthInput` tick id: it advances with every input packet, and
     /// the server pairs corrections with the id they answer.
     tick: AtomicI64,
@@ -136,6 +146,9 @@ pub fn try_connect(
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
         position: Mutex::new([0.0; 3]),
+        rotation: Mutex::new([0.0; 2]),
+        input: AtomicI64::new(0),
+        last_sent: Mutex::new([0.0; 3]),
         tick: AtomicI64::new(1),
         shutdown: AtomicBool::new(false),
     });
@@ -332,6 +345,7 @@ fn run(
     let mut queued: std::collections::VecDeque<bedrock_core::protocol::Packet> =
         std::collections::VecDeque::new();
 
+    let mut last_heartbeat = std::time::Instant::now();
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
         // shutdown) ends the thread.
@@ -371,7 +385,26 @@ fn run(
                 return;
             }
         }
-        for _ in 0..TRANSLATE_PER_TICK {
+        // Keep the input stream going, as a real client does, so the server
+        // never sees the player go silent (other clients would see it frozen).
+        // Only once we are in-world: a `PlayerAuthInput` during login is an
+        // unexpected packet and the server kicks with reason 49.
+        if ctx.runtime_id != 0 && last_heartbeat.elapsed() >= std::time::Duration::from_millis(50) {
+            let batch = translate::heartbeat(&bridge);
+            if let Err(e) = client.send(&batch) {
+                log::warn!("bedrock: heartbeat failed: {e}");
+            }
+            last_heartbeat = std::time::Instant::now();
+        }
+        // Translate more packets when a backlog built up, so received entities,
+        // chunks and chat are not seconds behind. The budget still bounds each
+        // iteration so the WebRTC pump is serviced.
+        let budget = if queued.len() > 16 {
+            TRANSLATE_PER_TICK * 3
+        } else {
+            TRANSLATE_PER_TICK
+        };
+        for _ in 0..budget {
             let Some(packet) = queued.pop_front() else {
                 break;
             };
@@ -393,7 +426,13 @@ fn run(
                 let _ = client.request_chunks(i32::from(view_distance));
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Only sleep when there is nothing queued; with a backlog, go straight
+        // round again to catch up.
+        if queued.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        } else {
+            std::thread::yield_now();
+        }
     }
 
     let _ = events.send(Event::Disconnected {
@@ -712,11 +751,13 @@ mod translate {
         })
     }
 
-    fn entity_type_id(ctx: &Context, java_name: &str) -> i32 {
+    /// The Java entity-type id for a name, or `None` when the client has no
+    /// such entity. A miss must not fall back to 0: id 0 is `acacia_boat`, which
+    /// is what turned every unrecognised entity into a boat.
+    fn entity_type_id(ctx: &Context, java_name: &str) -> Option<i32> {
         ctx.builtin
             .get("minecraft:entity_type")
             .and_then(|ids| ids.id(java_name))
-            .unwrap_or(0)
     }
 
     /// A Bedrock item identifier → Horizon's numeric item id (0 when unknown).
@@ -907,7 +948,11 @@ mod translate {
             ))],
             bp::Packet::AddEntity(entity) => {
                 let java_name = ctx.mappings.java_entity(&entity.identifier);
-                let kind = entity_type_id(ctx, &java_name);
+                // An entity the client has no type for is skipped rather than
+                // spawned as id 0 (acacia boat).
+                let Some(kind) = entity_type_id(ctx, &java_name) else {
+                    return Vec::new();
+                };
                 bedrock_core::nethernet::trace(format!(
                     "add entity {} {} at {:?}",
                     entity.runtime_id, entity.identifier, entity.position
@@ -940,6 +985,9 @@ mod translate {
             }
             bp::Packet::AddPlayer(player) => {
                 let uuid = u128::from_be_bytes(player.uuid);
+                let Some(kind) = entity_type_id(ctx, "minecraft:player") else {
+                    return Vec::new();
+                };
                 ctx.entities.insert(
                     player.runtime_id,
                     (player.position, player.yaw, player.pitch, player.yaw),
@@ -948,7 +996,7 @@ mod translate {
                     play::AddEntity {
                         id: player.runtime_id as i32,
                         uuid,
-                        kind: entity_type_id(ctx, "minecraft:player"),
+                        kind,
                         position: [
                             player.position[0] as f64,
                             player.position[1] as f64,
@@ -1328,40 +1376,144 @@ mod translate {
     /// ignored, which is why the player looked like a statue to it). The flag
     /// set is empty for now: no sneaking, sprinting or block actions yet.
     fn auth_input(bridge: &Bridge, position: [f32; 3], yaw: f32, pitch: f32) -> Vec<bp::Out> {
-        // The server rejects the PlayerAuthInput this builds — the session is
-        // dropped while the server still lists the player — so movement goes
-        // out as MovePlayer again, which it ignores harmlessly. The encoder
-        // stays for when the field order has been checked against a capture.
-        let _ = bridge.tick.fetch_add(1, Ordering::Relaxed);
-        vec![bp::Out::MovePlayer {
-            runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
+        auth_input_actions(bridge, position, yaw, pitch, Vec::new())
+    }
+
+    /// The same packet with block actions (start/stop/abort a break). The
+    /// `PERFORM_BLOCK_ACTIONS` flag (bit 35) is set, which is the flag the
+    /// encoder keys the action list off.
+    fn auth_input_actions(
+        bridge: &Bridge,
+        position: [f32; 3],
+        yaw: f32,
+        pitch: f32,
+        actions: Vec<bp::BlockAction>,
+    ) -> Vec<bp::Out> {
+        let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
+        let (mut flags, move_vec) = input_bits(bridge);
+        if !actions.is_empty() {
+            flags |= 1 << 35;
+        }
+        // The real per-tick delta (movement since the previous input).
+        let delta = {
+            let mut last = bridge.last_sent.lock().unwrap();
+            let d = [
+                position[0] - last[0],
+                position[1] - last[1],
+                position[2] - last[2],
+            ];
+            *last = position;
+            d
+        };
+        vec![bp::Out::PlayerAuthInput {
             position,
             pitch,
             yaw,
             head_yaw: yaw,
-            mode: 0,
-            on_ground: true,
+            move_vec,
+            delta,
+            flags,
+            block_actions: actions,
+            tick,
         }]
+    }
+
+    /// The Bedrock input flags and move vector for the game's current
+    /// `PlayerInput` bitfield. The server simulates movement from these, so with
+    /// an empty vector it holds the player still however the position claims
+    /// otherwise.
+    fn input_bits(bridge: &Bridge) -> (u64, [f32; 2]) {
+        let f = bridge.input.load(Ordering::Relaxed) as u8;
+        let (forward, backward) = (f & 0x01 != 0, f & 0x02 != 0);
+        let (left, right) = (f & 0x04 != 0, f & 0x08 != 0);
+        let (jump, sneak, sprint) = (f & 0x10 != 0, f & 0x20 != 0, f & 0x40 != 0);
+
+        // block_breaking_delay_enabled is on every real client input.
+        let mut bits = 1u64 << 48;
+        if forward {
+            bits |= 1 << 10; // up
+        }
+        if backward {
+            bits |= 1 << 11; // down
+        }
+        if left {
+            bits |= 1 << 12; // left
+        }
+        if right {
+            bits |= 1 << 13; // right
+        }
+        if jump {
+            bits |= (1 << 6) | (1 << 3); // jumping, jump_down
+        }
+        if sneak {
+            bits |= 1 << 8; // sneaking
+        }
+        if sprint {
+            bits |= 1 << 20; // sprinting
+        }
+        let x = (right as i32) - (left as i32);
+        let z = (forward as i32) - (backward as i32);
+        (bits, [x as f32, z as f32])
+    }
+
+    /// One `PlayerAuthInput` for the current tick even when the game sent no
+    /// movement. A real client transmits one every tick, and the server expects
+    /// the stream to keep going (an idle client that stops sending looks frozen
+    /// to the other players).
+    pub fn heartbeat(bridge: &Bridge) -> Vec<bp::Out> {
+        let pos = *bridge.position.lock().unwrap();
+        let [yaw, pitch] = *bridge.rotation.lock().unwrap();
+        auth_input(bridge, pos, yaw, pitch)
     }
 
     /// Java serverbound → Bedrock.
     pub fn serverbound(bridge: &Bridge, packet: &play::Serverbound) -> Vec<bp::Out> {
-        let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
         match packet {
+            // Movement and input only update the bridge state; the loop sends
+            // one `PlayerAuthInput` per tick (50 ms) with all of it. Sending one
+            // per movement packet ran the input tick far faster than the
+            // server's, and it stopped applying our movement.
             play::Serverbound::MovePlayerPos(p) => {
-                let pos = [p.x as f32, p.y as f32, p.z as f32];
-                *bridge.position.lock().unwrap() = pos;
-                auth_input(bridge, pos, 0.0, 0.0)
+                *bridge.position.lock().unwrap() = [p.x as f32, p.y as f32, p.z as f32];
+                Vec::new()
             }
             play::Serverbound::MovePlayerPosRot(p) => {
-                let pos = [p.x as f32, p.y as f32, p.z as f32];
-                *bridge.position.lock().unwrap() = pos;
-                auth_input(bridge, pos, p.yaw, p.pitch)
+                *bridge.position.lock().unwrap() = [p.x as f32, p.y as f32, p.z as f32];
+                *bridge.rotation.lock().unwrap() = [p.yaw, p.pitch];
+                Vec::new()
             }
             play::Serverbound::MovePlayerRot(p) => {
-                // Rotation only: keep the last position so it is not a teleport.
+                *bridge.rotation.lock().unwrap() = [p.yaw, p.pitch];
+                Vec::new()
+            }
+            play::Serverbound::PlayerInput(p) => {
+                bridge.input.store(i64::from(p.flags), Ordering::Relaxed);
+                Vec::new()
+            }
+            // Block breaking, with the action ids a real 1.26 client sends:
+            // `start_break` 0, `abort_break` 1, `predict_break` 26. Horizon's
+            // Java numbering (its `lan_actions.rs` handler) is 0 start, 1/2
+            // abort, 3 finished.
+            play::Serverbound::PlayerAction(p) => {
+                let action = match p.action {
+                    0 => 0,     // start_break
+                    1 | 2 => 1, // abort_break
+                    3 => 26,    // predict_break (the client predicted the break)
+                    _ => return Vec::new(),
+                };
                 let pos = *bridge.position.lock().unwrap();
-                auth_input(bridge, pos, p.yaw, p.pitch)
+                let [yaw, pitch] = *bridge.rotation.lock().unwrap();
+                auth_input_actions(
+                    bridge,
+                    pos,
+                    yaw,
+                    pitch,
+                    vec![bp::BlockAction {
+                        action,
+                        position: p.pos,
+                        face: i32::from(p.direction),
+                    }],
+                )
             }
             play::Serverbound::Chat(c) => vec![bp::Out::Text {
                 kind: 1,

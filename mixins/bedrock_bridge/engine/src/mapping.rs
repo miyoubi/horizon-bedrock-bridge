@@ -186,7 +186,10 @@ impl Mappings {
             "minecraft:xp_bottle" => "minecraft:experience_bottle".into(),
             "minecraft:ender_crystal" => "minecraft:end_crystal".into(),
             "minecraft:zombie_pigman" => "minecraft:zombified_piglin".into(),
-            "minecraft:splash_potion" => "minecraft:potion".into(),
+            // Java's thrown potions are entities of their own
+            // (`minecraft:splash_potion`, id 108). Mapping them to the
+            // `minecraft:potion` *item* made the id lookup fail and every witch
+            // potion spawned as acacia boat (Java entity id 0).
             "minecraft:villager_v2" => "minecraft:villager".into(),
             "minecraft:tropicalfish" => "minecraft:tropical_fish".into(),
             other => other.into(),

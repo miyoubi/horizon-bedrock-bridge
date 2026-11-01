@@ -18,6 +18,15 @@ use crate::stream::{Reader, Writer};
 pub enum Packet {
     NetworkSettings(NetworkSettings),
     PlayStatus(i32),
+    /// The server's anti-cheat telling us one of our packets was malformed
+    /// (156). `severity` 2 terminates the connection; `packet_id` is the
+    /// offending packet.
+    ViolationWarning {
+        kind: i32,
+        severity: i32,
+        packet_id: i32,
+        message: String,
+    },
     Disconnect(Disconnect),
     ServerToClientHandshake(String),
     ResourcePacksInfo,
@@ -157,8 +166,14 @@ pub enum Out {
         head_yaw: f32,
         /// Horizontal analog move vector, -1..1.
         move_vec: [f32; 2],
+        /// Movement since the previous input (the server compares our claimed
+        /// position against it).
+        delta: [f32; 3],
         /// `PlayerAuthInputFlags` bits.
         flags: u64,
+        /// Block actions for this tick, written when `flags` has
+        /// `PERFORM_BLOCK_ACTIONS` (bit 35) set.
+        block_actions: Vec<BlockAction>,
         tick: u64,
     },
     MovePlayer {
@@ -200,6 +215,12 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
     Ok(match id {
         ids::NETWORK_SETTINGS => Packet::NetworkSettings(NetworkSettings::read(&mut r)?),
         ids::PLAY_STATUS => Packet::PlayStatus(r.i32()?),
+        ids::VIOLATION_WARNING => Packet::ViolationWarning {
+            kind: r.zigzag32()?,
+            severity: r.zigzag32()?,
+            packet_id: r.zigzag32()?,
+            message: r.string()?,
+        },
         ids::DISCONNECT => Packet::Disconnect(Disconnect::read(&mut r)?),
         ids::SERVER_TO_CLIENT_HANDSHAKE => Packet::ServerToClientHandshake(r.string()?),
         ids::RESOURCE_PACKS_INFO => Packet::ResourcePacksInfo,
@@ -437,10 +458,13 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             yaw,
             head_yaw,
             move_vec,
+            delta,
             flags,
+            block_actions,
             tick,
         } => {
             w.varint(ids::PLAYER_AUTH_INPUT);
+            let start = w.data.len();
             w.f32(*pitch);
             w.f32(*yaw);
             w.f32(position[0]);
@@ -449,31 +473,41 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.f32(move_vec[0]);
             w.f32(move_vec[1]);
             w.f32(*head_yaw);
-            // The 65 input flags go seven bits per byte, every byte but the
-            // last carrying a continuation bit.
-            for group in 0..10u32 {
-                let mut byte = ((flags >> (group * 7)) & 0x7f) as u8;
-                if group < 9 {
-                    byte |= 0x80;
-                }
-                w.u8(byte);
-            }
+            packets::write_input_flags(&mut w, *flags);
             w.varint(1); // InputMode: mouse and keyboard
             w.varint(0); // PlayMode: normal
-            w.varint(1); // InteractionModel: crosshair
+            w.zigzag32(0); // InteractionModel: touch (what a real 1.26 client sends)
             w.f32(0.0);
             w.f32(0.0); // interact rotation
-            w.varint(*tick as u32);
-            w.f32(0.0);
-            w.f32(0.0);
-            w.f32(0.0); // delta
-            w.f32(0.0);
-            w.f32(0.0); // analog move vector
+            w.varlong(*tick);
+            w.f32(delta[0]);
+            w.f32(delta[1]);
+            w.f32(delta[2]); // delta
+            // The optional sections are each preceded by a presence bool. The
+            // server wants these (movement fails without them); the block-action
+            // payload itself still needs a captured frame to finish.
+            let has_actions = *flags & (1 << 35) != 0;
+            w.bool(false); // item interaction
+            w.bool(false); // item stack request
+            w.bool(has_actions);
+            if has_actions {
+                packets::write_block_actions(&mut w, block_actions);
+            }
+            w.bool(false); // vehicle rotation
+            w.bool(false); // vehicle id
+            w.f32(move_vec[0]);
+            w.f32(move_vec[1]); // analog move vector
             w.f32(*pitch);
             w.f32(*yaw);
             w.f32(0.0); // camera orientation
-            w.f32(0.0);
-            w.f32(0.0); // raw move
+            w.f32(move_vec[0]);
+            w.f32(move_vec[1]); // raw move vector
+            if !block_actions.is_empty() {
+                crate::nethernet::trace(format!(
+                    "AUTHIN flags={flags:#x} tick={tick} pos={position:?} actions={block_actions:?} bytes={:02x?}",
+                    &w.data[start..]
+                ));
+            }
         }
         Out::MovePlayer {
             runtime_id,

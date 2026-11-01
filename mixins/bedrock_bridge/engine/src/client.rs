@@ -212,7 +212,7 @@ impl BedrockClient {
     fn react(&mut self, packets: Vec<Packet>) -> Vec<Packet> {
         for packet in &packets {
             // How far the handshake got, in the trace file.
-            let shown: String = format!("{packet:?}").chars().take(80).collect();
+            let shown: String = format!("{packet:?}").chars().take(400).collect();
             crate::nethernet::trace(format!("recv {shown}"));
             match packet {
                 Packet::NetworkSettings(p) => {

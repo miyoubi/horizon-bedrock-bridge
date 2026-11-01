@@ -186,6 +186,9 @@ pub struct StartGame {
     pub yaw: f32,
     pub pitch: f32,
     pub seed: i64,
+    /// The server's current tick at spawn. `PlayerAuthInput`'s tick must start
+    /// here, not at zero — the server pairs inputs and corrections by it.
+    pub current_tick: i64,
     pub dimension: i32,
     pub generator: i32,
     pub world_gamemode: i32,
@@ -296,7 +299,7 @@ impl StartGame {
         let _trial = r.bool()?;
         let _rewind_history = r.zigzag32()?;
         let _server_auth_block_breaking = r.bool()?;
-        let _current_tick = r.i64()?;
+        let current_tick = r.i64()?;
         let _enchantment_seed = r.zigzag32()?;
 
         // The block palette: uvarint count of (string identifier, network NBT).
@@ -316,6 +319,7 @@ impl StartGame {
             yaw,
             pitch,
             seed,
+            current_tick,
             dimension,
             generator,
             world_gamemode,
@@ -975,6 +979,54 @@ impl BlockEntityData {
     }
 }
 
+/// One block action carried in a `PlayerAuthInput` (the `PERFORM_BLOCK_ACTIONS`
+/// flag). `action` is a Bedrock `PlayerAction`: `START_BREAK` 0, `ABORT_BREAK` 1,
+/// `STOP_BREAK` 2, `CRACK_BREAK` 18, `PREDICT_DESTROY_BLOCK` 26,
+/// `CONTINUE_DESTROY_BLOCK` 27. Every action carries the block position and face
+/// except `STOP_BREAK`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockAction {
+    pub action: i32,
+    pub position: [i32; 3],
+    pub face: i32,
+}
+
+impl BlockAction {
+    /// Whether the action is followed by the block position and face
+    /// (`PlayerBlockActionWithBlockInfo::isValidActionType`).
+    fn has_block_info(self) -> bool {
+        matches!(self.action, 0 | 1 | 18 | 26 | 27)
+    }
+}
+
+/// The block actions of a `PlayerAuthInput`, written after the block-actions
+/// presence bool. The count is an unsigned varint; the action, position and face
+/// are signed.
+pub fn write_block_actions(w: &mut Writer, actions: &[BlockAction]) {
+    w.varint(actions.len() as u32);
+    for action in actions {
+        w.zigzag32(action.action);
+        if action.has_block_info() {
+            w.zigzag32(action.position[0])
+                .zigzag32(action.position[1])
+                .zigzag32(action.position[2])
+                .zigzag32(action.face);
+        }
+    }
+}
+
+/// The `PlayerAuthInput` input flags, as a real 1.26 client sends them: a varint
+/// count of the set flags, then each flag index as a signed varint, ascending.
+/// (The server-side schema is `array<InputData>`, and `InputData` is zigzag32.)
+pub fn write_input_flags(w: &mut Writer, flags: u64) {
+    w.varint(flags.count_ones());
+    for bit in 0..64u32 {
+        if flags & (1u64 << bit) != 0 {
+            w.zigzag32(bit as i32);
+        }
+    }
+}
+
 /// A `PlayerAuthInput` position/rotation sample we send back to the server.
 #[allow(clippy::too_many_arguments)]
 pub fn write_move_player(
@@ -1185,5 +1237,49 @@ mod tests {
         // The bug this guards: skipping the version/NBT on a legacy
         // (non-component-based) entry leaves the reader mid-stream.
         assert!(r.is_empty(), "the palette must consume every entry");
+    }
+
+    #[test]
+    fn input_flags_are_a_count_then_signed_indices() {
+        let mut w = Writer::new();
+        write_input_flags(&mut w, 0);
+        assert_eq!(w.into_inner(), vec![0x00]);
+
+        let mut w = Writer::new();
+        write_input_flags(&mut w, 1 << 6);
+        assert_eq!(w.into_inner(), vec![0x01, 0x0c]);
+
+        let mut w = Writer::new();
+        write_input_flags(&mut w, (1 << 6) | (1 << 25));
+        assert_eq!(w.into_inner(), vec![0x02, 0x0c, 0x32]);
+    }
+
+    #[test]
+    fn block_actions_carry_position_except_stop_break() {
+        let actions = [
+            BlockAction {
+                action: 0,
+                position: [1, 64, -2],
+                face: 1,
+            },
+            // STOP_BREAK has no position or face on the wire.
+            BlockAction {
+                action: 2,
+                position: [9, 9, 9],
+                face: 5,
+            },
+        ];
+        let mut w = Writer::new();
+        write_block_actions(&mut w, &actions);
+        let bytes = w.into_inner();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.varint().unwrap(), 2); // count (unsigned)
+        assert_eq!(r.zigzag32().unwrap(), 0); // START_BREAK
+        assert_eq!(r.zigzag32().unwrap(), 1);
+        assert_eq!(r.zigzag32().unwrap(), 64);
+        assert_eq!(r.zigzag32().unwrap(), -2);
+        assert_eq!(r.zigzag32().unwrap(), 1); // face
+        assert_eq!(r.zigzag32().unwrap(), 2); // STOP_BREAK, and nothing more
+        assert!(r.is_empty(), "STOP_BREAK carries no position or face");
     }
 }
