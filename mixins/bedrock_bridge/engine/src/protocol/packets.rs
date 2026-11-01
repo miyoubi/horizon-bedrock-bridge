@@ -196,10 +196,6 @@ pub struct StartGame {
     /// The server's block palette in runtime-id order: `(identifier, state NBT)`.
     /// Chunk runtime ids index this, then map to Java block states.
     pub palette: Vec<(String, crate::nbt::Tag)>,
-    /// The server's item palette: `(identifier, network id)`. The network id is
-    /// what `MobEquipment` and the inventory packets carry, so it is kept
-    /// alongside the identifier the mappings are keyed by.
-    pub items: Vec<(String, i16)>,
 }
 
 impl StartGame {
@@ -312,27 +308,6 @@ impl StartGame {
             palette.push((name, state));
         }
 
-        // The item palette follows the block palette: an entry is the
-        // identifier, a little-endian `i16` network id, and — for items defined
-        // by components — a version and the component list.
-        let item_count = r.varint()?;
-        let mut items = Vec::with_capacity((item_count as usize).min(4096));
-        for _ in 0..item_count {
-            let name = r.string()?;
-            let runtime_id = r.i16()?;
-            if r.bool()? {
-                let version = r.varint()?;
-                if version >= 1 {
-                    let components = r.varint()?;
-                    for _ in 0..components {
-                        let _component = r.string()?;
-                        let _ = crate::nbt::read_named(r)?;
-                    }
-                }
-            }
-            items.push((name, runtime_id));
-        }
-
         Ok(StartGame {
             entity_unique_id,
             entity_runtime_id,
@@ -349,7 +324,6 @@ impl StartGame {
             level_id,
             world_name,
             palette,
-            items,
         })
     }
 
@@ -359,6 +333,31 @@ impl StartGame {
             .ok()
             .and_then(|i| self.palette.get(i))
     }
+}
+
+/// The `ItemRegistry` (162) payload: `(identifier, network id)` in arrival
+/// order. The inventory and equipment packets index this by network id.
+///
+/// Each entry is the identifier, a little-endian `i16` network id, the
+/// component-based flag, a version (0 legacy, 1 data-driven, 2 none) and the
+/// item's component NBT. The version and the NBT are always on the wire,
+/// whatever the flag says — reading them only for component-based entries runs
+/// the next name off the end of the stream and the whole packet fails.
+///
+/// Note that `StartGame` does **not** carry this palette in 1.26: it ends at the
+/// block palette (`block_properties`), and the items arrive in this packet.
+pub fn read_item_palette(r: &mut Reader) -> Result<Vec<(String, i16)>> {
+    let count = r.varint()?;
+    let mut items = Vec::with_capacity((count as usize).min(4096));
+    for _ in 0..count {
+        let name = r.string()?;
+        let network_id = r.i16()?;
+        let _component_based = r.bool()?;
+        let _version = r.zigzag32()?;
+        let _components = crate::nbt::read_named(r)?.1;
+        items.push((name, network_id));
+    }
+    Ok(items)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1143,5 +1142,48 @@ impl PlayerList {
             }
         }
         Ok(PlayerList { entries })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nbt::{self, Tag};
+    use crate::stream::{Reader, Writer};
+
+    /// One 1.26.60 item-palette entry: identifier, `i16` id, component-based,
+    /// version, then the component NBT — the last two always present.
+    fn entry(w: &mut Writer, name: &str, id: i16, component_based: bool, version: i32) {
+        w.string(name)
+            .i16(id)
+            .bool(component_based)
+            .zigzag32(version);
+        nbt::write_named(
+            w,
+            "",
+            &Tag::Compound(vec![("minecraft:max_stack_size".into(), Tag::Int(64))]),
+        );
+    }
+
+    #[test]
+    fn item_palette_reads_version_and_nbt_for_every_entry() {
+        let mut w = Writer::new();
+        w.varint(2);
+        entry(&mut w, "minecraft:air", 0, false, 0);
+        entry(&mut w, "minecraft:diamond_sword", 257, true, 1);
+        let bytes = w.into_inner();
+
+        let mut r = Reader::new(&bytes);
+        let items = read_item_palette(&mut r).expect("palette decodes");
+        assert_eq!(
+            items,
+            vec![
+                ("minecraft:air".to_owned(), 0),
+                ("minecraft:diamond_sword".to_owned(), 257),
+            ]
+        );
+        // The bug this guards: skipping the version/NBT on a legacy
+        // (non-component-based) entry leaves the reader mid-stream.
+        assert!(r.is_empty(), "the palette must consume every entry");
     }
 }

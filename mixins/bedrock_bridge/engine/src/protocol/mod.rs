@@ -23,7 +23,9 @@ pub enum Packet {
     ResourcePacksInfo,
     ResourcePackStack,
     StartGame(StartGame),
-    ItemComponent,
+    /// The item registry (162): `(identifier, network id)` for every item the
+    /// inventory and equipment packets can name.
+    ItemRegistry(Vec<(String, i16)>),
     AvailableEntityIdentifiers(crate::nbt::Tag),
     BiomeDefinitionList,
     CreativeContent,
@@ -73,7 +75,7 @@ pub enum Packet {
         gamemode: i32,
         runtime_id: u64,
     },
-    SetHealth(f32),
+    SetHealth(i32),
     SetSpawnPosition {
         position: [i32; 3],
     },
@@ -203,7 +205,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::RESOURCE_PACKS_INFO => Packet::ResourcePacksInfo,
         ids::RESOURCE_PACK_STACK => Packet::ResourcePackStack,
         ids::START_GAME => Packet::StartGame(StartGame::read(&mut r)?),
-        ids::ITEM_COMPONENT => Packet::ItemComponent,
+        ids::ITEM_REGISTRY => Packet::ItemRegistry(read_item_palette(&mut r)?),
         ids::AVAILABLE_ENTITY_IDENTIFIERS => {
             Packet::AvailableEntityIdentifiers(crate::nbt::read_named(&mut r)?.1)
         }
@@ -272,7 +274,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::TEXT => Packet::Text(Text::read(&mut r)?),
         ids::SET_TIME => Packet::SetTime(r.zigzag32()?),
         ids::SET_PLAYER_GAME_TYPE => Packet::SetPlayerGameType(r.zigzag32()?),
-        ids::SET_HEALTH => Packet::SetHealth(r.f32()?),
+        ids::SET_HEALTH => Packet::SetHealth(r.zigzag32()?),
         ids::SET_SPAWN_POSITION => {
             let _spawn_type = r.zigzag32()?;
             let position = [r.zigzag32()?, r.zigzag32()?, r.zigzag32()?];

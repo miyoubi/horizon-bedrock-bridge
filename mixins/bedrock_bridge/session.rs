@@ -296,6 +296,14 @@ fn run(
         );
     }
 
+    // The client's biome ids: its own file order, with plains as the default
+    // tint for every chunk until real per-chunk biomes are decoded.
+    let biomes = translate::biome_names(&resources);
+    let biome = biomes
+        .iter()
+        .position(|name| name == "minecraft:plains")
+        .unwrap_or(0) as i32;
+
     let mut ctx = translate::Context {
         builtin: &builtin,
         mappings: &mappings,
@@ -309,6 +317,9 @@ fn run(
         wanted: std::collections::VecDeque::new(),
         wanted_center: None,
         entities: std::collections::HashMap::new(),
+        items: Vec::new(),
+        biomes,
+        biome,
         runtime_id: 0,
         unique_id: 0,
     };
@@ -399,6 +410,8 @@ mod translate {
     use super::{Bridge, Event};
     use bedrock_core::protocol as bp;
     use horizon_protocol::chunk::{ChunkData, LightData, Paletted, Section, Strategy};
+    use horizon_protocol::item::Stack;
+    use horizon_protocol::packets::configuration::{RegistryData, RegistryEntry};
     use horizon_protocol::packets::play;
     use horizon_protocol::registry::{Builtin, DimensionType, Dynamic};
     use horizon_world::nbt::{JavaString, Tag as JTag};
@@ -431,8 +444,51 @@ mod translate {
         /// Where each entity was last put: a Bedrock move carries only the
         /// components that changed, and the client takes absolute positions.
         pub entities: std::collections::HashMap<u64, ([f32; 3], f32, f32, f32)>,
+        /// The server's item palette from `StartGame`: `(identifier, network
+        /// id)`. The inventory and equipment packets carry the network id, so
+        /// this is what resolves them to a Java item.
+        pub items: Vec<(String, i16)>,
+        /// The client's biome names in its own id order (the files under
+        /// `data/minecraft/worldgen/biome`, sorted by name, which is how the
+        /// client builds its table). The bridged `minecraft:worldgen/biome`
+        /// registry is sent in this order so a network id maps straight back to
+        /// the same biome.
+        pub biomes: Vec<String>,
+        /// The network biome id written into every chunk: the client's id for
+        /// plains. Real per-chunk biomes need the sub-chunk biome palettes and
+        /// are still TODO, but the tint is correct rather than falling back to
+        /// whatever biome id 1 hit in an empty registry.
+        pub biome: i32,
         pub runtime_id: u64,
         pub unique_id: i64,
+    }
+
+    /// The client's biome names in its own id order.
+    ///
+    /// The client loads `data/minecraft/worldgen/biome/*.json` and sorts the
+    /// file names; its ids are that order. Sending the `minecraft:worldgen/biome`
+    /// registry in the same order makes a network id equal to the client's own
+    /// id, so a chunk's biome value needs no remapping.
+    pub fn biome_names(resources: &std::path::Path) -> Vec<String> {
+        let dir = resources.join("data/minecraft/worldgen/biome");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| format!("minecraft:{s}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     /// Resolves Bedrock runtime ids to the game's block-state ids.
@@ -527,6 +583,7 @@ mod translate {
             ctx.sections.insert((x, z), known);
             return None;
         }
+        let biome = ctx.biome;
         let blocks = ctx.blocks.as_mut()?;
         let dimension = DimensionType::vanilla("minecraft:overworld");
         // Where the column's sections were put, so a vertical offset against
@@ -568,7 +625,7 @@ mod translate {
                 non_empty,
                 fluids: 0,
                 states: Paletted::from_values(&values, Strategy::Blocks, 16),
-                biomes: Paletted::from_values(&[1i32; 64], Strategy::Biomes, 7),
+                biomes: Paletted::from_values(&[biome; 64], Strategy::Biomes, 7),
             });
         }
         let air = blocks.air;
@@ -576,7 +633,7 @@ mod translate {
             non_empty: 0,
             fluids: 0,
             states: Paletted::from_values(&[air as i32; 4096], Strategy::Blocks, 16),
-            biomes: Paletted::from_values(&[1i32; 64], Strategy::Biomes, 7),
+            biomes: Paletted::from_values(&[biome; 64], Strategy::Biomes, 7),
         };
         let sections: Vec<Section> = filled
             .into_iter()
@@ -663,20 +720,23 @@ mod translate {
     }
 
     /// A Bedrock item identifier → Horizon's numeric item id (0 when unknown).
-    #[allow(dead_code)]
-    fn item_id(ctx: &Context, java_name: &str) -> i32 {
-        ctx.builtin
+    fn item_id(builtin: &Builtin, java_name: &str) -> i32 {
+        builtin
             .get("minecraft:item")
             .and_then(|ids| ids.id(java_name))
             .unwrap_or(0)
     }
 
     /// A network id from the server's item palette → Horizon's numeric item id.
-    #[allow(dead_code)]
-    fn item_by_network_id(ctx: &Context, palette: &[(String, i16)], network_id: i16) -> i32 {
-        ctx.mappings
+    fn item_by_network_id(
+        mappings: &bedrock_core::mapping::Mappings,
+        builtin: &Builtin,
+        palette: &[(String, i16)],
+        network_id: i16,
+    ) -> i32 {
+        mappings
             .java_item_by_network_id(palette, network_id)
-            .map(|name| item_id(ctx, &name))
+            .map(|name| item_id(builtin, &name))
             .unwrap_or(0)
     }
 
@@ -745,10 +805,26 @@ mod translate {
                 ];
                 ctx.spawn_yaw = g.yaw;
                 ctx.spawn_pitch = g.pitch;
+                // The biome registry in the client's own id order. Without it the
+                // client's biome table is empty and every chunk biome id falls
+                // back to the first biome (badlands — brown grass); with it, the
+                // id we write into each chunk maps straight to that biome.
+                let mut registries = Dynamic::default();
+                registries.add(RegistryData {
+                    registry: "minecraft:worldgen/biome".to_owned(),
+                    entries: ctx
+                        .biomes
+                        .iter()
+                        .map(|name| RegistryEntry {
+                            id: name.clone(),
+                            data: None,
+                        })
+                        .collect(),
+                });
                 vec![
                     Event::Status("Bedrock login accepted".into()),
                     Event::Joined {
-                        registries: Arc::new(Dynamic::default()),
+                        registries: Arc::new(registries),
                         uuid: 0,
                         name: String::new(),
                     },
@@ -821,9 +897,10 @@ mod translate {
                     locked: true,
                 }),
             ))],
+            // Bedrock sends health as a signed varint.
             bp::Packet::SetHealth(health) => vec![Event::Packet(Box::new(
                 play::Clientbound::SetHealth(play::SetHealth {
-                    health: *health,
+                    health: *health as f32,
                     food: 20,
                     saturation: 5.0,
                 }),
@@ -882,6 +959,38 @@ mod translate {
                         yaw: (player.yaw / (360.0 / 256.0)) as i8,
                         head_yaw: 0,
                         data: 0,
+                    },
+                )))]
+            }
+            // The item registry: the network ids every inventory and equipment
+            // packet names an item by. It arrives once, after `StartGame`.
+            bp::Packet::ItemRegistry(items) => {
+                ctx.items = items.clone();
+                Vec::new()
+            }
+            // The item an entity is holding. `SetEquipment` carries the two
+            // hands Java models; other containers are inventory traffic. An
+            // empty or unknown stack clears the slot.
+            bp::Packet::MobEquipment(e) => {
+                let java_slot = match e.window_id {
+                    // Inventory / hotbar → main hand.
+                    0 | 28 | 29 => 0u8,
+                    // Off hand.
+                    34 | 119 => 1u8,
+                    _ => return Vec::new(),
+                };
+                let id = item_by_network_id(
+                    ctx.mappings,
+                    ctx.builtin,
+                    &ctx.items,
+                    e.new_item.runtime_id,
+                );
+                let stack = (id != 0 && e.new_item.count > 0)
+                    .then(|| Stack::new(id, i32::from(e.new_item.count)));
+                vec![Event::Packet(Box::new(play::Clientbound::SetEquipment(
+                    play::SetEquipment {
+                        id: e.runtime_id as i32,
+                        slots: vec![(java_slot, stack)],
                     },
                 )))]
             }
@@ -1072,11 +1181,14 @@ mod translate {
                         break;
                     };
                     // Every section of the column: the client meshes what it has.
+                    // The base Y is 0 and the offsets carry the absolute section
+                    // index, which for the overworld (min_y -64) runs -4..=19 —
+                    // the convention a real Bedrock client uses.
                     let offsets: Vec<[i8; 3]> = (-4..=19).map(|sy| [0i8, sy as i8, 0]).collect();
                     ctx.requests
                         .push(bedrock_core::protocol::Out::SubChunkRequest {
                             dimension: 0,
-                            center: [cx, 4, cz],
+                            center: [cx, 0, cz],
                             offsets,
                         });
                 }
@@ -1179,7 +1291,11 @@ mod translate {
                     else {
                         continue;
                     };
-                    let y = (sub.position[1] + i32::from(entry.offset[1]) - 4) as i8;
+                    // The entry's section is the reply's base Y plus the offset,
+                    // both absolute section indices (the request asked with base
+                    // Y 0). `column` then places it against the dimension's
+                    // `min_y`, which is the shift that was missing before.
+                    let y = (sub.position[1] + i32::from(entry.offset[1])) as i8;
                     let mut ids = vec![0u32; 4096];
                     for sy in 0..16usize {
                         for sz in 0..16usize {
