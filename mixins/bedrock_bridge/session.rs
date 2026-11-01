@@ -711,7 +711,10 @@ mod translate {
                     for x in 0..16usize {
                         let top = heights[z * 16 + x] + dimension.min_y;
                         for y in 0..16usize {
-                            if base + (y as i32) < top {
+                            // The top solid block is at `top - 1` and is exposed
+                            // to the sky, so it is fully lit too — lighting only
+                            // `>= top` left the surface block itself dark.
+                            if base + (y as i32) < top - 1 {
                                 continue;
                             }
                             let index = y * 256 + z * 16 + x;
@@ -1067,17 +1070,26 @@ mod translate {
                         },
                     )))]
                 } else {
-                    vec![Event::Packet(Box::new(play::Clientbound::TeleportEntity(
-                        play::TeleportEntity {
+                    // The head turns on its own (head_yaw) while the body yaw
+                    // lags behind, so without the head rotation a player only
+                    // appears to pitch.
+                    vec![
+                        Event::Packet(Box::new(play::Clientbound::TeleportEntity(
+                            play::TeleportEntity {
+                                id: m.runtime_id as i32,
+                                position,
+                                delta: [0.0; 3],
+                                yaw: m.yaw,
+                                pitch: m.pitch,
+                                relatives: 0,
+                                on_ground: m.on_ground,
+                            },
+                        ))),
+                        Event::Packet(Box::new(play::Clientbound::RotateHead(play::RotateHead {
                             id: m.runtime_id as i32,
-                            position,
-                            delta: [0.0; 3],
-                            yaw: m.yaw,
-                            pitch: m.pitch,
-                            relatives: 0,
-                            on_ground: m.on_ground,
-                        },
-                    )))]
+                            head_yaw: (m.head_yaw / (360.0 / 256.0)) as i8,
+                        }))),
+                    ]
                 }
             }
             // Entities move with this one packet; without it everything stands
