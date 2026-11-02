@@ -737,8 +737,8 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(3); // ItemUseOnEntityTransaction
             w.varint(0); // actions count
             w.varlong(*runtime_id);
-            w.zigzag32(*action); // ItemUseOnActorActionType (compressed int32)
-            w.zigzag32(*hotbar_slot); // slot (compressed int32)
+            w.varint(*action as u32); // ItemUseOnActorActionType (plain varint)
+            w.varint(*hotbar_slot as u32); // slot
             w.u8(0); // hand slot: main hand
             // The held item, as a network item stack descriptor.
             write_item(&mut w, *item);
@@ -763,13 +763,13 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.bool(false); // no legacy data
             w.varint(2); // ItemUseTransaction
             w.varint(0); // actions count
-            w.zigzag32(*action); // ItemUseActionType
+            w.varint(*action as u32); // ItemUseActionType (plain varint)
             w.u8(1); // ItemUseTriggerType: player input
             w.zigzag32(block[0])
                 .zigzag32(block[1])
                 .zigzag32(block[2]);
             w.u8(*face as u8);
-            w.zigzag32(*hotbar_slot);
+            w.varint(*hotbar_slot as u32);
             w.u8(0); // hand: main
             write_item(&mut w, *item);
             w.f32(position[0]);
@@ -792,8 +792,8 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.bool(false); // no legacy data
             w.varint(4); // ItemReleaseTransaction
             w.varint(0); // actions count
-            w.zigzag32(0); // ItemReleaseActionType: release
-            w.zigzag32(*slot);
+            w.varint(0); // ItemReleaseActionType: release
+            w.varint(*slot as u32);
             write_item(&mut w, *item);
             w.f32(position[0]);
             w.f32(position[1]);
