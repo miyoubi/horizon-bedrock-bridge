@@ -1039,6 +1039,54 @@ mod translate {
                     },
                 )))]
             }
+            // A dropped item: spawn the Java item entity and put the stack in
+            // its metadata (index 8 is the item entity's stack).
+            bp::Packet::AddItemEntity {
+                runtime_id,
+                unique_id,
+                item,
+                position,
+                velocity,
+            } => {
+                let java_name = ctx.mappings.java_entity("minecraft:item");
+                let Some(kind) = entity_type_id(ctx, &java_name) else {
+                    return Vec::new();
+                };
+                let stack = map_item(ctx, item);
+                ctx.entities
+                    .insert(*runtime_id, (*position, 0.0, 0.0, 0.0));
+                vec![
+                    Event::Packet(Box::new(play::Clientbound::AddEntity(play::AddEntity {
+                        id: *runtime_id as i32,
+                        uuid: *unique_id as u128,
+                        kind,
+                        position: [
+                            position[0] as f64,
+                            position[1] as f64,
+                            position[2] as f64,
+                        ],
+                        velocity: [
+                            velocity[0] as f64,
+                            velocity[1] as f64,
+                            velocity[2] as f64,
+                        ],
+                        pitch: 0,
+                        yaw: 0,
+                        head_yaw: 0,
+                        data: 0,
+                    }))),
+                    Event::Packet(Box::new(play::Clientbound::SetEntityData(
+                        play::SetEntityData {
+                            id: *runtime_id as i32,
+                            values: vec![(
+                                8,
+                                horizon_protocol::entity_data::serializer::ITEM_STACK,
+                                horizon_protocol::entity_data::Value::Item(stack),
+                            )],
+                        },
+                    ))),
+                ]
+            }
             bp::Packet::AddPlayer(player) => {
                 let uuid = u128::from_be_bytes(player.uuid);
                 let Some(kind) = entity_type_id(ctx, "minecraft:player") else {

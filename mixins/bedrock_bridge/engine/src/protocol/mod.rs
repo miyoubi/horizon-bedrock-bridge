@@ -53,6 +53,14 @@ pub enum Packet {
     MovePlayer(MovePlayer),
     MoveEntityAbsolute(MoveEntityAbsolute),
     MoveActorDelta(MoveActorDelta),
+    /// A dropped item lying in the world.
+    AddItemEntity {
+        runtime_id: u64,
+        unique_id: u64,
+        item: NetworkItem,
+        position: [f32; 3],
+        velocity: [f32; 3],
+    },
     /// The server's authoritative correction of our own predicted position.
     CorrectPlayerMovePrediction {
         position: [f32; 3],
@@ -317,6 +325,22 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
                 rotation,
                 on_ground,
                 tick,
+            }
+        }
+        ids::ADD_ITEM_ENTITY => {
+            let unique_id = r.varlong()?;
+            let runtime_id = r.varlong()?;
+            let item = NetworkItem::read(&mut r)?;
+            let position = [r.f32()?, r.f32()?, r.f32()?];
+            let velocity = [r.f32()?, r.f32()?, r.f32()?];
+            let _metadata = read_metadata(&mut r)?;
+            let _from_fishing = r.bool()?;
+            Packet::AddItemEntity {
+                runtime_id,
+                unique_id,
+                item,
+                position,
+                velocity,
             }
         }
         ids::LEVEL_EVENT => Packet::LevelEvent(LevelEvent::read(&mut r)?),
