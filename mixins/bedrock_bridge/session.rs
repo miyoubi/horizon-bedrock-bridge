@@ -1156,12 +1156,16 @@ mod translate {
                 if *tick == 0 || *tick + REWIND_WINDOW < now_tick || *tick > now_tick {
                     return Vec::new();
                 }
-                // The client is not a Bedrock client and cannot predict the
-                // server's movement maths, so ordinary per-tick mismatches are
-                // both constant and large during fast movement (a sprint-jump
-                // covers over a block). Apply only a genuine teleport, or the
-                // client rubber-bands on every jump.
-                if dx * dx + dz * dz < 5.0 * 5.0 && dy.abs() < 4.0 {
+                // The Bedrock server broadcasts its own simulation of the player
+                // to everyone else, so if the client is allowed to sit far from
+                // it, other players see the server's version sliding and
+                // skipping while this client looks fine. Track it closely: the
+                // server accepts a deviation up to its
+                // `player-position-acceptance-threshold` (0.5 by default) and
+                // corrects beyond that, so follow at the same scale. The tick
+                // check above keeps a stale correction from pulling the client
+                // backwards.
+                if dx * dx + dz * dz < 0.5 * 0.5 && dy.abs() < 1.0 {
                     return Vec::new();
                 }
                 vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
