@@ -120,6 +120,13 @@ struct Bridge {
     /// The `PlayerAuthInput` tick id: it advances with every input packet, and
     /// the server pairs corrections with the id they answer.
     tick: AtomicI64,
+    /// Whether the game last reported the player standing on ground, and
+    /// whether it reported a horizontal collision. Bedrock carries these as the
+    /// `VerticalCollision`/`HorizontalCollision` input flags, and the server
+    /// picks ground friction from them; without them it treats the player as
+    /// airborne and glides after the keys are released.
+    on_ground: AtomicBool,
+    collision: AtomicBool,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -150,6 +157,8 @@ pub fn try_connect(
         input: AtomicI64::new(0),
         last_sent: Mutex::new([0.0; 3]),
         tick: AtomicI64::new(1),
+        on_ground: AtomicBool::new(true),
+        collision: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1529,7 +1538,11 @@ mod translate {
         if !actions.is_empty() {
             flags |= 1 << 35;
         }
-        // The real per-tick delta (movement since the previous input).
+        // The delta is a velocity in Bedrock's movement maths, which ViaBedrock
+        // builds from the raw position change: horizontal * 0.98 * friction *
+        // 0.91, and vertical minus gravity then * 0.98. Sending the raw position
+        // change instead makes the server's reconciliation disagree every tick.
+        let on_ground = bridge.on_ground.load(Ordering::Relaxed);
         let delta = {
             let mut last = bridge.last_sent.lock().unwrap();
             let d = [
@@ -1538,7 +1551,12 @@ mod translate {
                 position[2] - last[2],
             ];
             *last = position;
-            d
+            let friction = if on_ground { 0.6 } else { 1.0 };
+            [
+                d[0] * 0.98 * friction * 0.91,
+                (d[1] - 0.08) * 0.98,
+                d[2] * 0.98 * friction * 0.91,
+            ]
         };
         // The move vector comes from the game's input bitfield, which holds the
         // pressed keys until they change. Deriving it from the position delta as
@@ -1587,6 +1605,14 @@ mod translate {
         }]
     }
 
+    /// Record the game's on-ground and horizontal-collision state from a Java
+    /// movement packet's flags: bit 0 is on-ground, bit 1 is horizontal
+    /// collision.
+    fn set_movement_flags(bridge: &Bridge, flags: u8) {
+        bridge.on_ground.store(flags & 1 != 0, Ordering::Relaxed);
+        bridge.collision.store(flags & 2 != 0, Ordering::Relaxed);
+    }
+
     /// The Bedrock input flags and move vector for the game's current
     /// `PlayerInput` bitfield. The server simulates movement from these, so with
     /// an empty vector it holds the player still however the position claims
@@ -1604,6 +1630,17 @@ mod translate {
 
         // block_breaking_delay_enabled is on every real client input.
         let mut bits = 1u64 << 48;
+        // ViaBedrock sends these two from the game's own on-ground/collision
+        // state, and the server picks ground friction from VerticalCollision:
+        // without it the player is simulated as airborne and glides after the
+        // keys are released.
+        let on_ground = bridge.on_ground.load(Ordering::Relaxed);
+        if on_ground {
+            bits |= 1 << 50; // vertical_collision
+        }
+        if bridge.collision.load(Ordering::Relaxed) {
+            bits |= 1 << 49; // horizontal_collision
+        }
         if forward {
             bits |= 1 << 10; // up
         }
@@ -1617,13 +1654,19 @@ mod translate {
             bits |= 1 << 13; // right
         }
         if jump {
-            bits |= (1 << 6) | (1 << 3); // jumping, jump_down
+            // jumping, jump_down, want_up, jump_current_raw
+            bits |= (1 << 6) | (1 << 3) | (1 << 16) | (1 << 61);
+            if on_ground {
+                bits |= 1 << 31; // start_jumping
+            }
         }
         if sneak {
-            bits |= 1 << 8; // sneaking
+            // sneaking, sneak_down, want_down (sneak_current_raw is bit 64,
+            // past the 64-bit flag set the encoder carries)
+            bits |= (1 << 8) | (1 << 9) | (1 << 17);
         }
         if sprint {
-            bits |= 1 << 20; // sprinting
+            bits |= (1 << 20) | (1 << 4); // sprinting, sprint_down
         }
         // Bedrock's local move vector: +x is LEFT, +y is FORWARD. A diagonal is
         // scaled by 1/√2 and sneaking by 0.3, as the reference translator does.
@@ -1673,15 +1716,24 @@ mod translate {
             // server's, and it stopped applying our movement.
             play::Serverbound::MovePlayerPos(p) => {
                 *bridge.position.lock().unwrap() = [p.x as f32, p.y as f32, p.z as f32];
+                set_movement_flags(bridge, p.flags);
                 Vec::new()
             }
             play::Serverbound::MovePlayerPosRot(p) => {
                 *bridge.position.lock().unwrap() = [p.x as f32, p.y as f32, p.z as f32];
                 *bridge.rotation.lock().unwrap() = [p.yaw, p.pitch];
+                set_movement_flags(bridge, p.flags);
                 Vec::new()
             }
             play::Serverbound::MovePlayerRot(p) => {
                 *bridge.rotation.lock().unwrap() = [p.yaw, p.pitch];
+                set_movement_flags(bridge, p.flags);
+                Vec::new()
+            }
+            // A status-only packet carries just the movement flags; the game
+            // sends it when only the on-ground/collision state changed.
+            play::Serverbound::MovePlayerStatus(p) => {
+                set_movement_flags(bridge, p.flags);
                 Vec::new()
             }
             play::Serverbound::PlayerInput(p) => {
