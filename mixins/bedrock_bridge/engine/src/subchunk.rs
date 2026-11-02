@@ -103,18 +103,14 @@ impl SubChunk {
             let header = r.u8()?;
             let runtime = header & 1 == 1;
             let bits = header >> 1;
-            if bits == 0 {
-                // Single-value storage: one zigzag palette id, no packed words.
-                let id = r.zigzag32()?;
-                storages.push(BlockStorage {
-                    storage: BitStorage::new(1, 4096)?,
-                    palette: Palette::Runtime(vec![id]),
-                    layer,
-                });
-                layer = layer.saturating_add(1);
-                continue;
-            }
-            let storage = BitStorage::read(r, bits, 4096)?;
+            // A zero-bit storage carries no packed words but still carries its
+            // palette. Reading it as a lone id left the palette entry behind,
+            // which drifted every following section of the chunk.
+            let storage = if bits == 0 {
+                BitStorage::new(1, 4096)?
+            } else {
+                BitStorage::read(r, bits, 4096)?
+            };
             let palette_size = r.zigzag32()?;
             if palette_size < 0 {
                 return Err(Error::decode("negative palette size"));
