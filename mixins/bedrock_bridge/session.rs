@@ -373,6 +373,7 @@ fn run(
             }
         }
         if !alive || bridge.shutdown.load(Ordering::Relaxed) {
+            bedrock_core::nethernet::trace(format!("session ending: alive={alive} shutdown={}", bridge.shutdown.load(Ordering::Relaxed)));
             // Tell the server the player is leaving and close the transport
             // gracefully; dropping it without this leaves them in the world
             // until the server times the connection out.
@@ -1569,6 +1570,16 @@ mod translate {
             {
                 move_vec = hold.0;
             }
+        }
+        // Snap a near-zero component to zero. A straight walk leaves a tiny
+        // cross-component from yaw rounding, and that residual is enough to set
+        // a direction flag, which the server honours: the player then walks
+        // diagonally instead of straight.
+        if move_vec[0].abs() < 0.05 {
+            move_vec[0] = 0.0;
+        }
+        if move_vec[1].abs() < 0.05 {
+            move_vec[1] = 0.0;
         }
         if move_vec != [0.0, 0.0] {
             flags &= !((1 << 10) | (1 << 11) | (1 << 12) | (1 << 13));

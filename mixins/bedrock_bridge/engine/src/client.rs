@@ -348,6 +348,7 @@ impl BedrockClient {
     /// gracefully, so the player is removed at once rather than after the
     /// session timeout.
     pub fn disconnect(&mut self) {
+        crate::nethernet::trace("DISCONNECT: closing transport");
         let _ = self.send(&[Out::Disconnect {
             hide: true,
             message: String::new(),
