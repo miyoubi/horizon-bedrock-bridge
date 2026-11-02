@@ -791,9 +791,10 @@ mod translate {
     /// entity positions are feet-based, so the two directions need this offset.
     const PLAYER_EYE: f32 = 1.62;
     /// Heartbeats a derived move direction stays live after the last real
-    /// movement, so position updates slower than the heartbeat do not read as
-    /// stops. At 20 heartbeats a second this is about half a second.
-    const HOLD_TICKS: u64 = 10;
+    /// movement, so a position update that lands one heartbeat late still reads
+    /// as walking rather than a stop. Two ticks is one such gap; longer made a
+    /// brief tap keep walking after the key was released.
+    const HOLD_TICKS: u64 = 2;
 
     /// The Java entity-type id for a name, or `None` when the client has no
     /// such entity. A miss must not fall back to 0: id 0 is `acacia_boat`, which
