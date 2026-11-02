@@ -2166,6 +2166,36 @@ mod translate {
                     0 => 0,     // start_break
                     1 | 2 => 1, // abort_break
                     3 => 26,    // predict_break (the client predicted the break)
+                    // The game's own numbering drops through a player action:
+                    // 4 drops the whole stack, 5 drops one. Bedrock drops with
+                    // an item-release transaction instead.
+                    4 | 5 => {
+                        let pos = *bridge.position.lock().unwrap();
+                        let slot = bridge.hotbar.load(Ordering::Relaxed) as i32;
+                        let item = held_item(bridge);
+                        bedrock_core::nethernet::trace(format!(
+                            "DROP action={} slot={slot} item={item:?}",
+                            p.action
+                        ));
+                        {
+                            let mut items = bridge.items.lock().unwrap();
+                            let index = slot.max(0) as usize;
+                            if let Some(entry) = items.get_mut(index) {
+                                if p.action == 5 && entry.as_ref().is_some_and(|e| e.count > 1) {
+                                    if let Some(e) = entry.as_mut() {
+                                        e.count -= 1;
+                                    }
+                                } else {
+                                    *entry = None;
+                                }
+                            }
+                        }
+                        return vec![bp::Out::ItemRelease {
+                            slot,
+                            item,
+                            position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                        }];
+                    }
                     _ => return Vec::new(),
                 };
                 let pos = *bridge.position.lock().unwrap();
