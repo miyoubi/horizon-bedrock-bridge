@@ -1106,21 +1106,54 @@ mod translate {
                 ))];
                 if *actor == ctx.runtime_id as u64 {
                     if let Some(drop) = ctx.drops.remove(item) {
-                        let stack = map_item(ctx, &drop);
-                        let picked = descriptor(&drop);
                         let mut items = bridge.items.lock().unwrap();
-                        let free = items.iter().position(|s| s.is_none());
-                        if let Some(slot) = free {
-                            items[slot] = picked;
-                            if let Some(java_slot) = java_inventory_slot(slot as u32) {
-                                events.push(Event::Packet(Box::new(
-                                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
-                                        container: 0,
-                                        state: 0,
-                                        slot: java_slot,
-                                        item: stack,
-                                    }),
-                                )));
+                        // Top up a stack already holding the same item first, so
+                        // a pickup adds to what is carried instead of appearing
+                        // as its own stack.
+                        let target = descriptor(&drop).and_then(|d| {
+                            items
+                                .iter_mut()
+                                .enumerate()
+                                .find(|(_, s)| {
+                                    s.as_ref().is_some_and(|e| {
+                                        e.runtime_id == d.runtime_id
+                                            && e.damage == d.damage
+                                            && e.count < 64
+                                    })
+                                })
+                                .map(|(i, s)| {
+                                    let e = s.as_mut().unwrap();
+                                    let add = d.count.min(64 - e.count);
+                                    e.count += add;
+                                    (i, e.count)
+                                })
+                                .or_else(|| {
+                                    items.iter().position(|s| s.is_none()).map(|i| {
+                                        items[i] = Some(d);
+                                        (i, d.count)
+                                    })
+                                })
+                        });
+                        if let Some((slot, count)) = target {
+                            let id = item_by_network_id(
+                                ctx.mappings,
+                                ctx.builtin,
+                                &ctx.items,
+                                drop.runtime_id,
+                            );
+                            if id != 0 {
+                                if let Some(java_slot) = java_inventory_slot(slot as u32) {
+                                    events.push(Event::Packet(Box::new(
+                                        play::Clientbound::ContainerSetSlot(
+                                            play::ContainerSetSlot {
+                                                container: 0,
+                                                state: 0,
+                                                slot: java_slot,
+                                                item: Some(Stack::new(id, i32::from(count))),
+                                            },
+                                        ),
+                                    )));
+                                }
                             }
                         }
                     }
@@ -1997,6 +2030,24 @@ mod translate {
                     action: 1, // use
                     item: held_item(bridge),
                     cursor: [0.0; 3],
+                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                }]
+            }
+            // Dropping an item: the game clicks "outside" the window (slot
+            // -999). Bedrock performs it as an item-release transaction.
+            play::Serverbound::ContainerClick(c) if c.slot == -999 => {
+                let pos = *bridge.position.lock().unwrap();
+                let slot = bridge.hotbar.load(Ordering::Relaxed) as i32;
+                let item = held_item(bridge);
+                {
+                    let mut items = bridge.items.lock().unwrap();
+                    if let Some(entry) = items.get_mut(slot.max(0) as usize) {
+                        *entry = None;
+                    }
+                }
+                vec![bp::Out::ItemRelease {
+                    slot,
+                    item,
                     position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                 }]
             }

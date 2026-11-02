@@ -240,9 +240,12 @@ pub enum Out {
         item: Option<ItemDescriptor>,
         position: [f32; 3],
     },
-    /// Using an item on a block (placing or interacting). Bedrock performs it
-    /// as an `InventoryTransaction` of type item-use. `action` is the
-    /// `ItemUseActionType` (0 = place, 1 = use).
+    /// Dropping an item: Bedrock's item-release inventory transaction.
+    ItemRelease {
+        slot: i32,
+        item: Option<ItemDescriptor>,
+        position: [f32; 3],
+    },
     ItemUseOnBlock {
         block: [i32; 3],
         face: i32,
@@ -778,6 +781,24 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(0); // the target block's runtime id
             w.u8(1); // ItemUsePredictedResult: success
             w.u8(0); // cooldown state: off
+        }
+        Out::ItemRelease {
+            slot,
+            item,
+            position,
+        } => {
+            w.varint(ids::INVENTORY_TRANSACTION);
+            w.varint(0); // legacy request id
+            w.bool(false); // no legacy data
+            w.varint(4); // ItemReleaseTransaction
+            w.varint(0); // actions count
+            w.zigzag32(0); // ItemReleaseActionType: release
+            w.zigzag32(*slot);
+            write_item(&mut w, *item);
+            w.f32(position[0]);
+            w.f32(position[1]);
+            w.f32(position[2]); // the player's position
+            w.u8(0); // hand: main
         }
         Out::Text {
             kind,
