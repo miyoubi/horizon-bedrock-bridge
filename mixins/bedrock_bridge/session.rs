@@ -1545,7 +1545,7 @@ mod translate {
         let horizontal = delta[0] * delta[0] + delta[2] * delta[2];
         {
             let mut hold = bridge.move_hold.lock().unwrap();
-            if horizontal > 1e-4 {
+            if horizontal > 1e-3 {
                 let yaw = bridge.rotation.lock().unwrap()[0].to_radians();
                 let (s, c) = (yaw.sin(), yaw.cos());
                 // Bedrock's local frame: +x is left, +y is forward.
@@ -1566,7 +1566,7 @@ mod translate {
             // then made the server keep walking it after it stopped, which then
             // diverged and snapped back as a correction.
             if move_vec == [0.0, 0.0]
-                && horizontal > 1e-4
+                && horizontal > 1e-3
                 && tick.saturating_sub(hold.1) <= HOLD_TICKS
             {
                 move_vec = hold.0;
