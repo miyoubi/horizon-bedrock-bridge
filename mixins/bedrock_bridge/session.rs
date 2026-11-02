@@ -127,6 +127,9 @@ struct Bridge {
     /// airborne and glides after the keys are released.
     on_ground: AtomicBool,
     collision: AtomicBool,
+    /// The hotbar slot the game last selected, carried by item-use
+    /// transactions.
+    hotbar: AtomicI64,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -159,6 +162,7 @@ pub fn try_connect(
         tick: AtomicI64::new(1),
         on_ground: AtomicBool::new(true),
         collision: AtomicBool::new(false),
+        hotbar: AtomicI64::new(0),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1470,6 +1474,61 @@ mod translate {
                     })
                     .collect()
             }
+            // The player's own inventory. Bedrock's window 0 lists its slots in
+            // Bedrock order, which is not Java's inventory-menu order, so place
+            // each item at its Java slot. Other windows still need mapping.
+            bp::Packet::InventoryContent(c) if c.window_id == 0 => {
+                let mut items: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
+                for (i, item) in c.slots.iter().enumerate() {
+                    let Some(slot) = java_inventory_slot(i as u32) else {
+                        continue;
+                    };
+                    if let Ok(index) = usize::try_from(slot) {
+                        if index < items.len() {
+                            items[index] = map_item(ctx, item);
+                        }
+                    }
+                }
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetContent(play::ContainerSetContent {
+                        container: 0,
+                        state: 0,
+                        items,
+                        carried: None,
+                    }),
+                ))]
+            }
+            bp::Packet::InventorySlot(s) if s.window_id == 0 => {
+                let Some(slot) = java_inventory_slot(s.slot) else {
+                    return Vec::new();
+                };
+                let item = map_item(ctx, &s.item);
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                        container: 0,
+                        state: 0,
+                        slot,
+                        item,
+                    }),
+                ))]
+            }
+            // Java conveys the selected hotbar slot as inventory data id 0.
+            bp::Packet::PlayerHotbar { slot, window_id } if *window_id == 0 => {
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetData(play::ContainerSetData {
+                        container: 0,
+                        id: 0,
+                        value: *slot as i16,
+                    }),
+                ))]
+            }
+            bp::Packet::ContainerClose { window_id } => {
+                vec![Event::Packet(Box::new(play::Clientbound::ContainerClose(
+                    play::ContainerClose {
+                        container: i32::from(*window_id),
+                    },
+                )))]
+            }
             // A column's blocks. A server running with client-side chunk
             // generation sends partial chunks and answers these requests, so
             // without this every column stays empty and never lights.
@@ -1615,6 +1674,24 @@ mod translate {
         bridge.collision.store(flags & 2 != 0, Ordering::Relaxed);
     }
 
+    /// A Bedrock network item as a Java stack, or `None` for air/unknown.
+    fn map_item(ctx: &Context, item: &bp::NetworkItem) -> Option<Stack> {
+        let id = item_by_network_id(ctx.mappings, ctx.builtin, &ctx.items, item.runtime_id);
+        (id != 0 && item.count > 0).then(|| Stack::new(id, i32::from(item.count)))
+    }
+
+    /// Bedrock's player-inventory slot order to Java's inventory-menu order:
+    /// hotbar 0..8, main 9..35, armour 36..39, off hand 40.
+    fn java_inventory_slot(slot: u32) -> Option<i16> {
+        Some(match slot {
+            0..=8 => 36 + slot as i16,
+            9..=35 => slot as i16,
+            36..=39 => 5 + (slot - 36) as i16,
+            40 => 45,
+            _ => return None,
+        })
+    }
+
     /// The Bedrock input flags and move vector for the game's current
     /// `PlayerInput` bitfield. The server simulates movement from these, so with
     /// an empty vector it holds the player still however the position claims
@@ -1742,6 +1819,37 @@ mod translate {
                 bridge.input.store(i64::from(p.flags), Ordering::Relaxed);
                 bedrock_core::nethernet::trace(format!("recv PlayerInput flags={:#04x}", p.flags));
                 Vec::new()
+            }
+            // Swinging the arm. Bedrock has no local swing packet: it is an
+            // `Animate` of the swing-arm action on the player's own runtime id.
+            play::Serverbound::Punch(_) => vec![bp::Out::Animate {
+                runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
+                action: 1, // swing_arm
+            }],
+            // Hitting an entity. Bedrock performs the hit as an item-use-on-
+            // entity inventory transaction, and needs the swing alongside it.
+            play::Serverbound::Attack(a) => {
+                let pos = *bridge.position.lock().unwrap();
+                vec![
+                    bp::Out::Animate {
+                        runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
+                        action: 1, // swing_arm
+                    },
+                    bp::Out::ItemUseOnEntity {
+                        runtime_id: a.id as u64,
+                        action: 1, // attack
+                        hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                        position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    },
+                ]
+            }
+            play::Serverbound::SetCarriedItem(i) => {
+                bridge.hotbar.store(i64::from(i.slot), Ordering::Relaxed);
+                vec![bp::Out::MobEquipment {
+                    runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
+                    slot: i.slot as u8,
+                    window_id: 0,
+                }]
             }
             // Block breaking, with the action ids a real 1.26 client sends:
             // `start_break` 0, `abort_break` 1, `predict_break` 26. Horizon's

@@ -217,6 +217,15 @@ pub enum Out {
         slot: u8,
         window_id: u8,
     },
+    /// Hitting or interacting with an entity. Bedrock does this as an
+    /// `InventoryTransaction` of type item-use-on-entity, not a dedicated
+    /// attack packet. `action` is the `ItemUseOnActorActionType` (1 = attack).
+    ItemUseOnEntity {
+        runtime_id: u64,
+        action: i32,
+        hotbar_slot: i32,
+        position: [f32; 3],
+    },
     Text {
         kind: u8,
         source: String,
@@ -632,6 +641,30 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             // An empty network item stack descriptor.
             w.i16(0).i16(0).varint(0).bool(false).varint(0).u16(0);
             w.u8(*slot).u8(*window_id);
+        }
+        Out::ItemUseOnEntity {
+            runtime_id,
+            action,
+            hotbar_slot,
+            position,
+        } => {
+            w.varint(ids::INVENTORY_TRANSACTION);
+            w.varint(0); // legacy request id
+            w.bool(false); // no legacy data
+            w.varint(3); // ItemUseOnEntityTransaction
+            w.varint(0); // actions count
+            w.varlong(*runtime_id);
+            w.zigzag32(*action); // ItemUseOnActorActionType (compressed int32)
+            w.zigzag32(*hotbar_slot); // slot (compressed int32)
+            w.u8(0); // hand slot: main hand
+            // The held item, as the empty network item stack descriptor.
+            w.i16(0).i16(0).varint(0).bool(false).varint(0).u16(0);
+            w.f32(position[0]);
+            w.f32(position[1]);
+            w.f32(position[2]); // the player's position
+            w.f32(0.0);
+            w.f32(0.0);
+            w.f32(0.0); // the position clicked on the entity
         }
         Out::Text {
             kind,
