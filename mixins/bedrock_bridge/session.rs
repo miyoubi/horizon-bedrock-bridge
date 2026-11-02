@@ -1851,6 +1851,32 @@ mod translate {
                     window_id: 0,
                 }]
             }
+            // Placing or using an item on a block: Bedrock's item-use
+            // inventory transaction with a place action.
+            play::Serverbound::UseItemOn(u) => {
+                let pos = *bridge.position.lock().unwrap();
+                vec![bp::Out::ItemUseOnBlock {
+                    block: u.pos,
+                    face: u.face,
+                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                    action: 0, // place
+                    cursor: u.cursor,
+                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                }]
+            }
+            // Using the held item in the air (eating, throwing): the same
+            // transaction with a use action and no block.
+            play::Serverbound::UseItem(_) => {
+                let pos = *bridge.position.lock().unwrap();
+                vec![bp::Out::ItemUseOnBlock {
+                    block: [0, 0, 0],
+                    face: 255,
+                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                    action: 1, // use
+                    cursor: [0.0; 3],
+                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                }]
+            }
             // Block breaking, with the action ids a real 1.26 client sends:
             // `start_break` 0, `abort_break` 1, `predict_break` 26. Horizon's
             // Java numbering (its `lan_actions.rs` handler) is 0 start, 1/2

@@ -226,6 +226,17 @@ pub enum Out {
         hotbar_slot: i32,
         position: [f32; 3],
     },
+    /// Using an item on a block (placing or interacting). Bedrock performs it
+    /// as an `InventoryTransaction` of type item-use. `action` is the
+    /// `ItemUseActionType` (0 = place, 1 = use).
+    ItemUseOnBlock {
+        block: [i32; 3],
+        face: i32,
+        hotbar_slot: i32,
+        action: i32,
+        cursor: [f32; 3],
+        position: [f32; 3],
+    },
     Text {
         kind: u8,
         source: String,
@@ -683,6 +694,38 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.f32(0.0);
             w.f32(0.0);
             w.f32(0.0); // the position clicked on the entity
+        }
+        Out::ItemUseOnBlock {
+            block,
+            face,
+            hotbar_slot,
+            action,
+            cursor,
+            position,
+        } => {
+            w.varint(ids::INVENTORY_TRANSACTION);
+            w.varint(0); // legacy request id
+            w.bool(false); // no legacy data
+            w.varint(2); // ItemUseTransaction
+            w.varint(0); // actions count
+            w.zigzag32(*action); // ItemUseActionType
+            w.u8(1); // ItemUseTriggerType: player input
+            w.zigzag32(block[0])
+                .zigzag32(block[1])
+                .zigzag32(block[2]);
+            w.u8(*face as u8);
+            w.zigzag32(*hotbar_slot);
+            w.u8(0); // hand: main
+            write_empty_item(&mut w);
+            w.f32(position[0]);
+            w.f32(position[1]);
+            w.f32(position[2]); // the player's position
+            w.f32(cursor[0]);
+            w.f32(cursor[1]);
+            w.f32(cursor[2]); // the position clicked on the block
+            w.varint(0); // the target block's runtime id
+            w.u8(1); // ItemUsePredictedResult: success
+            w.u8(0); // cooldown state: off
         }
         Out::Text {
             kind,
