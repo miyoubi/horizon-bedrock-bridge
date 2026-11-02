@@ -222,6 +222,12 @@ pub enum Out {
         runtime_id: u64,
         action: i32,
     },
+    /// Serverbound disconnect: tells the server this client is leaving so it
+    /// removes the player at once instead of waiting out the transport timeout.
+    Disconnect {
+        hide: bool,
+        message: String,
+    },
     /// A raw packet id + body, for anything not modelled above.
     Raw(u32, Vec<u8>),
 }
@@ -416,6 +422,14 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             // integers, which are little-endian).
             w.varint(ids::REQUEST_NETWORK_SETTINGS);
             w.bytes(&protocol.to_be_bytes());
+        }
+        Out::Disconnect { hide, message } => {
+            w.varint(ids::DISCONNECT);
+            w.zigzag32(0);
+            w.bool(*hide);
+            if !hide {
+                w.varint(message.len() as u32).bytes(message.as_bytes());
+            }
         }
         Out::Login {
             auth_info,
