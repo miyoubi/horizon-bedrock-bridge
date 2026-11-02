@@ -847,9 +847,13 @@ mod translate {
                 // Remembered so the position can be sent again once the client
                 // has chunks: it is the packet that creates its own player, and
                 // that is what ends the loading screen.
+                // StartGame's position is the eye; the client's feet are 1.62
+                // lower. Everything downstream (the repeated spawn teleport and
+                // the auth input) is feet-based, so convert here or the player
+                // spawns — and stays — floating a block and a half up.
                 ctx.spawn = [
                     g.position[0] as f64,
-                    g.position[1] as f64,
+                    g.position[1] as f64 - PLAYER_EYE as f64,
                     g.position[2] as f64,
                 ];
                 ctx.spawn_yaw = g.yaw;
@@ -896,7 +900,7 @@ mod translate {
                             teleport: 0,
                             position: [
                                 g.position[0] as f64,
-                                g.position[1] as f64,
+                                g.position[1] as f64 - PLAYER_EYE as f64,
                                 g.position[2] as f64,
                             ],
                             delta: [0.0; 3],
@@ -1434,7 +1438,7 @@ mod translate {
         actions: Vec<bp::BlockAction>,
     ) -> Vec<bp::Out> {
         let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
-        let (mut flags, move_vec) = input_bits(bridge);
+        let (mut flags, mut move_vec) = input_bits(bridge);
         if !actions.is_empty() {
             flags |= 1 << 35;
         }
@@ -1449,8 +1453,45 @@ mod translate {
             *last = position;
             d
         };
+        // The game sends its input bitfield only when it changes, so it goes
+        // silent while the player is plainly moving (the position updates every
+        // tick). The server simulates movement from this vector, not from the
+        // position, so a silent bitfield reads as standing still. Derive the
+        // direction from the actual movement when the bitfield gave none.
+        if move_vec == [0.0, 0.0] {
+            let (dx, dz) = (delta[0], delta[2]);
+            if dx * dx + dz * dz > 1e-4 {
+                let yaw = bridge.rotation.lock().unwrap()[0].to_radians();
+                let (s, c) = (yaw.sin(), yaw.cos());
+                let fwd = -dx * s + dz * c;
+                let strafe = -dx * c - dz * s;
+                let len = (fwd * fwd + strafe * strafe).sqrt();
+                move_vec = if len > 1.0 {
+                    [strafe / len, fwd / len]
+                } else {
+                    [strafe, fwd]
+                };
+                flags &= !((1 << 10) | (1 << 11) | (1 << 12) | (1 << 13));
+                if fwd > 0.03 {
+                    flags |= 1 << 10;
+                } else if fwd < -0.03 {
+                    flags |= 1 << 11;
+                }
+                if strafe > 0.03 {
+                    flags |= 1 << 13;
+                } else if strafe < -0.03 {
+                    flags |= 1 << 12;
+                }
+            }
+        }
         // Bedrock's mPos is the eye position; the game tracks feet.
         let position = [position[0], position[1] + PLAYER_EYE, position[2]];
+        if tick % 20 == 0 {
+            bedrock_core::nethernet::trace(format!(
+                "AUTHIN-MOVE pos={:?} move={:?} flags={:#x} tick={}",
+                position, move_vec, flags, tick
+            ));
+        }
         vec![bp::Out::PlayerAuthInput {
             position,
             pitch,
@@ -1534,6 +1575,7 @@ mod translate {
             }
             play::Serverbound::PlayerInput(p) => {
                 bridge.input.store(i64::from(p.flags), Ordering::Relaxed);
+                bedrock_core::nethernet::trace(format!("recv PlayerInput flags={:#04x}", p.flags));
                 Vec::new()
             }
             // Block breaking, with the action ids a real 1.26 client sends:
