@@ -120,10 +120,6 @@ struct Bridge {
     /// The `PlayerAuthInput` tick id: it advances with every input packet, and
     /// the server pairs corrections with the id they answer.
     tick: AtomicI64,
-    /// The last local move direction derived from the position delta, and the
-    /// tick it was set: reused briefly so sparse movement packets still read as
-    /// walking rather than freezing between them.
-    move_hold: Mutex<([f32; 2], u64)>,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -154,7 +150,6 @@ pub fn try_connect(
         input: AtomicI64::new(0),
         last_sent: Mutex::new([0.0; 3]),
         tick: AtomicI64::new(1),
-        move_hold: Mutex::new(([0.0; 2], 0)),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -790,11 +785,6 @@ mod translate {
     /// (`PlayerAuthInput` mPos and `MovePlayer`) are eye-based, while Java's
     /// entity positions are feet-based, so the two directions need this offset.
     const PLAYER_EYE: f32 = 1.62;
-    /// Heartbeats a derived move direction stays live after the last real
-    /// movement, so a position update that lands one heartbeat late still reads
-    /// as walking rather than a stop. Two ticks is one such gap; longer made a
-    /// brief tap keep walking after the key was released.
-    const HOLD_TICKS: u64 = 2;
 
     /// The Java entity-type id for a name, or `None` when the client has no
     /// such entity. A miss must not fall back to 0: id 0 is `acacia_boat`, which
@@ -1537,45 +1527,13 @@ mod translate {
             *last = position;
             d
         };
-        // The game sends its input bitfield only when it changes, so it goes
-        // silent while the player is plainly moving. The server simulates the
-        // movement from the input flags and this vector, so derive the direction
-        // from the actual movement, and hold it briefly so updates slower than
-        // the heartbeat still read as walking rather than freezing.
-        let horizontal = delta[0] * delta[0] + delta[2] * delta[2];
-        {
-            let mut hold = bridge.move_hold.lock().unwrap();
-            if horizontal > 1e-3 {
-                let yaw = bridge.rotation.lock().unwrap()[0].to_radians();
-                let (s, c) = (yaw.sin(), yaw.cos());
-                // Bedrock's local frame: +x is left, +y is forward.
-                let left = delta[0] * c + delta[2] * s;
-                let fwd = -delta[0] * s + delta[2] * c;
-                let len = (left * left + fwd * fwd).sqrt();
-                if len > 1e-6 {
-                    let mut mv = [left / len, fwd / len];
-                    if mv[0].abs() > 1e-3 && mv[1].abs() > 1e-3 {
-                        mv[0] *= std::f32::consts::FRAC_1_SQRT_2;
-                        mv[1] *= std::f32::consts::FRAC_1_SQRT_2;
-                    }
-                    *hold = (mv, tick);
-                }
-            }
-            // Reuse the held direction only while the client is still moving.
-            // A stopped client has a zero delta, and reusing the last direction
-            // then made the server keep walking it after it stopped, which then
-            // diverged and snapped back as a correction.
-            if move_vec == [0.0, 0.0]
-                && horizontal > 1e-3
-                && tick.saturating_sub(hold.1) <= HOLD_TICKS
-            {
-                move_vec = hold.0;
-            }
-        }
-        // Snap a near-zero component to zero. A straight walk leaves a tiny
-        // cross-component from yaw rounding, and that residual is enough to set
-        // a direction flag, which the server honours: the player then walks
-        // diagonally instead of straight.
+        // The move vector comes from the game's input bitfield, which holds the
+        // pressed keys until they change. Deriving it from the position delta as
+        // well read the client's own glide after a key release as still-held
+        // input, and normalized it to full speed, so the server kept walking the
+        // player. The bitfield is the real key state, so trust it alone.
+        // Snap a near-zero component to zero: a leftover cross-component is
+        // enough to set a direction flag, which the server honours.
         if move_vec[0].abs() < 0.05 {
             move_vec[0] = 0.0;
         }
