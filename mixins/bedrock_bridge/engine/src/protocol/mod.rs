@@ -58,6 +58,10 @@ pub enum Packet {
         position: [f32; 3],
         rotation: [f32; 2],
         on_ground: bool,
+        /// The `PlayerInputTick` this correction answers. ViaBedrock drops a
+        /// correction whose tick has fallen outside the server's rewind window,
+        /// because applying it would yank the client to an old position.
+        tick: u64,
     },
     LevelEvent(LevelEvent),
     UpdateAttributes(UpdateAttributes),
@@ -272,19 +276,25 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::MOVE_ENTITY_ABSOLUTE => Packet::MoveEntityAbsolute(MoveEntityAbsolute::read(&mut r)?),
         ids::MOVE_ACTOR_DELTA => Packet::MoveActorDelta(MoveActorDelta::read(&mut r)?),
         ids::CORRECT_PLAYER_MOVE_PREDICTION => {
-            let _kind = r.u8()?;
+            let kind = r.u8()?;
             let position = [r.f32()?, r.f32()?, r.f32()?];
             let _delta = [r.f32()?, r.f32()?, r.f32()?];
             let rotation = [r.f32()?, r.f32()?];
             if r.bool()? {
                 let _angular_velocity = r.f32()?;
             }
-            let on_ground = r.bool()?;
-            let _tick = r.varlong()?;
+            // `on_ground` and the tick follow only for a Player rewind; the
+            // Vehicle form sends vehicle data instead.
+            let (on_ground, tick) = if kind == 0 {
+                (r.bool()?, r.varlong()? as u64)
+            } else {
+                (false, 0)
+            };
             Packet::CorrectPlayerMovePrediction {
                 position,
                 rotation,
                 on_ground,
+                tick,
             }
         }
         ids::LEVEL_EVENT => Packet::LevelEvent(LevelEvent::read(&mut r)?),

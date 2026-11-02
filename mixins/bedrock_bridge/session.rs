@@ -1113,7 +1113,7 @@ mod translate {
             // applying it the client drifts from the server (collisions, holes,
             // knockback) and then ignores the chunks sent for the server's
             // position, because they fall outside its view range.
-            bp::Packet::CorrectPlayerMovePrediction { position, .. } => {
+            bp::Packet::CorrectPlayerMovePrediction { position, tick, .. } => {
                 // Correct a real divergence only. Applying every tick's
                 // prediction snapped the player back and forth, which reads as
                 // teleporting; a small gap is just the server trailing the
@@ -1139,7 +1139,20 @@ mod translate {
                         ));
                     }
                 }
-                if dx * dx + dz * dz < 1.5 * 1.5 && dy.abs() < 1.5 {
+                // Follow ViaBedrock: drop a correction whose tick has fallen
+                // outside the server's rewind window, because applying it would
+                // pull the client back to a position it has already left.
+                const REWIND_WINDOW: u64 = 40;
+                let now_tick = bridge.tick.load(Ordering::Relaxed) as u64;
+                if *tick == 0 || *tick + REWIND_WINDOW < now_tick || *tick > now_tick {
+                    return Vec::new();
+                }
+                // The client is not a Bedrock client and cannot predict the
+                // server's movement maths, so ordinary per-tick mismatches are
+                // both constant and large during fast movement (a sprint-jump
+                // covers over a block). Apply only a genuine teleport, or the
+                // client rubber-bands on every jump.
+                if dx * dx + dz * dz < 5.0 * 5.0 && dy.abs() < 4.0 {
                     return Vec::new();
                 }
                 vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
