@@ -366,9 +366,17 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         }
         ids::MOB_EQUIPMENT => Packet::MobEquipment(MobEquipment::read(&mut r)?),
         ids::ANIMATE => {
-            let action = r.zigzag32()?;
+            // 1.26: a byte action, the runtime id, a float, then the swing
+            // source and hand bytes.
+            let action = r.u8()?;
             let runtime_id = r.varlong()?;
-            Packet::Animate { action, runtime_id }
+            let _data = r.f32()?;
+            let _swing_source = r.u8()?;
+            let _hand = r.u8()?;
+            Packet::Animate {
+                action: i32::from(action),
+                runtime_id,
+            }
         }
         ids::BLOCK_ENTITY_DATA => Packet::BlockEntityData(BlockEntityData::read(&mut r)?),
         ids::SET_DIFFICULTY => Packet::SetDifficulty(r.zigzag32()?),
@@ -430,6 +438,17 @@ pub fn parse_batch(data: &[u8]) -> Result<Vec<Packet>> {
         }
     }
     Ok(out)
+}
+
+/// Write an empty network item stack descriptor: no id, an empty stack id, and
+/// the user-data blob (an empty tag marker plus two empty string lists), which
+/// the server expects to be present even when there is no item.
+fn write_empty_item(w: &mut Writer) {
+    w.i16(0).i16(0).varint(0).bool(false).varint(0);
+    w.varint(4); // user-data length: 2 + 1 + 1 bytes
+    w.i16(0); // no tag
+    w.varint(0); // can place: none
+    w.varint(0); // can break: none
 }
 
 /// Encode one outbound packet (id + body).
@@ -638,8 +657,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         } => {
             w.varint(ids::MOB_EQUIPMENT);
             w.varlong(*runtime_id);
-            // An empty network item stack descriptor.
-            w.i16(0).i16(0).varint(0).bool(false).varint(0).u16(0);
+            write_empty_item(&mut w);
             w.u8(*slot).u8(*window_id);
         }
         Out::ItemUseOnEntity {
@@ -657,8 +675,8 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.zigzag32(*action); // ItemUseOnActorActionType (compressed int32)
             w.zigzag32(*hotbar_slot); // slot (compressed int32)
             w.u8(0); // hand slot: main hand
-            // The held item, as the empty network item stack descriptor.
-            w.i16(0).i16(0).varint(0).bool(false).varint(0).u16(0);
+            // The held item, as an empty network item stack descriptor.
+            write_empty_item(&mut w);
             w.f32(position[0]);
             w.f32(position[1]);
             w.f32(position[2]); // the player's position
@@ -684,9 +702,15 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.bool(false);
         }
         Out::Animate { runtime_id, action } => {
-            w.varint(ids::ANIMATE)
-                .zigzag32(*action)
-                .varlong(*runtime_id);
+            // 1.26's Animate: a byte action, the runtime id, a float, then the
+            // swing source and hand bytes. A shorter form makes the server reject
+            // the batch and drop the connection.
+            w.varint(ids::ANIMATE);
+            w.u8(*action as u8);
+            w.varlong(*runtime_id);
+            w.f32(0.0); // data
+            w.u8(0); // swing source
+            w.u8(0); // hand: main
         }
         Out::Raw(id, body) => {
             w.varint(*id).bytes(body);
