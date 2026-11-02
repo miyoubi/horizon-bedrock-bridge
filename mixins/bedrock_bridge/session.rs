@@ -373,13 +373,10 @@ fn run(
             }
         }
         if !alive || bridge.shutdown.load(Ordering::Relaxed) {
-            // Tell the server the player is leaving so it removes them at
-            // once; dropping the transport without this leaves them in the
-            // world until the server times the connection out.
-            let _ = client.send(&[bedrock_core::protocol::Out::Disconnect {
-                hide: true,
-                message: String::new(),
-            }]);
+            // Tell the server the player is leaving and close the transport
+            // gracefully; dropping it without this leaves them in the world
+            // until the server times the connection out.
+            client.disconnect();
             break;
         }
         // Sub-chunk requests queued while translating.

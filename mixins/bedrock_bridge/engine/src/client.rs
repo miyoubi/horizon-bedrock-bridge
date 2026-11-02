@@ -22,6 +22,9 @@ use crate::raknet::RakNetClient;
 pub trait Transport: Send {
     fn send(&mut self, body: &[u8]) -> Result<()>;
     fn recv(&mut self) -> Result<Option<Vec<u8>>>;
+    /// Gracefully close the connection so the peer removes the player at once
+    /// instead of waiting out the session timeout.
+    fn close(&mut self) {}
 }
 
 impl Transport for RakNetClient {
@@ -339,6 +342,17 @@ impl BedrockClient {
                 runtime_id: self.runtime_id as u64,
             },
         ])
+    }
+
+    /// Tell the server this client is leaving and close the transport
+    /// gracefully, so the player is removed at once rather than after the
+    /// session timeout.
+    pub fn disconnect(&mut self) {
+        let _ = self.send(&[Out::Disconnect {
+            hide: true,
+            message: String::new(),
+        }]);
+        self.transport.close();
     }
 }
 

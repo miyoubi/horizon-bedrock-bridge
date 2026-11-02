@@ -84,4 +84,8 @@ impl Transport for NetherNetTransport {
         }
         Ok(self.pending.pop_front())
     }
+
+    fn close(&mut self) {
+        self.session.close();
+    }
 }
