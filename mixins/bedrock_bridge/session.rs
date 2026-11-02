@@ -1190,30 +1190,42 @@ mod translate {
             // Entity metadata. Bedrock's actor flags (index 0, a long) become
             // Java's shared-flags byte: on-fire, sneaking, sprinting and
             // invisible occupy the same bit positions in both, so the rest of
-            // the long is dropped. Without this a crouching player never
-            // crouches on the Java client.
+            // the long is dropped. Bedrock's name tag (index 4) and its
+            // always-show flag (index 81) become Java's custom name (index 2)
+            // and its visible flag (index 3).
             bp::Packet::SetEntityData(d) => {
-                let mut flags: Option<i8> = None;
+                let mut values = Vec::new();
                 for (k, v) in &d.metadata {
-                    if *k == 0 {
-                        if let bp::MetaValue::Long(f) = v {
-                            flags = Some((*f as u64 & 0x2B) as i8);
-                        }
+                    match (*k, v) {
+                        (0, bp::MetaValue::Long(f)) => values.push((
+                            0,
+                            horizon_protocol::entity_data::serializer::BYTE,
+                            horizon_protocol::entity_data::Value::Byte((*f as u64 & 0x2B) as i8),
+                        )),
+                        (4, bp::MetaValue::String(name)) => values.push((
+                            2,
+                            horizon_protocol::entity_data::serializer::OPTIONAL_COMPONENT,
+                            horizon_protocol::entity_data::Value::OptText(Some(
+                                text_component(name),
+                            )),
+                        )),
+                        (81, bp::MetaValue::Byte(show)) => values.push((
+                            3,
+                            horizon_protocol::entity_data::serializer::BOOLEAN,
+                            horizon_protocol::entity_data::Value::Bool(*show != 0),
+                        )),
+                        _ => {}
                     }
                 }
-                match flags {
-                    Some(f) => vec![Event::Packet(Box::new(play::Clientbound::SetEntityData(
-                        play::SetEntityData {
-                            id: d.runtime_id as i32,
-                            values: vec![(
-                                0,
-                                horizon_protocol::entity_data::serializer::BYTE,
-                                horizon_protocol::entity_data::Value::Byte(f),
-                            )],
-                        },
-                    )))],
-                    None => Vec::new(),
+                if values.is_empty() {
+                    return Vec::new();
                 }
+                vec![Event::Packet(Box::new(play::Clientbound::SetEntityData(
+                    play::SetEntityData {
+                        id: d.runtime_id as i32,
+                        values,
+                    },
+                )))]
             }
             // The item registry: the network ids every inventory and equipment
             // packet names an item by. It arrives once, after `StartGame`.
@@ -1525,20 +1537,29 @@ mod translate {
                 let entries: Vec<play::PlayerInfo> = list
                     .entries
                     .iter()
-                    .filter_map(|entry| {
-                        let skin = entry.skin.as_ref()?;
-                        Some(play::PlayerInfo {
+                    .map(|entry| {
+                        // A Bedrock entry need not carry a skin; the tab entry
+                        // still belongs there, so add the textures only when
+                        // there is one rather than dropping the player.
+                        let properties = entry
+                            .skin
+                            .as_ref()
+                            .map(|skin| {
+                                vec![horizon_protocol::packets::login::Property {
+                                    name: "textures".into(),
+                                    value: bedrock_core::png::textures_value(skin),
+                                    signature: None,
+                                }]
+                            })
+                            .unwrap_or_default();
+                        play::PlayerInfo {
                             uuid: u128::from_be_bytes(entry.uuid),
                             name: Some(entry.username.clone()),
-                            properties: vec![horizon_protocol::packets::login::Property {
-                                name: "textures".into(),
-                                value: bedrock_core::png::textures_value(skin),
-                                signature: None,
-                            }],
+                            properties,
                             listed: Some(true),
                             latency: Some(0),
                             ..Default::default()
-                        })
+                        }
                     })
                     .collect();
                 if entries.is_empty() {
@@ -2069,6 +2090,24 @@ mod translate {
             // Dropping an item: the game clicks "outside" the window (slot
             // -999). Bedrock performs it as an item-release transaction.
             play::Serverbound::ContainerClick(c) if c.slot == -999 => {
+                let pos = *bridge.position.lock().unwrap();
+                let slot = bridge.hotbar.load(Ordering::Relaxed) as i32;
+                let item = held_item(bridge);
+                {
+                    let mut items = bridge.items.lock().unwrap();
+                    if let Some(entry) = items.get_mut(slot.max(0) as usize) {
+                        *entry = None;
+                    }
+                }
+                vec![bp::Out::ItemRelease {
+                    slot,
+                    item,
+                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                }]
+            }
+            // A creative-screen drop: the game sets slot -1, which drops the
+            // stack from the hand. Bedrock does it as an item-release.
+            play::Serverbound::SetCreativeModeSlot(s) if s.slot == -1 => {
                 let pos = *bridge.position.lock().unwrap();
                 let slot = bridge.hotbar.load(Ordering::Relaxed) as i32;
                 let item = held_item(bridge);

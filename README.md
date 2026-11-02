@@ -1,31 +1,44 @@
 # bedrock-bridge — a Horizon native mod for joining Bedrock servers
 
 A [horizon-mixins](https://github.com/horizon-rust/horizon-mixins) native mod that lets
-**Horizon** (Minecraft: Java Edition 26.3, rewritten in Rust) join **Minecraft: Bedrock
-Edition** servers, see and interact with entities — including custom entities from addons —
-and sign in with a real Xbox Live account.
+**Horizon** (Minecraft: Java Edition client code, rewritten in Rust) join **Minecraft: Bedrock
+Edition** servers: move and be seen moving, break and place blocks, fight mobs, pick items up and
+see them in the inventory, read chat and the player list, and sign in with a real Xbox Live
+account.
 
-Horizon speaks Java protocol 777 to servers. Bedrock servers speak a different protocol over
-RakNet (moving to NetherNet). This mod adds the Bedrock half and translates it into the
-packets Horizon already understands, so the game itself is unchanged.
+Horizon speaks the Java protocol to servers. Bedrock servers speak a different protocol over
+**RakNet** or **NetherNet**. This mod implements the Bedrock half and translates it into the
+Java packets Horizon already understands, so the game itself is unchanged.
 
 ```
-Bedrock server ──RakNet──▶ bedrock-core (RakNet, MCPE codecs, Xbox auth, crypto, mappings)
-                                   │  decoded Bedrock packets
-                                   ▼
-                          bedrock-bridge glue (injected into horizon-client)
-                                   │  Java clientbound packets
-                                   ▼
-                          Horizon's normal multiplayer client (handle_packet)
+Bedrock server ──RakNet (UDP)──┐
+               └─NetherNet─────┤  bedrock-core (transport, MCPE codecs, Xbox auth, crypto, mappings)
+                   (WebRTC)    │
+                               ▼
+                       bedrock-bridge glue (injected into horizon-client)
+                               │  Java clientbound packets
+                               ▼
+                       Horizon's normal multiplayer client
 ```
+
+## Transports
+
+Both transports a Bedrock server can serve are implemented, and the address prefix picks one:
+
+| Address | Transport | Notes |
+|---|---|---|
+| `bedrock:host:19132` | **NetherNet** (WebRTC data channel) | What current Bedrock clients use. BDS serves it on its TCP port, alongside RakNet on UDP. |
+| `bedrock+raknet:host:19132` | **RakNet** (UDP) | The classic transport, still served for older clients and `transport=raknet` servers. |
+
+A bare address stays Java, so the mod never hijacks a normal join.
 
 ## What is here
 
 | Path | What it is |
 |---|---|
 | `mixins/bedrock_bridge/engine/` | `bedrock-core`: the whole Bedrock stack, a standalone crate with no Horizon dependency (unit-tested with `cargo test`). |
-| `mixins/bedrock_bridge/horizon-mixin.toml` | The bundle: the `[[crate]]`, the injected session module, and the four `Session` hooks. |
-| `mixins/bedrock_bridge/session.rs` | The injected module `crate::net::bedrock`: session lifecycle, the client thread, and Bedrock→Java translation. |
+| `mixins/bedrock_bridge/horizon-mixin.toml` | The bundle: the `[[crate]]`, the injected session module, and the `Session` hooks. |
+| `mixins/bedrock_bridge/session.rs` | The injected module: session lifecycle, the client thread, and Bedrock→Java translation. |
 | `mixins/bedrock_bridge/hooks/` | Thin `horizon-mixins` helpers for `Session::connect` / `connect_transferred` / `send` / `disconnect`. |
 | `compatibility.json` | Pinned Horizon and horizon-mixins revisions. |
 
@@ -35,14 +48,28 @@ Everything below the Horizon glue, in one testable crate:
 
 * `stream` — little-endian primitives, LEB128 varints, zig-zag signed varints (Bedrock's base wire encoding).
 * `nbt` — **network NBT** (little-endian, varint/zig-zag int and long, Bedrock flavour).
-* `bitarray` / `subchunk` — the paletted sub-chunk format, `(x<<8)|(z<<4)|y` ordering, runtime and persistent (NBT) palettes.
+* `bitarray` / `subchunk` / `chunk` — the paletted sub-chunk format, `(x<<8)|(z<<4)|y` ordering, runtime and persistent (NBT) palettes, and the column assembly the Java chunk packet needs.
 * `raknet` — the reliability layer: offline handshake, datagrams, encapsulated packets, reliability/ordering, ACK/NACK, fragment reassembly.
-* `protocol` — packet ids for protocol **2225** (1.26.60), typed codecs for the packets the bridge needs, batch framing.
+* `nethernet` — the WebRTC transport: signaling, the data-channel message codec with segmentation and reassembly, and the `Transport` adapter.
+* `protocol` — packet ids for protocol **2225** (1.26.60), typed codecs for the packets the bridge needs, and batch framing.
 * `crypto` — ES384 identity key + JWT signing, X25519 handshake key, AES-256-GCM stream cipher, `ServerToClientHandshake` parsing (`ring`).
 * `auth` — Xbox Live device-code sign-in, the user/device/title/XSTS chain with the ES256 proof-of-key signature header, the Minecraft JWT chain, and the client-data (skin) JWT.
 * `mapping` — Bedrock↔Java block-range and biome tables (loaded from the GeyserMC mappings), the **addon entity registry** (custom entities from `AvailableEntityIdentifiers`), and the skin helpers.
-* `nethernet` — the portable half of the WebRTC transport newer clients use: the wire codec, data-channel segmentation/reassembly, the signaling message and the discovery constants (the connection half needs a WebRTC stack, see below).
-* `client` — ties it together: RakNet connect, zlib batch compression, the login handshake state machine, login/encryption/resource-pack handling.
+* `client` — ties it together: connect, zlib batch compression, the login handshake state machine, login/encryption/resource-pack handling, and chunk requests.
+
+### Translation coverage
+
+Clientbound (Bedrock → Java):
+
+* **World** — `StartGame`, time/difficulty/health, level events and sounds, spawn position, chunk publisher, `LevelChunk` + `SubChunk` + block updates.
+* **Entities** — `AddEntity` / `AddPlayer` / `AddItemEntity`, `SetEntityData`, equipment, `MovePlayer` / `MoveActorDelta` / `MoveEntityAbsolute` / `SetEntityMotion`, `Animate`, `RemoveEntity`, and item pickup.
+* **Player** — the server's position corrections, chat, the player list (tab), and the disconnect reason.
+
+Serverbound (Java → Bedrock):
+
+* **Movement** — one `PlayerAuthInput` per tick carrying the position, rotation, input flags (including the collision and jump/sneak/sprint variants a real client sends) and the velocity delta.
+* **Interaction** — block breaking through the input packet's block actions, attacking as an item-use-on-entity inventory transaction, placing and using as an item-use transaction, dropping as an item-release transaction, and the arm swing as `Animate`.
+* **Inventory** — the selected hotbar slot as equipment, and item-use transactions carrying the real held stack.
 
 ### Xbox authentication
 
@@ -50,33 +77,12 @@ Everything below the Horizon glue, in one testable crate:
 
 1. **Device code** — the mod prints a code and URL and polls until the player signs in; the refresh token is cached under the mod's data directory.
 2. **Xbox Live** — user, device and title tokens (each with an ES256 proof-of-key and the `x-xbl-contract-version` signature header) and an XSTS token for `https://multiplayer.minecraft.net/`.
-3. **Minecraft chain** — `multiplayer.minecraft.net/authentication` returns the three inherited JWTs; the client prepends its own ES384 self-signed JWT whose `identityPublicKey` points at the inherited root.
+3. **Minecraft chain** — `multiplayer.minecraft.net/authentication` returns the inherited JWTs; the client prepends its own ES384 self-signed JWT whose `identityPublicKey` points at the inherited root.
 4. **Skin JWT** — carries the client's X25519 handshake key in `x5u`, signed with the identity key.
 
 ### Custom entities
 
 `AvailableEntityIdentifiers` lists every entity identifier, vanilla and addon. `Mappings::parse_entity_identifiers` reads it; `Mappings::java_entity` maps a Bedrock identifier to a Java one and passes an addon identifier (`mymod:robot`) through with its namespace, so the bridge can spawn it and a content mapping can give it a model.
-
-## What was learned from the real client (Ghidra)
-
-`references`/`minecraft-26-60` is the Bedrock **1.26.60.4** Android APK, and its
-`lib/arm64-v8a/libminecraftpe.so` (342 MB, stripped) was imported into Ghidra 12.2 headless
-(`-noanalysis`, since a full pass over ~215 MB of `.text` is not practical here). Ghidra
-recovered **80,129 functions** and **95,696 symbols** and mapped the sections; a script then
-scanned memory for the transport and protocol names. It confirmed:
-
-* **NetherNet is WebRTC**: `handheld/src-deps/NetherNet/src/...`, `JsonRpc::WebRtcComponent`,
-  `HttpSignalingClient`, `Signaling/Http/HttpServer.cpp`, with mbedTLS **DTLS** and WebRTC
-  **SCTP data channels** (`webrtc::SctpDataChannel`) and STUN/TURN ICE.
-* **RakNet is still linked** (`src-deps/raknet/raknet/RakPeer.cpp`, `ReliabilityLayer.cpp`),
-  and `NetworkSystemToggles`/`NetherNetTransportFactory` select between them.
-* The **Xbox Live native SDK** (`Xbl*`, `Java_com_microsoft_xbox_idp_*`) and
-  `handheld/src-client/common/client/identity/XboxLiveIdentity.cpp`.
-* The packet class names (`StartGamePacket`, `PlayerAuthInputPacket`, `SubChunkPacket`,
-  `InventoryTransactionPacket`, ...), which match the ids in `protocol/ids.rs`.
-
-That analysis is why the transport is split behind RakNet (implemented) and NetherNet
-(WebRTC — out of scope; see below) rather than assuming the old RakNet-only world.
 
 ## Install
 
@@ -89,8 +95,8 @@ Native mods are compiled into the game, not dropped beside it. Build the file wi
   source and its own Rust, then builds a private instance.
 * **CLI:** `horizon-launcher native-build target/bedrock_bridge-0.1.0.hnmod --trust-native-code`.
 
-Both compile on **Nightly 2026-10-30** (`ba6344a5`), the pin in `compatibility.json`; every mod a
-build combines must pin the same revision and the same horizon-mixins revision.
+Both compile on the Nightly pin in `compatibility.json`; every mod a build combines must pin the
+same revision and the same horizon-mixins revision.
 
 ## Build and test
 
@@ -106,58 +112,50 @@ injection in place):
 ```sh
 python3 tools/horizon.py stage --horizon ../horizon   # export the pin, run plan/apply
 python3 tools/horizon.py check --horizon ../horizon
-python3 tools/horizon.py test  --horizon ../horizon    # embedded engine tests in the game
+python3 tools/horizon.py test  --horizon ../horizon   # embedded engine tests in the game
 ```
 
-Then launch the built client with prepared resources and join a server with the
-`bedrock:` address prefix:
+Then launch the built client and join a server with a Bedrock address:
 
 ```
 Multiplayer ▸ Direct Connection ▸ bedrock:play.example.net:19132
+Multiplayer ▸ Direct Connection ▸ bedrock+raknet:play.example.net:19132
 ```
 
-The prefix is deliberate: bare addresses stay Java, so the mod never hijacks a normal join.
-Non-prefixed addresses default to port 19132 only when the prefix is present.
+## Status
 
-## Status and what is left
+Implemented: the wire codecs, both transports, the login chain and Xbox auth, the mappings, the
+session lifecycle and packet dispatch, and the translation listed above — movement in both
+directions, chunks and blocks, entities, inventory, and the interaction packets.
 
-**Verified against the pinned commit (Nightly 2026-10-30, `ba6344a5`):** `horizon-mixins plan` and
-`apply` succeed (4 injections, 1 module, 1 crate all resolve), and the staged workspace
-**compiles and links** — `cargo check`/`cargo build -p horizon-client --bin horizon-client
---no-default-features` finish with no warnings and produce the `horizon-client` binary. So the
-injection, the engine crate and the whole dependency wiring are real, not just sketched.
+Known gaps:
 
-Implemented and unit-tested: the wire codecs, RakNet, the login chain and Xbox auth, the
-mappings, and the session lifecycle + packet dispatch.
-
-The parts that still need work, in order of importance:
-
-1. **Chunks and blocks.** `Clientbound::LevelChunkWithLight` needs a Bedrock-runtime-id →
-   Java-block-state resolver. The GeyserMC `blocks.nbt` mapping is the source; wiring it to
-   Horizon's block tables (a resolved Java state id per Bedrock runtime id) is the next step.
-   `session.rs` currently drops chunk/block packets.
-2. **The configuration phase.** Horizon's client normally receives its `Dynamic` registries
-   during the Java configuration phase. The bridge emits `Event::Joined` with
-   `Dynamic::default()`, which is enough for dimension defaults but not for biomes, damage
-   types or item components; a synthetic configuration phase that sends the vanilla registries
-   is needed for full parity.
-3. **Inventories and interaction.** `InventoryContent`/`InventorySlot` → Java container
-   packets, and `ContainerClick`/`UseItemOn` → `InventoryTransaction`/`ItemStackRequest`.
-4. **NetherNet.** The portable layers are ported (`bedrock_core::nethernet`: codec, message
-   segmentation, signaling, constants, `Transport` selection). The connection half — ICE, DTLS,
-   SCTP and the data channels — needs a WebRTC stack, and a bundle crate may only use crates
-   already in Horizon's `Cargo.lock`, where no WebRTC stack exists. Until Horizon carries one,
-   RakNet (on 19132) is the working transport.
-5. **The handshake cipher.** The key/IV derivation is the documented modern scheme; the
-   AES-GCM nonce layout is isolated in `crypto::Cipher` and should be confirmed against a
-   live online-mode server.
+1. **Containers beyond the player's own.** Window-type to Java menu mapping (chests, crafting)
+   and container clicks that move items between slots.
+2. **Damage and death feedback.** The server's actor events (hurt, death) and the knockback it
+   applies to the player, plus weather and the day cycle.
+3. **The configuration phase.** The bridge emits `Event::Joined` with `Dynamic::default()`, which
+   is enough for dimension defaults but not for biomes, damage types or item components; a
+   synthetic configuration phase sending the vanilla registries is what full parity needs.
+4. **Reconnection.** A quick rejoin after leaving is retried, because the server holds the
+   previous session for a while after the bridge drops it.
 
 ## References
 
-Ported/adapted from, and checked against: **TunnelMC** (Java→Bedrock, auth and translation),
-**Geyser**/**Floodgate** (Bedrock stack and mappings), the **CloudburstMC** projects (Network,
-NBT, BlockStateUpdater, Cloudburst server), **Nukkit** (Bedrock packet layouts, protocol 2225)
-and the GeyserMC **mappings** (Java 26.3 ↔ Bedrock 1.26.60). See `THIRD_PARTY_NOTICES.md`.
+Standing on the work of others. The Bedrock side was implemented from these sources:
+
+* **[bedrock-protocol-docs](https://github.com/Mojang/bedrock-protocol-docs)** — Mojang's own packet documentation; the authority for 1.26 packet layouts and enum values.
+* **[ViaBedrock](https://github.com/RaphiMC/ViaBedrock)** — a Java↔Bedrock proxy. The reference for translating a *Java client* into Bedrock, which is this bridge's direction: its `PlayerAuthInput` builder, its movement-correction handling and its item-use transactions are what the corresponding code here follows.
+* **[Pumpkin](https://github.com/Pumpkin-MC/Pumpkin)** — a Bedrock server; the reference for what a server expects from the client (input gating, position basis).
+* **[Geyser](https://github.com/GeyserMC/Geyser)** and **[Floodgate](https://github.com/GeyserMC/Floodgate)** — the Bedrock stack and mappings used across the ecosystem.
+* **[GeyserMC mappings](https://github.com/GeyserMC/mappings)** — the Java↔Bedrock block, item and biome tables this mod loads.
+* **[CloudburstMC Protocol](https://github.com/CloudburstMC/Protocol)**, **[NBT](https://github.com/CloudburstMC/NBT)** and **[BlockStateUpdater](https://github.com/CloudburstMC/BlockStateUpdater)** — Bedrock packet layouts and NBT.
+* **[bedrock-protocol](https://github.com/PrismarineJS/bedrock-protocol)** and **[minecraft-data](https://github.com/PrismarineJS/minecraft-data)** — the JavaScript client and its protocol data, used to cross-check field order and enum values.
+* **[TunnelMC](https://github.com/THEREALWWEFAN231/TunnelMC)** — a Bedrock↔Java bridge, referenced for the auth and translation structure.
+* **[Horizon](https://github.com/horizon-rust/horizon)** and **[horizon-mixins](https://github.com/horizon-rust/horizon-mixins)** — the game this mod is built into, and the injection it uses.
+
+Older packet layouts were also checked against the CloudburstMC server, Nukkit and the Minecraft
+Bedrock Wiki. See `THIRD_PARTY_NOTICES.md`.
 
 ## Licence
 
