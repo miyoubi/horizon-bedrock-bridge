@@ -1131,6 +1131,18 @@ mod translate {
                     feet - held[1],
                     position[2] - held[2],
                 );
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+                        bedrock_core::nethernet::trace(format!(
+                            "CORR corr=[{:.2},{:.2},{:.2}] feet=[{:.2},{:.2},{:.2}] held=[{:.2},{:.2},{:.2}] d=[{:.2},{:.2},{:.2}]",
+                            position[0], position[1], position[2],
+                            position[0], feet, position[2],
+                            held[0], held[1], held[2], dx, dy, dz
+                        ));
+                    }
+                }
                 if dx * dx + dz * dz < 1.5 * 1.5 && dy.abs() < 1.5 {
                     return Vec::new();
                 }
@@ -1543,7 +1555,14 @@ mod translate {
                     *hold = (mv, tick);
                 }
             }
-            if move_vec == [0.0, 0.0] && tick.saturating_sub(hold.1) <= HOLD_TICKS {
+            // Reuse the held direction only while the client is still moving.
+            // A stopped client has a zero delta, and reusing the last direction
+            // then made the server keep walking it after it stopped, which then
+            // diverged and snapped back as a correction.
+            if move_vec == [0.0, 0.0]
+                && horizontal > 1e-4
+                && tick.saturating_sub(hold.1) <= HOLD_TICKS
+            {
                 move_vec = hold.0;
             }
         }
