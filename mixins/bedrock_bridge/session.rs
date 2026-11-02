@@ -347,6 +347,7 @@ fn run(
         wanted: std::collections::VecDeque::new(),
         wanted_center: None,
         entities: std::collections::HashMap::new(),
+        drops: std::collections::HashMap::new(),
         items: Vec::new(),
         biomes,
         biome,
@@ -527,6 +528,9 @@ mod translate {
         /// Where each entity was last put: a Bedrock move carries only the
         /// components that changed, and the client takes absolute positions.
         pub entities: std::collections::HashMap<u64, ([f32; 3], f32, f32, f32)>,
+        /// The stack each dropped item entity carries, so a pickup can put it
+        /// into the inventory: the server sends no inventory packet for one.
+        pub drops: std::collections::HashMap<u64, bp::NetworkItem>,
         /// The server's item palette from `StartGame`: `(identifier, network
         /// id)`. The inventory and equipment packets carry the network id, so
         /// this is what resolves them to a Java item.
@@ -1053,6 +1057,7 @@ mod translate {
                     return Vec::new();
                 };
                 let stack = map_item(ctx, item);
+                ctx.drops.insert(*runtime_id, item.clone());
                 ctx.entities
                     .insert(*runtime_id, (*position, 0.0, 0.0, 0.0));
                 vec![
@@ -1087,16 +1092,40 @@ mod translate {
                     ))),
                 ]
             }
-            // Picking an item up: it flies to the actor and despawns.
+            // Picking an item up: it flies to the actor and despawns. The
+            // server sends no inventory packet for the pickup, so put the stack
+            // into the player's first free slot ourselves.
             bp::Packet::TakeItemEntity { item, actor } => {
                 ctx.entities.remove(item);
-                vec![Event::Packet(Box::new(play::Clientbound::TakeItemEntity(
-                    play::TakeItemEntity {
+                let mut events = vec![Event::Packet(Box::new(
+                    play::Clientbound::TakeItemEntity(play::TakeItemEntity {
                         item: *item as i32,
                         player: *actor as i32,
                         amount: 1,
-                    },
-                )))]
+                    }),
+                ))];
+                if *actor == ctx.runtime_id as u64 {
+                    if let Some(drop) = ctx.drops.remove(item) {
+                        let stack = map_item(ctx, &drop);
+                        let picked = descriptor(&drop);
+                        let mut items = bridge.items.lock().unwrap();
+                        let free = items.iter().position(|s| s.is_none());
+                        if let Some(slot) = free {
+                            items[slot] = picked;
+                            if let Some(java_slot) = java_inventory_slot(slot as u32) {
+                                events.push(Event::Packet(Box::new(
+                                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                                        container: 0,
+                                        state: 0,
+                                        slot: java_slot,
+                                        item: stack,
+                                    }),
+                                )));
+                            }
+                        }
+                    }
+                }
+                events
             }
             bp::Packet::AddPlayer(player) => {
                 let uuid = u128::from_be_bytes(player.uuid);
