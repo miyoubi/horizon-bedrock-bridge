@@ -291,14 +291,26 @@ fn run(
         }
     };
 
-    let mut client = match connect(address, &host, port, &login) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = events.send(Event::Disconnected {
-                reason: format!("Bedrock connection failed: {e}"),
-                from_server: false,
-            });
-            return;
+    // The server keeps the previous session for a while after a bridge leaves,
+    // so a quick reconnect is often refused. Retry it rather than giving up.
+    let mut client = {
+        let mut attempt = 0;
+        loop {
+            match connect(address, &host, port, &login) {
+                Ok(c) => break c,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= 8 {
+                        let _ = events.send(Event::Disconnected {
+                            reason: format!("Bedrock connection failed: {e}"),
+                            from_server: false,
+                        });
+                        return;
+                    }
+                    status(format!("Bedrock connection failed ({e}); retrying"));
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
         }
     };
     let auth_info = bedrock_core::auth::auth_info(&login.multiplayer_token, 0);
@@ -1105,57 +1117,45 @@ mod translate {
                     }),
                 ))];
                 if *actor == ctx.runtime_id as u64 {
-                    if let Some(drop) = ctx.drops.remove(item) {
+                    let changed = if let Some(drop) = ctx.drops.remove(item) {
                         let mut items = bridge.items.lock().unwrap();
                         // Top up a stack already holding the same item first, so
                         // a pickup adds to what is carried instead of appearing
                         // as its own stack.
-                        let target = descriptor(&drop).and_then(|d| {
-                            items
-                                .iter_mut()
-                                .enumerate()
-                                .find(|(_, s)| {
-                                    s.as_ref().is_some_and(|e| {
-                                        e.runtime_id == d.runtime_id
-                                            && e.damage == d.damage
-                                            && e.count < 64
+                        descriptor(&drop)
+                            .and_then(|d| {
+                                items
+                                    .iter_mut()
+                                    .enumerate()
+                                    .find(|(_, s)| {
+                                        s.as_ref().is_some_and(|e| {
+                                            e.runtime_id == d.runtime_id
+                                                && e.damage == d.damage
+                                                && e.count < 64
+                                        })
                                     })
-                                })
-                                .map(|(i, s)| {
-                                    let e = s.as_mut().unwrap();
-                                    let add = d.count.min(64 - e.count);
-                                    e.count += add;
-                                    (i, e.count)
-                                })
-                                .or_else(|| {
-                                    items.iter().position(|s| s.is_none()).map(|i| {
-                                        items[i] = Some(d);
-                                        (i, d.count)
+                                    .map(|(i, s)| {
+                                        let e = s.as_mut().unwrap();
+                                        let add = d.count.min(64 - e.count);
+                                        e.count += add;
+                                        i
                                     })
-                                })
-                        });
-                        if let Some((slot, count)) = target {
-                            let id = item_by_network_id(
-                                ctx.mappings,
-                                ctx.builtin,
-                                &ctx.items,
-                                drop.runtime_id,
-                            );
-                            if id != 0 {
-                                if let Some(java_slot) = java_inventory_slot(slot as u32) {
-                                    events.push(Event::Packet(Box::new(
-                                        play::Clientbound::ContainerSetSlot(
-                                            play::ContainerSetSlot {
-                                                container: 0,
-                                                state: 0,
-                                                slot: java_slot,
-                                                item: Some(Stack::new(id, i32::from(count))),
-                                            },
-                                        ),
-                                    )));
-                                }
-                            }
-                        }
+                                    .or_else(|| {
+                                        items.iter().position(|s| s.is_none()).map(|i| {
+                                            items[i] = Some(d);
+                                            i
+                                        })
+                                    })
+                            })
+                            .is_some()
+                    } else {
+                        false
+                    };
+                    // Send the whole container, not one slot: the server sends
+                    // no inventory packet for a pickup, and a single slot update
+                    // is discarded when its menu state does not match.
+                    if changed {
+                        events.push(inventory_content(ctx, bridge));
                     }
                 }
                 events
@@ -1831,6 +1831,39 @@ mod translate {
                 block_runtime_id: item.block_runtime_id,
             },
         )
+    }
+
+    /// The whole player inventory as a Java content update, from what the
+    /// server reported plus any pickups the bridge predicted. Sending the whole
+    /// container keeps every count consistent, where a single slot update can
+    /// be discarded when its menu state does not match.
+    fn inventory_content(ctx: &Context, bridge: &Bridge) -> Event {
+        let items = bridge.items.lock().unwrap();
+        let mut slots: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
+        for (i, entry) in items.iter().enumerate() {
+            let Some(d) = entry else { continue };
+            let Some(slot) = java_inventory_slot(i as u32) else {
+                continue;
+            };
+            let Ok(index) = usize::try_from(slot) else {
+                continue;
+            };
+            if index >= slots.len() {
+                continue;
+            }
+            let id = item_by_network_id(ctx.mappings, ctx.builtin, &ctx.items, d.runtime_id);
+            if id != 0 {
+                slots[index] = Some(Stack::new(id, i32::from(d.count)));
+            }
+        }
+        Event::Packet(Box::new(play::Clientbound::ContainerSetContent(
+            play::ContainerSetContent {
+                container: 0,
+                state: 0,
+                items: slots,
+                carried: None,
+            },
+        )))
     }
 
     /// Bedrock's player-inventory slot order to Java's inventory-menu order:
