@@ -224,6 +224,7 @@ pub enum Out {
         runtime_id: u64,
         action: i32,
         hotbar_slot: i32,
+        item: Option<ItemDescriptor>,
         position: [f32; 3],
     },
     /// Using an item on a block (placing or interacting). Bedrock performs it
@@ -234,6 +235,7 @@ pub enum Out {
         face: i32,
         hotbar_slot: i32,
         action: i32,
+        item: Option<ItemDescriptor>,
         cursor: [f32; 3],
         position: [f32; 3],
     },
@@ -451,11 +453,25 @@ pub fn parse_batch(data: &[u8]) -> Result<Vec<Packet>> {
     Ok(out)
 }
 
-/// Write an empty network item stack descriptor: no id, an empty stack id, and
-/// the user-data blob (an empty tag marker plus two empty string lists), which
-/// the server expects to be present even when there is no item.
-fn write_empty_item(w: &mut Writer) {
-    w.i16(0).i16(0).varint(0).bool(false).varint(0);
+/// The fields of a network item stack descriptor the bridge can reproduce.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ItemDescriptor {
+    pub runtime_id: i16,
+    pub count: i16,
+    pub damage: u32,
+    pub block_runtime_id: u32,
+}
+
+/// Write a network item stack descriptor: the id, count, damage, an empty
+/// stack id, the block runtime id, and the user-data blob (an empty tag marker
+/// plus two empty string lists), which the server expects even for no item.
+fn write_item(w: &mut Writer, item: Option<ItemDescriptor>) {
+    let d = item.unwrap_or_default();
+    w.i16(d.runtime_id)
+        .i16(d.count)
+        .varint(d.damage)
+        .bool(false)
+        .varint(d.block_runtime_id);
     w.varint(4); // user-data length: 2 + 1 + 1 bytes
     w.i16(0); // no tag
     w.varint(0); // can place: none
@@ -668,13 +684,14 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         } => {
             w.varint(ids::MOB_EQUIPMENT);
             w.varlong(*runtime_id);
-            write_empty_item(&mut w);
+            write_item(&mut w, None);
             w.u8(*slot).u8(*window_id);
         }
         Out::ItemUseOnEntity {
             runtime_id,
             action,
             hotbar_slot,
+            item,
             position,
         } => {
             w.varint(ids::INVENTORY_TRANSACTION);
@@ -686,8 +703,8 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.zigzag32(*action); // ItemUseOnActorActionType (compressed int32)
             w.zigzag32(*hotbar_slot); // slot (compressed int32)
             w.u8(0); // hand slot: main hand
-            // The held item, as an empty network item stack descriptor.
-            write_empty_item(&mut w);
+            // The held item, as a network item stack descriptor.
+            write_item(&mut w, *item);
             w.f32(position[0]);
             w.f32(position[1]);
             w.f32(position[2]); // the player's position
@@ -700,6 +717,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             face,
             hotbar_slot,
             action,
+            item,
             cursor,
             position,
         } => {
@@ -716,7 +734,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.u8(*face as u8);
             w.zigzag32(*hotbar_slot);
             w.u8(0); // hand: main
-            write_empty_item(&mut w);
+            write_item(&mut w, *item);
             w.f32(position[0]);
             w.f32(position[1]);
             w.f32(position[2]); // the player's position

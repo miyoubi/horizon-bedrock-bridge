@@ -130,6 +130,9 @@ struct Bridge {
     /// The hotbar slot the game last selected, carried by item-use
     /// transactions.
     hotbar: AtomicI64,
+    /// The player's inventory slots as reported by the server, so transactions
+    /// (place, use, attack) can carry the real held item.
+    items: Mutex<Vec<Option<bedrock_core::protocol::ItemDescriptor>>>,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -163,6 +166,7 @@ pub fn try_connect(
         on_ground: AtomicBool::new(true),
         collision: AtomicBool::new(false),
         hotbar: AtomicI64::new(0),
+        items: Mutex::new(vec![None; 36]),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1489,6 +1493,10 @@ mod translate {
                         }
                     }
                 }
+                {
+                    let mut held = bridge.items.lock().unwrap();
+                    *held = c.slots.iter().map(descriptor).collect();
+                }
                 vec![Event::Packet(Box::new(
                     play::Clientbound::ContainerSetContent(play::ContainerSetContent {
                         container: 0,
@@ -1499,6 +1507,12 @@ mod translate {
                 ))]
             }
             bp::Packet::InventorySlot(s) if s.window_id == 0 => {
+                if let Ok(index) = usize::try_from(s.slot) {
+                    let mut held = bridge.items.lock().unwrap();
+                    if let Some(slot) = held.get_mut(index) {
+                        *slot = descriptor(&s.item);
+                    }
+                }
                 let Some(slot) = java_inventory_slot(s.slot) else {
                     return Vec::new();
                 };
@@ -1680,6 +1694,24 @@ mod translate {
         (id != 0 && item.count > 0).then(|| Stack::new(id, i32::from(item.count)))
     }
 
+    /// The stack in the selected hotbar slot, as a descriptor for transactions.
+    fn held_item(bridge: &Bridge) -> Option<bedrock_core::protocol::ItemDescriptor> {
+        let slot = bridge.hotbar.load(Ordering::Relaxed).max(0) as usize;
+        bridge.items.lock().unwrap().get(slot).copied().flatten()
+    }
+
+    /// A Bedrock network item as the descriptor a transaction carries.
+    fn descriptor(item: &bp::NetworkItem) -> Option<bedrock_core::protocol::ItemDescriptor> {
+        (item.runtime_id != 0 && item.count > 0).then(
+            || bedrock_core::protocol::ItemDescriptor {
+                runtime_id: item.runtime_id,
+                count: item.count,
+                damage: item.damage,
+                block_runtime_id: item.block_runtime_id,
+            },
+        )
+    }
+
     /// Bedrock's player-inventory slot order to Java's inventory-menu order:
     /// hotbar 0..8, main 9..35, armour 36..39, off hand 40.
     fn java_inventory_slot(slot: u32) -> Option<i16> {
@@ -1839,6 +1871,7 @@ mod translate {
                         runtime_id: a.id as u64,
                         action: 1, // attack
                         hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                        item: held_item(bridge),
                         position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                     },
                 ]
@@ -1860,6 +1893,7 @@ mod translate {
                     face: u.face,
                     hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
                     action: 0, // place
+                    item: held_item(bridge),
                     cursor: u.cursor,
                     position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                 }]
@@ -1873,6 +1907,7 @@ mod translate {
                     face: 255,
                     hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
                     action: 1, // use
+                    item: held_item(bridge),
                     cursor: [0.0; 3],
                     position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                 }]
