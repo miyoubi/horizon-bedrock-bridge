@@ -2135,6 +2135,7 @@ mod translate {
                 }
                 vec![bp::Out::ItemRelease {
                     slot,
+                    count: item.map_or(1, |i| i.count.max(1) as u8),
                     item,
                     position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                 }]
@@ -2153,6 +2154,7 @@ mod translate {
                 }
                 vec![bp::Out::ItemRelease {
                     slot,
+                    count: item.map_or(1, |i| i.count.max(1) as u8),
                     item,
                     position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                 }]
@@ -2192,6 +2194,11 @@ mod translate {
                         }
                         return vec![bp::Out::ItemRelease {
                             slot,
+                            count: if p.action == 5 {
+                                1
+                            } else {
+                                item.map_or(1, |i| i.count.max(1) as u8)
+                            },
                             item,
                             position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
                         }];

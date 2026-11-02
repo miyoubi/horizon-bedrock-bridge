@@ -240,9 +240,11 @@ pub enum Out {
         item: Option<ItemDescriptor>,
         position: [f32; 3],
     },
-    /// Dropping an item: Bedrock's item-release inventory transaction.
+    /// Dropping an item: an `ItemStackRequest` with a drop action, which is how
+    /// a current client drops (there is no drop flag on an inventory source).
     ItemRelease {
         slot: i32,
+        count: u8,
         item: Option<ItemDescriptor>,
         position: [f32; 3],
     },
@@ -784,21 +786,25 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         }
         Out::ItemRelease {
             slot,
-            item,
-            position,
+            count,
+            item: _,
+            position: _,
         } => {
-            w.varint(ids::INVENTORY_TRANSACTION);
-            w.varint(0); // legacy request id
-            w.bool(false); // no legacy data
-            w.varint(4); // ItemReleaseTransaction
-            w.varint(0); // actions count
-            w.varint(0); // ItemReleaseActionType: release
-            w.varint(*slot as u32);
-            write_item(&mut w, *item);
-            w.f32(position[0]);
-            w.f32(position[1]);
-            w.f32(position[2]); // the player's position
-            w.u8(0); // hand: main
+            // An item stack request with one drop action: the stack leaves the
+            // combined hotbar-and-inventory container (12) for the world.
+            w.varint(ids::ITEM_STACK_REQUEST);
+            w.varint(1); // one request
+            w.varint(0); // client request id
+            w.varint(1); // actions count
+            w.u8(3); // action: drop
+            w.u8(*count);
+            w.u8(12); // container: combined hotbar and inventory
+            w.varint(0); // dynamic container id
+            w.u8(*slot as u8);
+            w.varint(0); // stack net id: none
+            w.bool(false); // not random
+            w.varint(0); // strings to filter
+            w.varint(0); // strings-to-filter origin
         }
         Out::Text {
             kind,
