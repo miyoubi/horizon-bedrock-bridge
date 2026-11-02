@@ -152,6 +152,12 @@ pub enum Out {
     SetLocalPlayerAsInitialized {
         runtime_id: u64,
     },
+    /// Serverbound `respawn`; a client ready to spawn sends it after a death.
+    Respawn {
+        position: [f32; 3],
+        state: u8,
+        runtime_id: u64,
+    },
     /// Serverbound `loading_screen`; ends the client's loading screen so the
     /// server starts simulating the player.
     LoadingScreen {
@@ -452,6 +458,18 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         }
         Out::SetLocalPlayerAsInitialized { runtime_id } => {
             w.varint(ids::SET_LOCAL_PLAYER_AS_INITIALIZED)
+                .varlong(*runtime_id);
+        }
+        Out::Respawn {
+            position,
+            state,
+            runtime_id,
+        } => {
+            w.varint(ids::RESPAWN)
+                .f32(position[0])
+                .f32(position[1])
+                .f32(position[2])
+                .u8(*state)
                 .varlong(*runtime_id);
         }
         Out::LoadingScreen { r#type } => {

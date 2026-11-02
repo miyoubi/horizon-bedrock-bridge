@@ -1679,6 +1679,17 @@ mod translate {
                 source: String::new(),
                 message: format!("/{}", c.command),
             }],
+            // ServerboundClientCommandPacket: 0 is respawn. A dead player's
+            // respawn sends it, and the server revives the player only once it
+            // hears back, so report the client ready to spawn.
+            play::Serverbound::ClientCommand(c) if c.action == 0 => {
+                bedrock_core::nethernet::trace("recv ClientCommand respawn".to_string());
+                vec![bp::Out::Respawn {
+                    position: [0.0; 3],
+                    state: 2, // ClientReadyToSpawn
+                    runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
+                }]
+            }
             _ => Vec::new(),
         }
     }
