@@ -1087,6 +1087,17 @@ mod translate {
                     ))),
                 ]
             }
+            // Picking an item up: it flies to the actor and despawns.
+            bp::Packet::TakeItemEntity { item, actor } => {
+                ctx.entities.remove(item);
+                vec![Event::Packet(Box::new(play::Clientbound::TakeItemEntity(
+                    play::TakeItemEntity {
+                        item: *item as i32,
+                        player: *actor as i32,
+                        amount: 1,
+                    },
+                )))]
+            }
             bp::Packet::AddPlayer(player) => {
                 let uuid = u128::from_be_bytes(player.uuid);
                 let Some(kind) = entity_type_id(ctx, "minecraft:player") else {

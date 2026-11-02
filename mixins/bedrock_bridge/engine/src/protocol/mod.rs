@@ -61,6 +61,11 @@ pub enum Packet {
         position: [f32; 3],
         velocity: [f32; 3],
     },
+    /// An item being picked up: the item entity and the actor taking it.
+    TakeItemEntity {
+        item: u64,
+        actor: u64,
+    },
     /// The server's authoritative correction of our own predicted position.
     CorrectPlayerMovePrediction {
         position: [f32; 3],
@@ -342,6 +347,11 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
                 position,
                 velocity,
             }
+        }
+        ids::TAKE_ITEM_ENTITY => {
+            let item = r.varlong()?;
+            let actor = r.varlong()?;
+            Packet::TakeItemEntity { item, actor }
         }
         ids::LEVEL_EVENT => Packet::LevelEvent(LevelEvent::read(&mut r)?),
         ids::UPDATE_ATTRIBUTES => Packet::UpdateAttributes(UpdateAttributes::read(&mut r)?),
