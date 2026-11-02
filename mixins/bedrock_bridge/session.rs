@@ -416,7 +416,7 @@ fn run(
             let Some(packet) = queued.pop_front() else {
                 break;
             };
-            for event in translate::clientbound(&mut ctx, &packet) {
+            for event in translate::clientbound(&mut ctx, &**bridge, &packet) {
                 let _ = events.send(event);
             }
             // React to the resource-pack phase automatically.
@@ -860,7 +860,7 @@ mod translate {
         }
     }
 
-    pub fn clientbound(ctx: &mut Context, packet: &bp::Packet) -> Vec<Event> {
+    pub fn clientbound(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
         match packet {
             bp::Packet::StartGame(g) => {
                 let spawn = play::SpawnInfo {
@@ -1118,17 +1118,29 @@ mod translate {
             // knockback) and then ignores the chunks sent for the server's
             // position, because they fall outside its view range.
             bp::Packet::CorrectPlayerMovePrediction { position, .. } => {
+                // Correct a real divergence only. Applying every tick's
+                // prediction snapped the player back and forth, which reads as
+                // teleporting; a small gap is just the server trailing the
+                // client by a tick, and the client's own movement is closer to
+                // correct there. Knockback and void falls are far enough apart
+                // to still land.
+                let held = *bridge.position.lock().unwrap();
+                let feet = position[1] - PLAYER_EYE;
+                let (dx, dy, dz) = (
+                    position[0] - held[0],
+                    feet - held[1],
+                    position[2] - held[2],
+                );
+                if dx * dx + dz * dz < 1.5 * 1.5 && dy.abs() < 1.5 {
+                    return Vec::new();
+                }
                 vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                     play::PlayerPosition {
                         teleport: 0,
-                        position: [
-                            position[0] as f64,
-                            position[1] as f64 - PLAYER_EYE as f64,
-                            position[2] as f64,
-                        ],
+                        position: [position[0] as f64, feet as f64, position[2] as f64],
                         delta: [0.0; 3],
-                        // Keep the client's own heading: the correction carries
-                        // an absolute position, not a rotation we should apply.
+                        // Keep the client's own heading: the correction is a
+                        // position, not a rotation to apply.
                         yaw: 0.0,
                         pitch: 0.0,
                         relatives: 0x18, // yaw + pitch relative
