@@ -53,6 +53,12 @@ pub enum Packet {
     MovePlayer(MovePlayer),
     MoveEntityAbsolute(MoveEntityAbsolute),
     MoveActorDelta(MoveActorDelta),
+    /// The server's authoritative correction of our own predicted position.
+    CorrectPlayerMovePrediction {
+        position: [f32; 3],
+        rotation: [f32; 2],
+        on_ground: bool,
+    },
     LevelEvent(LevelEvent),
     UpdateAttributes(UpdateAttributes),
     SetCommandsEnabled(bool),
@@ -259,6 +265,22 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::MOVE_PLAYER => Packet::MovePlayer(MovePlayer::read(&mut r)?),
         ids::MOVE_ENTITY_ABSOLUTE => Packet::MoveEntityAbsolute(MoveEntityAbsolute::read(&mut r)?),
         ids::MOVE_ACTOR_DELTA => Packet::MoveActorDelta(MoveActorDelta::read(&mut r)?),
+        ids::CORRECT_PLAYER_MOVE_PREDICTION => {
+            let _kind = r.u8()?;
+            let position = [r.f32()?, r.f32()?, r.f32()?];
+            let _delta = [r.f32()?, r.f32()?, r.f32()?];
+            let rotation = [r.f32()?, r.f32()?];
+            if r.bool()? {
+                let _angular_velocity = r.f32()?;
+            }
+            let on_ground = r.bool()?;
+            let _tick = r.varlong()?;
+            Packet::CorrectPlayerMovePrediction {
+                position,
+                rotation,
+                on_ground,
+            }
+        }
         ids::LEVEL_EVENT => Packet::LevelEvent(LevelEvent::read(&mut r)?),
         ids::UPDATE_ATTRIBUTES => Packet::UpdateAttributes(UpdateAttributes::read(&mut r)?),
         ids::SET_COMMANDS_ENABLED => Packet::SetCommandsEnabled(r.bool()?),

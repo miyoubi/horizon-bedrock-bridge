@@ -1113,6 +1113,28 @@ mod translate {
                     },
                 )))]
             }
+            // The server's authoritative position for our own player. Without
+            // applying it the client drifts from the server (collisions, holes,
+            // knockback) and then ignores the chunks sent for the server's
+            // position, because they fall outside its view range.
+            bp::Packet::CorrectPlayerMovePrediction { position, .. } => {
+                vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
+                    play::PlayerPosition {
+                        teleport: 0,
+                        position: [
+                            position[0] as f64,
+                            position[1] as f64 - PLAYER_EYE as f64,
+                            position[2] as f64,
+                        ],
+                        delta: [0.0; 3],
+                        // Keep the client's own heading: the correction carries
+                        // an absolute position, not a rotation we should apply.
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        relatives: 0x18, // yaw + pitch relative
+                    },
+                )))]
+            }
             bp::Packet::MovePlayer(m) => {
                 // Bedrock reports a player's position at the eye; Java entity
                 // positions are feet. Without the offset the player floats ~1.6.
@@ -1553,6 +1575,11 @@ mod translate {
     /// otherwise.
     fn input_bits(bridge: &Bridge) -> (u64, [f32; 2]) {
         let f = bridge.input.load(Ordering::Relaxed) as u8;
+        // The game sends its bitfield only when it changes, so a held jump would
+        // re-fire every tick. Consume it so one press is one jump.
+        if f & 0x10 != 0 {
+            bridge.input.fetch_and(!0x10, Ordering::Relaxed);
+        }
         let (forward, backward) = (f & 0x01 != 0, f & 0x02 != 0);
         let (left, right) = (f & 0x04 != 0, f & 0x08 != 0);
         let (jump, sneak, sprint) = (f & 0x10 != 0, f & 0x20 != 0, f & 0x40 != 0);

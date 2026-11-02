@@ -28,6 +28,8 @@ pub const UPDATE_ATTRIBUTES: u32 = 0x1d;
 pub const SET_COMMANDS_ENABLED: u32 = 0x3b;
 pub const INVENTORY_TRANSACTION: u32 = 0x1e;
 pub const MOB_EQUIPMENT: u32 = 0x1f;
+/// The server's movement correction for our own player.
+pub const CORRECT_PLAYER_MOVE_PREDICTION: u32 = 0xa1;
 pub const MOB_ARMOR_EQUIPMENT: u32 = 0x20;
 pub const INTERACT: u32 = 0x21;
 pub const BLOCK_PICK_REQUEST: u32 = 0x22;
