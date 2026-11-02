@@ -304,6 +304,10 @@ impl BedrockClient {
 
     /// Ask for chunks once the world has started, and report the player spawned.
     pub fn request_chunks(&mut self, radius: i32) -> Result<()> {
+        crate::nethernet::trace(format!(
+            "send init: RequestChunkRadius {radius} + SetLocalPlayerAsInitialized runtime_id={}",
+            self.runtime_id
+        ));
         self.send(&[
             Out::RequestChunkRadius { radius },
             Out::SetLocalPlayerAsInitialized {

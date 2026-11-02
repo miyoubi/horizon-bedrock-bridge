@@ -120,6 +120,10 @@ struct Bridge {
     /// The `PlayerAuthInput` tick id: it advances with every input packet, and
     /// the server pairs corrections with the id they answer.
     tick: AtomicI64,
+    /// The last local move direction derived from the position delta, and the
+    /// tick it was set: reused briefly so sparse movement packets still read as
+    /// walking rather than freezing between them.
+    move_hold: Mutex<([f32; 2], u64)>,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
 }
@@ -150,6 +154,7 @@ pub fn try_connect(
         input: AtomicI64::new(0),
         last_sent: Mutex::new([0.0; 3]),
         tick: AtomicI64::new(1),
+        move_hold: Mutex::new(([0.0; 2], 0)),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -758,6 +763,10 @@ mod translate {
     /// (`PlayerAuthInput` mPos and `MovePlayer`) are eye-based, while Java's
     /// entity positions are feet-based, so the two directions need this offset.
     const PLAYER_EYE: f32 = 1.62;
+    /// Heartbeats a derived move direction stays live after the last real
+    /// movement, so position updates slower than the heartbeat do not read as
+    /// stops. At 20 heartbeats a second this is about half a second.
+    const HOLD_TICKS: u64 = 10;
 
     /// The Java entity-type id for a name, or `None` when the client has no
     /// such entity. A miss must not fall back to 0: id 0 is `acacia_boat`, which
@@ -1438,6 +1447,7 @@ mod translate {
         actions: Vec<bp::BlockAction>,
     ) -> Vec<bp::Out> {
         let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
+        let raw_input = bridge.input.load(Ordering::Relaxed) as u8;
         let (mut flags, mut move_vec) = input_bits(bridge);
         if !actions.is_empty() {
             flags |= 1 << 35;
@@ -1454,42 +1464,52 @@ mod translate {
             d
         };
         // The game sends its input bitfield only when it changes, so it goes
-        // silent while the player is plainly moving (the position updates every
-        // tick). The server simulates movement from this vector, not from the
-        // position, so a silent bitfield reads as standing still. Derive the
-        // direction from the actual movement when the bitfield gave none.
-        if move_vec == [0.0, 0.0] {
-            let (dx, dz) = (delta[0], delta[2]);
-            if dx * dx + dz * dz > 1e-4 {
+        // silent while the player is plainly moving. The server simulates the
+        // movement from the input flags and this vector, so derive the direction
+        // from the actual movement, and hold it briefly so updates slower than
+        // the heartbeat still read as walking rather than freezing.
+        let horizontal = delta[0] * delta[0] + delta[2] * delta[2];
+        {
+            let mut hold = bridge.move_hold.lock().unwrap();
+            if horizontal > 1e-4 {
                 let yaw = bridge.rotation.lock().unwrap()[0].to_radians();
                 let (s, c) = (yaw.sin(), yaw.cos());
-                let fwd = -dx * s + dz * c;
-                let strafe = -dx * c - dz * s;
-                let len = (fwd * fwd + strafe * strafe).sqrt();
-                move_vec = if len > 1.0 {
-                    [strafe / len, fwd / len]
-                } else {
-                    [strafe, fwd]
-                };
-                flags &= !((1 << 10) | (1 << 11) | (1 << 12) | (1 << 13));
-                if fwd > 0.03 {
-                    flags |= 1 << 10;
-                } else if fwd < -0.03 {
-                    flags |= 1 << 11;
+                // Bedrock's local frame: +x is left, +y is forward.
+                let left = delta[0] * c + delta[2] * s;
+                let fwd = -delta[0] * s + delta[2] * c;
+                let len = (left * left + fwd * fwd).sqrt();
+                if len > 1e-6 {
+                    let mut mv = [left / len, fwd / len];
+                    if mv[0].abs() > 1e-3 && mv[1].abs() > 1e-3 {
+                        mv[0] *= std::f32::consts::FRAC_1_SQRT_2;
+                        mv[1] *= std::f32::consts::FRAC_1_SQRT_2;
+                    }
+                    *hold = (mv, tick);
                 }
-                if strafe > 0.03 {
-                    flags |= 1 << 13;
-                } else if strafe < -0.03 {
-                    flags |= 1 << 12;
-                }
+            }
+            if move_vec == [0.0, 0.0] && tick.saturating_sub(hold.1) <= HOLD_TICKS {
+                move_vec = hold.0;
+            }
+        }
+        if move_vec != [0.0, 0.0] {
+            flags &= !((1 << 10) | (1 << 11) | (1 << 12) | (1 << 13));
+            if move_vec[1] > 0.0 {
+                flags |= 1 << 10; // up / forward
+            } else if move_vec[1] < 0.0 {
+                flags |= 1 << 11; // down / backward
+            }
+            if move_vec[0] > 0.0 {
+                flags |= 1 << 12; // left
+            } else if move_vec[0] < 0.0 {
+                flags |= 1 << 13; // right
             }
         }
         // Bedrock's mPos is the eye position; the game tracks feet.
         let position = [position[0], position[1] + PLAYER_EYE, position[2]];
-        if tick % 20 == 0 {
+        if tick % 20 == 0 || move_vec != [0.0, 0.0] {
             bedrock_core::nethernet::trace(format!(
-                "AUTHIN-MOVE pos={:?} move={:?} flags={:#x} tick={}",
-                position, move_vec, flags, tick
+                "AUTHIN-MOVE pos={:?} move={:?} flags={:#x} input={:#04x} delta={:?} tick={}",
+                position, move_vec, flags, raw_input, delta, tick
             ));
         }
         vec![bp::Out::PlayerAuthInput {
@@ -1538,9 +1558,33 @@ mod translate {
         if sprint {
             bits |= 1 << 20; // sprinting
         }
-        let x = (right as i32) - (left as i32);
-        let z = (forward as i32) - (backward as i32);
-        (bits, [x as f32, z as f32])
+        // Bedrock's local move vector: +x is LEFT, +y is FORWARD. A diagonal is
+        // scaled by 1/√2 and sneaking by 0.3, as the reference translator does.
+        let mut mv = [
+            if left {
+                1.0f32
+            } else if right {
+                -1.0
+            } else {
+                0.0
+            },
+            if forward {
+                1.0f32
+            } else if backward {
+                -1.0
+            } else {
+                0.0
+            },
+        ];
+        if mv[0] != 0.0 && mv[1] != 0.0 {
+            mv[0] *= std::f32::consts::FRAC_1_SQRT_2;
+            mv[1] *= std::f32::consts::FRAC_1_SQRT_2;
+        }
+        if sneak {
+            mv[0] *= 0.3;
+            mv[1] *= 0.3;
+        }
+        (bits, mv)
     }
 
     /// One `PlayerAuthInput` for the current tick even when the game sent no

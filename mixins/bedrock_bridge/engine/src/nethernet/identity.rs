@@ -6,12 +6,12 @@
 //! token: the default server trust accepts any well-formed unexpired token and
 //! binds it to the DTLS certificate through the fingerprint signature.
 
-use crate::crypto::{IdentityKey, B64, B64URL};
+use crate::crypto::{B64, B64URL, IdentityKey};
 use crate::error::{Error, Result};
 use base64::Engine;
-use ring::signature::{UnparsedPublicKey, ECDSA_P384_SHA384_FIXED};
+use ring::signature::{ECDSA_P384_SHA384_FIXED, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Header of a compact JWS.

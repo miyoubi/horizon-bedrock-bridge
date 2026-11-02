@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
-use crate::aes::{pad, unpad, Aes256};
+use crate::aes::{Aes256, pad, unpad};
 use crate::error::{Error, Result};
 use crate::nethernet::{ID_REQUEST_PACKET, ID_RESPONSE_PACKET, MAX_BYTES};
 use crate::stream::{Reader, Writer};

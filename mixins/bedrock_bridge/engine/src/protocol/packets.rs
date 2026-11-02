@@ -209,8 +209,11 @@ impl StartGame {
         let entity_runtime_id = r.varlong()?;
         let player_gamemode = r.zigzag32()?;
         let position = [r.f32()?, r.f32()?, r.f32()?];
-        let yaw = r.f32()?;
+        // Rotation is (pitch, yaw), like every other rotation packet here.
+        // Read as (yaw, pitch) the two swap and the client spawns pitched past
+        // vertical, its camera pointed at the sky.
         let pitch = r.f32()?;
+        let yaw = r.f32()?;
         let seed = r.i64()?;
         let _spawn_biome_type = r.i16()?;
         let _user_biome = r.string()?;

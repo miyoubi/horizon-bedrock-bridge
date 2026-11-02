@@ -477,8 +477,8 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(1); // InputMode: mouse and keyboard
             w.varint(0); // PlayMode: normal
             w.zigzag32(0); // InteractionModel: touch (what a real 1.26 client sends)
-            w.f32(0.0);
-            w.f32(0.0); // interact rotation
+            w.f32(*pitch);
+            w.f32(*yaw); // interact rotation: the view interactions are aimed with
             w.varlong(*tick);
             w.f32(delta[0]);
             w.f32(delta[1]);
@@ -495,11 +495,15 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             }
             w.bool(false); // vehicle rotation
             w.bool(false); // vehicle id
-            w.f32(move_vec[0]);
-            w.f32(move_vec[1]); // analog move vector
-            w.f32(*pitch);
-            w.f32(*yaw);
-            w.f32(0.0); // camera orientation
+            w.f32(0.0);
+            w.f32(0.0); // analog move vector: empty with mouse-and-keyboard input
+            // Camera orientation: the world-space unit vector the view faces.
+            let yaw_rad = f32::to_radians(*yaw);
+            let pitch_rad = f32::to_radians(*pitch);
+            let cos_pitch = pitch_rad.cos();
+            w.f32(-yaw_rad.sin() * cos_pitch);
+            w.f32(-pitch_rad.sin());
+            w.f32(yaw_rad.cos() * cos_pitch); // camera orientation
             w.f32(move_vec[0]);
             w.f32(move_vec[1]); // raw move vector
             if !block_actions.is_empty() {

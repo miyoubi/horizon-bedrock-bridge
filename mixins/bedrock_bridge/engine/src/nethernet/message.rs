@@ -174,9 +174,10 @@ mod tests {
     #[test]
     fn oversized_remaining_count_is_rejected_not_overflowed() {
         let mut m = Message::new();
-        assert!(m
-            .add_segment(MessageSegment::new(u8::MAX, vec![1]))
-            .is_err());
+        assert!(
+            m.add_segment(MessageSegment::new(u8::MAX, vec![1]))
+                .is_err()
+        );
     }
 
     #[test]
