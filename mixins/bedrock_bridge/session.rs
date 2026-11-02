@@ -360,6 +360,7 @@ fn run(
         wanted_center: None,
         entities: std::collections::HashMap::new(),
         drops: std::collections::HashMap::new(),
+        name: name.to_string(),
         items: Vec::new(),
         biomes,
         biome,
@@ -543,6 +544,9 @@ mod translate {
         /// The stack each dropped item entity carries, so a pickup can put it
         /// into the inventory: the server sends no inventory packet for one.
         pub drops: std::collections::HashMap<u64, bp::NetworkItem>,
+        /// The player's own name, for its tab entry: the server's `PlayerList`
+        /// entry for the local player carries no name.
+        pub name: String,
         /// The server's item palette from `StartGame`: `(identifier, network
         /// id)`. The inventory and equipment packets carry the network id, so
         /// this is what resolves them to a Java item.
@@ -991,9 +995,16 @@ mod translate {
                 } else {
                     t.parameters.join(" ")
                 };
+                // A player's chat carries the sender's name in `source`;
+                // without it the line reads as if nobody said it.
+                let content = if t.source.is_empty() {
+                    text_component(message.trim())
+                } else {
+                    text_component(&format!("<{}> {}", t.source, message.trim()))
+                };
                 vec![Event::Packet(Box::new(play::Clientbound::SystemChat(
                     play::SystemChat {
-                        content: text_component(message.trim()),
+                        content,
                         overlay: false,
                     },
                 )))]
@@ -1169,8 +1180,22 @@ mod translate {
                     player.runtime_id,
                     (player.position, player.yaw, player.pitch, player.yaw),
                 );
-                vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
-                    play::AddEntity {
+                // The server's player-list entries carry no name, so the tab
+                // entry for a player is built from the spawn, which names it.
+                vec![
+                    Event::Packet(Box::new(play::Clientbound::PlayerInfoUpdate(
+                        play::PlayerInfoUpdate {
+                            actions: 0b0001_1001, // add, latency, listed
+                            entries: vec![play::PlayerInfo {
+                                uuid,
+                                name: Some(player.username.clone()),
+                                listed: Some(true),
+                                latency: Some(0),
+                                ..Default::default()
+                            }],
+                        },
+                    ))),
+                    Event::Packet(Box::new(play::Clientbound::AddEntity(play::AddEntity {
                         id: player.runtime_id as i32,
                         uuid,
                         kind,
@@ -1184,8 +1209,8 @@ mod translate {
                         yaw: (player.yaw / (360.0 / 256.0)) as i8,
                         head_yaw: 0,
                         data: 0,
-                    },
-                )))]
+                    }))),
+                ]
             }
             // Entity metadata. Bedrock's actor flags (index 0, a long) become
             // Java's shared-flags byte: on-fire, sneaking, sprinting and
@@ -1554,7 +1579,12 @@ mod translate {
                             .unwrap_or_default();
                         play::PlayerInfo {
                             uuid: u128::from_be_bytes(entry.uuid),
-                            name: Some(entry.username.clone()),
+                            // The entry for the local player carries no name.
+                            name: Some(if entry.username.is_empty() {
+                                ctx.name.clone()
+                            } else {
+                                entry.username.clone()
+                            }),
                             properties,
                             listed: Some(true),
                             latency: Some(0),
@@ -2093,6 +2123,10 @@ mod translate {
                 let pos = *bridge.position.lock().unwrap();
                 let slot = bridge.hotbar.load(Ordering::Relaxed) as i32;
                 let item = held_item(bridge);
+                bedrock_core::nethernet::trace(format!(
+                    "DROP click slot={} button={} input={} hotbar={slot} item={item:?}",
+                    c.slot, c.button, c.input
+                ));
                 {
                     let mut items = bridge.items.lock().unwrap();
                     if let Some(entry) = items.get_mut(slot.max(0) as usize) {
