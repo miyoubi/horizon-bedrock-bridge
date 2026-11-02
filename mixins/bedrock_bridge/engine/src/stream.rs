@@ -84,6 +84,11 @@ impl<'a> Reader<'a> {
         let b = self.bytes(4)?;
         Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+    /// Big-endian i32, as `PlayStatus` and a few other fields are encoded.
+    pub fn i32_be(&mut self) -> Result<i32> {
+        let b = self.bytes(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
     pub fn i64(&mut self) -> Result<i64> {
         let b = self.bytes(8)?;
         Ok(i64::from_le_bytes([

@@ -351,6 +351,9 @@ fn run(
         std::collections::VecDeque::new();
 
     let mut last_heartbeat = std::time::Instant::now();
+    // How many world packets have arrived since StartGame; the initialized
+    // signal is repeated while the world streams in.
+    let mut chunks_seen = 0u32;
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
         // shutdown) ends the thread.
@@ -421,6 +424,12 @@ fn run(
                 if *s == 0 {
                     let _ = client.accept_resource_packs();
                 }
+                // 3 = PlayerSpawn. A real client ends its loading screen and
+                // reports itself initialized here; without that the server keeps
+                // the player's movement skipped.
+                if *s == 3 {
+                    let _ = client.end_loading_screen();
+                }
             }
             if let bedrock_core::protocol::Packet::StartGame(g) = &packet {
                 ctx.runtime_id = g.entity_runtime_id;
@@ -429,6 +438,19 @@ fn run(
                     .runtime_id
                     .store(g.entity_runtime_id as i64, Ordering::Relaxed);
                 let _ = client.request_chunks(i32::from(view_distance));
+            }
+            // The server ignores the player's input until the client reports
+            // itself initialized, and a real client only reports it once the
+            // world is arriving. Repeat it as chunks come in so it lands after
+            // the load, not only in the login burst.
+            if matches!(
+                &packet,
+                bedrock_core::protocol::Packet::LevelChunk(_)
+                    | bedrock_core::protocol::Packet::SubChunk(_)
+            ) && chunks_seen < 24
+            {
+                chunks_seen += 1;
+                let _ = client.set_local_player_as_initialized();
             }
         }
         // Only sleep when there is nothing queued; with a backlog, go straight

@@ -63,6 +63,9 @@ pub const PLAY_SOUND: u32 = 0x56;
 pub const SET_TITLE: u32 = 0x58;
 pub const PLAYER_SKIN: u32 = 0x5d;
 pub const SET_LOCAL_PLAYER_AS_INITIALIZED: u32 = 0x71;
+/// Serverbound `loading_screen` (0x138). A client that never ends its loading
+/// screen leaves the server skipping the player's movement.
+pub const LOADING_SCREEN: u32 = 0x138;
 pub const TICK_SYNC: u32 = 0x17;
 pub const AVAILABLE_ENTITY_IDENTIFIERS: u32 = 0x77;
 pub const NETWORK_CHUNK_PUBLISHER_UPDATE: u32 = 0x79;

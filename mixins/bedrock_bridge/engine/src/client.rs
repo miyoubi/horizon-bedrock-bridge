@@ -302,6 +302,31 @@ impl BedrockClient {
         ])
     }
 
+    /// Report the client ready. A real client sends this once the world is
+    /// arriving, not the moment `StartGame` lands; the server ignores the
+    /// player's input until it arrives.
+    pub fn set_local_player_as_initialized(&mut self) -> Result<()> {
+        self.send(&[Out::SetLocalPlayerAsInitialized {
+            runtime_id: self.runtime_id as u64,
+        }])
+    }
+
+    /// Finish the client's loading screen and report it ready. A real client
+    /// sends both once the server reports the player spawn; without the loading
+    /// screen ending, the server keeps skipping the player's movement.
+    pub fn end_loading_screen(&mut self) -> Result<()> {
+        crate::nethernet::trace(format!(
+            "send ready: LoadingScreen(EndLoadingScreen) + SetLocalPlayerAsInitialized runtime_id={}",
+            self.runtime_id
+        ));
+        self.send(&[
+            Out::LoadingScreen { r#type: 2 }, // EndLoadingScreen
+            Out::SetLocalPlayerAsInitialized {
+                runtime_id: self.runtime_id as u64,
+            },
+        ])
+    }
+
     /// Ask for chunks once the world has started, and report the player spawned.
     pub fn request_chunks(&mut self, radius: i32) -> Result<()> {
         crate::nethernet::trace(format!(

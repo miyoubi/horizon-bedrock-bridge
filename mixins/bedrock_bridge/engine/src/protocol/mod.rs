@@ -152,6 +152,11 @@ pub enum Out {
     SetLocalPlayerAsInitialized {
         runtime_id: u64,
     },
+    /// Serverbound `loading_screen`; ends the client's loading screen so the
+    /// server starts simulating the player.
+    LoadingScreen {
+        r#type: i32,
+    },
     TickSync {
         request: i64,
         response: i64,
@@ -214,7 +219,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
     let mut r = Reader::new(body);
     Ok(match id {
         ids::NETWORK_SETTINGS => Packet::NetworkSettings(NetworkSettings::read(&mut r)?),
-        ids::PLAY_STATUS => Packet::PlayStatus(r.i32()?),
+        ids::PLAY_STATUS => Packet::PlayStatus(r.i32_be()?),
         ids::VIOLATION_WARNING => Packet::ViolationWarning {
             kind: r.zigzag32()?,
             severity: r.zigzag32()?,
@@ -448,6 +453,11 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         Out::SetLocalPlayerAsInitialized { runtime_id } => {
             w.varint(ids::SET_LOCAL_PLAYER_AS_INITIALIZED)
                 .varlong(*runtime_id);
+        }
+        Out::LoadingScreen { r#type } => {
+            w.varint(ids::LOADING_SCREEN);
+            w.zigzag32(*r#type);
+            w.bool(false); // no loading screen id
         }
         Out::TickSync { request, response } => {
             w.varint(ids::TICK_SYNC).i64(*request).i64(*response);
