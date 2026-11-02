@@ -1139,10 +1139,12 @@ mod translate {
                 {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static N: AtomicU64 = AtomicU64::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+                    if N.fetch_add(1, Ordering::Relaxed) % 3 == 0 {
                         bedrock_core::nethernet::trace(format!(
-                            "CORR corr=[{:.2},{:.2},{:.2}] feet=[{:.2},{:.2},{:.2}] held=[{:.2},{:.2},{:.2}] d=[{:.2},{:.2},{:.2}]",
-                            position[0], position[1], position[2],
+                            "CORR tick={} now={} input={:#04x} feet=[{:.2},{:.2},{:.2}] held=[{:.2},{:.2},{:.2}] d=[{:.2},{:.2},{:.2}]",
+                            tick,
+                            bridge.tick.load(Ordering::Relaxed),
+                            bridge.input.load(Ordering::Relaxed),
                             position[0], feet, position[2],
                             held[0], held[1], held[2], dx, dy, dz
                         ));
@@ -1156,16 +1158,12 @@ mod translate {
                 if *tick == 0 || *tick + REWIND_WINDOW < now_tick || *tick > now_tick {
                     return Vec::new();
                 }
-                // The Bedrock server broadcasts its own simulation of the player
-                // to everyone else, so if the client is allowed to sit far from
-                // it, other players see the server's version sliding and
-                // skipping while this client looks fine. Track it closely: the
-                // server accepts a deviation up to its
-                // `player-position-acceptance-threshold` (0.5 by default) and
-                // corrects beyond that, so follow at the same scale. The tick
-                // check above keeps a stale correction from pulling the client
-                // backwards.
-                if dx * dx + dz * dz < 0.5 * 0.5 && dy.abs() < 1.0 {
+                // Apply only a genuine teleport-sized move. Tracking the
+                // server's simulation at its own threshold pulled the client
+                // back to the server's trailing position on every tick while
+                // running, which reads as teleporting; the server's view of the
+                // player is driven by the input, not by this.
+                if dx * dx + dz * dz < 4.0 * 4.0 && dy.abs() < 3.0 {
                     return Vec::new();
                 }
                 vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
