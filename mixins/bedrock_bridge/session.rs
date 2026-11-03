@@ -424,6 +424,8 @@ fn run(
         spawn_pitch: 0.0,
         published: 0,
         chunks: std::collections::HashMap::new(),
+        block_ids: std::collections::HashMap::new(),
+        kinds: std::collections::HashMap::new(),
         requests: Vec::new(),
         wanted: std::collections::VecDeque::new(),
         request_limit: 24,
@@ -609,6 +611,12 @@ mod translate {
         /// type the renderer streams and the light engine reads. A partial
         /// column starts empty and fills as the sub-chunk replies arrive.
         pub chunks: std::collections::HashMap<(i32, i32), Chunk>,
+        /// The Bedrock runtime id of every block the columns hold, per section.
+        /// The game's states cannot be mapped back to them reliably, and a
+        /// block use has to name the exact one the server has.
+        pub block_ids: std::collections::HashMap<(i32, i32), Vec<Option<Box<[u32; 4096]>>>>,
+        /// Each entity's Java identifier, for the sound that belongs to it.
+        pub kinds: std::collections::HashMap<u64, String>,
         /// Sub-chunk requests queued while translating; the session loop sends
         /// them.
         pub requests: Vec<bedrock_core::protocol::Out>,
@@ -844,6 +852,15 @@ mod translate {
         for (value, runtime_id) in values.iter_mut().zip(ids) {
             *value = blocks.java(*runtime_id as i32);
         }
+        if ids.len() == 4096 {
+            let mut raw = Box::new([0u32; 4096]);
+            raw.copy_from_slice(ids);
+            let entry = ctx.block_ids.entry((x, z)).or_default();
+            if entry.len() <= slot {
+                entry.resize_with(slot + 1, || None);
+            }
+            entry[slot] = Some(raw);
+        }
         let mut section = ClientSection {
             blocks: ClientSection::from_blocks(&values),
             biomes: PalettedContainer::new(BIOME_STRATEGY, biome as u32),
@@ -858,6 +875,29 @@ mod translate {
             *target = Arc::new(section);
         }
         true
+    }
+
+    /// A block's own runtime id, straight from what the server sent.
+    fn block_id_at(ctx: &Context, pos: [i32; 3]) -> Option<u32> {
+        let dimension = DimensionType::vanilla("minecraft:overworld");
+        let slot = usize::try_from((pos[1] - dimension.min_y).div_euclid(16)).ok()?;
+        let entry = ctx.block_ids.get(&(pos[0] >> 4, pos[2] >> 4))?;
+        let section = entry.get(slot)?.as_ref()?;
+        Some(section[(((pos[1] & 15) << 8) | ((pos[2] & 15) << 4) | (pos[0] & 15)) as usize])
+    }
+
+    /// Record one changed block's runtime id, so a use of it names it right.
+    fn store_block_id(ctx: &mut Context, pos: [i32; 3], id: u32) {
+        let dimension = DimensionType::vanilla("minecraft:overworld");
+        let Ok(slot) = usize::try_from((pos[1] - dimension.min_y).div_euclid(16)) else {
+            return;
+        };
+        let entry = ctx.block_ids.entry((pos[0] >> 4, pos[2] >> 4)).or_default();
+        if entry.len() <= slot {
+            entry.resize_with(slot + 1, || None);
+        }
+        let section = entry[slot].get_or_insert_with(|| Box::new([0u32; 4096]));
+        section[(((pos[1] & 15) << 8) | ((pos[2] & 15) << 4) | (pos[0] & 15)) as usize] = id;
     }
 
     /// One column as the Java client wants it: every section, its heightmaps
@@ -1157,24 +1197,29 @@ mod translate {
     /// A positional hurt sound at a hurt entity, since the game's sound-event
     /// handler takes a position rather than an entity. Bedrock's own level
     /// sound event for the same hurt is not decoded.
-    fn hurt_sound(player: bool, position: [f32; 3]) -> Event {
-        let name = if player {
-            "minecraft:entity.player.hurt"
-        } else {
-            "minecraft:entity.generic.hurt"
-        };
-        sound_at(name, position)
+    fn hurt_sound(ctx: &Context, id: u64, position: [f32; 3]) -> Event {
+        sound_at(&mob_sound(ctx, id, "hurt"), position)
     }
 
     /// A positional death sound. The game only plays one by itself for the
     /// local player, so any other dead entity would go quietly.
-    fn death_sound(player: bool, position: [f32; 3]) -> Event {
-        let name = if player {
-            "minecraft:entity.player.death"
-        } else {
-            "minecraft:entity.generic.death"
-        };
-        sound_at(name, position)
+    fn death_sound(ctx: &Context, id: u64, position: [f32; 3]) -> Event {
+        sound_at(&mob_sound(ctx, id, "death"), position)
+    }
+
+    /// Bedrock's mobs each have their own hurt and death sounds; the game's
+    /// names follow the entity's own Java id.
+    fn mob_sound(ctx: &Context, id: u64, verb: &str) -> String {
+        if ctx.players.contains(&id) {
+            return format!("minecraft:entity.player.{verb}");
+        }
+        match ctx.kinds.get(&id) {
+            Some(kind) => {
+                let path = kind.strip_prefix("minecraft:").unwrap_or(kind);
+                format!("minecraft:entity.{path}.{verb}")
+            }
+            None => format!("minecraft:entity.generic.{verb}"),
+        }
     }
 
     fn sound_at(name: &str, position: [f32; 3]) -> Event {
@@ -1498,6 +1543,7 @@ mod translate {
                     entity.runtime_id,
                     (entity.position, entity.yaw, entity.pitch, entity.head_yaw),
                 );
+                ctx.kinds.insert(entity.runtime_id, java_name.clone());
                 ctx.uniques
                     .insert(entity.unique_id as u64, entity.runtime_id);
                 vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
@@ -1629,6 +1675,8 @@ mod translate {
                     return Vec::new();
                 };
                 ctx.players.insert(player.runtime_id);
+                ctx.kinds
+                    .insert(player.runtime_id, "minecraft:player".to_owned());
                 ctx.entities.insert(
                     player.runtime_id,
                     (player.position, player.yaw, player.pitch, player.yaw),
@@ -1986,6 +2034,7 @@ mod translate {
                 let mut events = Vec::new();
                 for entity in gone {
                     ctx.entities.remove(&entity);
+                    ctx.kinds.remove(&entity);
                     ctx.players.remove(&entity);
                     ctx.drops.remove(&entity);
                     events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
@@ -2019,7 +2068,7 @@ mod translate {
                 if id != ctx.runtime_id as u64
                     && let Some((position, ..)) = ctx.entities.get(&id)
                 {
-                    events.push(hurt_sound(ctx.players.contains(&id), *position));
+                    events.push(hurt_sound(&ctx, id, *position));
                 }
                 events
             }
@@ -2050,10 +2099,11 @@ mod translate {
                 gone.extend(children);
                 let mut events = Vec::new();
                 if let Some((position, ..)) = ctx.entities.get(&id) {
-                    events.push(death_sound(ctx.players.contains(&id), *position));
+                    events.push(death_sound(&ctx, id, *position));
                 }
                 for entity in gone {
                     ctx.entities.remove(&entity);
+                    ctx.kinds.remove(&entity);
                     ctx.players.remove(&entity);
                     ctx.drops.remove(&entity);
                     events.push(Event::Packet(Box::new(play::Clientbound::EntityEvent(
@@ -2311,6 +2361,7 @@ mod translate {
                 else {
                     return Vec::new();
                 };
+                store_block_id(ctx, *position, *runtime_id);
                 set_block(ctx, *position, state);
                 let mut events = vec![Event::Packet(Box::new(play::Clientbound::BlockUpdate(
                     play::BlockUpdate {
@@ -2335,6 +2386,7 @@ mod translate {
                         return Vec::new();
                     };
                     set_block(ctx, block.position, state);
+                    store_block_id(ctx, block.position, block.runtime_id);
                     columns.extend(columns_around(block.position));
                     events.push(Event::Packet(Box::new(play::Clientbound::BlockUpdate(
                         play::BlockUpdate {
@@ -2723,11 +2775,41 @@ mod translate {
     /// A block use, translated where the columns are: the state of the clicked
     /// block goes into the transaction as the server's check.
     pub fn use_item_on(ctx: &mut Context<'_>, bridge: &Bridge, u: &play::UseItemOn) -> Vec<bp::Out> {
-        let state = ctx
-            .chunks
-            .get(&(u.pos[0] >> 4, u.pos[2] >> 4))
-            .map_or(0, |chunk| chunk.get(u.pos[0] & 15, u.pos[1], u.pos[2]));
-        let block_id = ctx.blocks.as_mut().map_or(0, |blocks| blocks.bedrock(state));
+        let block_id = match block_id_at(ctx, u.pos) {
+            Some(id) => id,
+            None => {
+                let state = ctx
+                    .chunks
+                    .get(&(u.pos[0] >> 4, u.pos[2] >> 4))
+                    .map_or(0, |chunk| chunk.get(u.pos[0] & 15, u.pos[1], u.pos[2]));
+                ctx.blocks.as_mut().map_or(0, |blocks| blocks.bedrock(state))
+            }
+        };
+        // A placement puts a new block there, and the server does not always
+        // echo it back, so the client's next use of it must know its id.
+        if let Some(item) = held_item(bridge) {
+            if item.block_runtime_id > 0 {
+                let normal = match u.face {
+                    0 => [0, -1, 0],
+                    1 => [0, 1, 0],
+                    2 => [0, 0, -1],
+                    3 => [0, 0, 1],
+                    4 => [-1, 0, 0],
+                    5 => [1, 0, 0],
+                    _ => [0, 0, 0],
+                };
+                let target = if u.inside {
+                    u.pos
+                } else {
+                    [
+                        u.pos[0] + normal[0],
+                        u.pos[1] + normal[1],
+                        u.pos[2] + normal[2],
+                    ]
+                };
+                store_block_id(ctx, target, item.block_runtime_id as u32);
+            }
+        }
         serverbound_with(
             bridge,
             &play::Serverbound::UseItemOn(u.clone()),
