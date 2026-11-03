@@ -801,20 +801,18 @@ mod translate {
 
         // Light sections run from one below the lowest block section upwards.
         let light_sections = count + 2;
-        // Full sky light for every light section. The sub-chunk stream carries
-        // no light of the server's own, and deriving it from the heightmap drew
-        // a black stripe along the terrain: shading a slope is not the same as
-        // leaving it unlit, and a shadow that follows the ground is worse than
-        // an evenly lit surface.
-        let sky: Vec<Vec<u8>> = (0..light_sections).map(|_| vec![0xFFu8; 2048]).collect();
+        // Declare every light section empty rather than filling them in. The
+        // Bedrock stream carries no light of its own -- its client works its
+        // lighting out locally from the blocks and the heightmap -- so the only
+        // honest answer is to say there is none and let the game's light engine
+        // light the column. A flat fill lights everything evenly and a
+        // heightmap fill leaves slopes unlit; both fight the engine.
         let light = LightData {
-            sky_mask: bitset(light_sections),
+            sky_mask: Vec::new(),
             block_mask: Vec::new(),
-            empty_sky_mask: Vec::new(),
-            // Block light everywhere is zero, which the empty mask conveys
-            // without sending 2048 bytes per section.
+            empty_sky_mask: bitset(light_sections),
             empty_block_mask: bitset(light_sections),
-            sky,
+            sky: Vec::new(),
             block: Vec::new(),
         };
 
