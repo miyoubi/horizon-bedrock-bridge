@@ -809,85 +809,11 @@ mod translate {
 
         // Light sections run from one below the lowest block section upwards.
         let light_sections = count + 2;
-        // Sky light, worked out here and spread sideways. The Bedrock stream
-        // carries no light of the server's own, and the game's light engine only
-        // relights the chunks around the player: marking the sections empty left
-        // a dark ring that never lifted. Seeding the open sky at 15 and letting
-        // it spread down and across puts the sides of slopes in shade instead of
-        // leaving them black, and every section is filled, so nothing is dark
-        // for want of data.
-        let world_height = dimension.height as usize;
-        let at = |y: usize, z: usize, x: usize| y * 256 + z * 16 + x;
-        let mut levels = vec![0u8; world_height * 256];
-        let mut queue: std::collections::VecDeque<(usize, usize, usize)> =
-            std::collections::VecDeque::new();
-        for z in 0..16usize {
-            for x in 0..16usize {
-                // `heights` counts from `min_y`, so the surface block's own cell
-                // is one below the value.
-                let top = (heights[z * 16 + x] as usize).min(world_height);
-                for y in top.saturating_sub(1)..world_height {
-                    levels[at(y, z, x)] = 15;
-                }
-                if top > 0 {
-                    queue.push_back((top - 1, z, x));
-                }
-            }
-        }
-        while let Some((y, z, x)) = queue.pop_front() {
-            let level = levels[at(y, z, x)];
-            if level <= 1 {
-                continue;
-            }
-            for (dz, dx) in [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
-                let nz = z as i32 + dz;
-                let nx = x as i32 + dx;
-                if !(0..16).contains(&nz) || !(0..16).contains(&nx) {
-                    continue;
-                }
-                let (nz, nx) = (nz as usize, nx as usize);
-                if solid[at(y, nz, nx)] {
-                    continue;
-                }
-                if levels[at(y, nz, nx)] < level - 1 {
-                    levels[at(y, nz, nx)] = level - 1;
-                    queue.push_back((y, nz, nx));
-                }
-            }
-            if y > 0 && !solid[at(y - 1, z, x)] && levels[at(y - 1, z, x)] < level - 1 {
-                levels[at(y - 1, z, x)] = level - 1;
-                queue.push_back((y - 1, z, x));
-            }
-        }
-        let sky: Vec<Vec<u8>> = (0..light_sections)
-            .map(|section| {
-                let mut layer = vec![0u8; 2048];
-                // Light section i covers block section i - 1.
-                let base = dimension.min_y + (section as i32 - 1) * 16;
-                for y in 0..16usize {
-                    let world = base + y as i32 - dimension.min_y;
-                    if !(0..world_height as i32).contains(&world) {
-                        continue;
-                    }
-                    for z in 0..16usize {
-                        for x in 0..16usize {
-                            let level = levels[at(world as usize, z, x)];
-                            if level == 0 {
-                                continue;
-                            }
-                            let index = y * 256 + z * 16 + x;
-                            let byte = index >> 1;
-                            if index & 1 == 0 {
-                                layer[byte] |= level;
-                            } else {
-                                layer[byte] |= level << 4;
-                            }
-                        }
-                    }
-                }
-                layer
-            })
-            .collect();
+        // Full sky light for every section. Hand-computed light bands badly no
+        // matter how the spread is constrained, and an empty light section is
+        // only relit around the player, leaving a dark ring. Flat light is dull
+        // but stable, and it is what the result actually looks like.
+        let sky: Vec<Vec<u8>> = (0..light_sections).map(|_| vec![0xFFu8; 2048]).collect();
         let light = LightData {
             sky_mask: bitset(light_sections),
             block_mask: Vec::new(),
