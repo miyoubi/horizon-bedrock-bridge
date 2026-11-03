@@ -639,11 +639,16 @@ fn write_slot(w: &mut Writer, slot: &SlotRef) {
         }
     }
     w.u8(slot.slot);
-    // The request's net id is a tagged variant, not the sign-tagged integer
-    // that other packets use: variant zero is the server's own id for the
-    // stack, which is what the bridge always has.
-    w.varint(0);
-    w.zigzag32(slot.stack_id);
+    // The stack id is optional, and where it is carried it is a tagged
+    // variant: variant zero is the server's own id for the stack. A slot the
+    // bridge has no id for carries no id at all.
+    if slot.stack_id == 0 {
+        w.bool(false);
+    } else {
+        w.bool(true);
+        w.varint(0); // ItemStackNetId
+        w.zigzag32(slot.stack_id);
+    }
 }
 
 /// Encode one outbound packet (id + body).
@@ -1176,8 +1181,8 @@ mod inventory_tests {
                 0x01, // one action
                 0x00, 0x00, // Take, then its const action type
                 0x01, // one item
-                0x1d, 0x00, 0x09, 0x00, 0x00, // source: inventory 29, slot 9, server stack 0
-                0x3b, 0x00, 0x00, 0x00, 0x00, // destination: cursor 59, slot 0, server stack 0
+                0x1d, 0x00, 0x09, 0x00, // source: inventory 29, slot 9, no stack id
+                0x3b, 0x00, 0x00, 0x00, // destination: cursor 59, slot 0, no stack id
                 0x00, // no filter strings
                 0x00, 0x00, 0x00, 0x00, // filter string cause
             ]
@@ -1203,7 +1208,7 @@ mod inventory_tests {
                 0x08, // request id 4, zigzag
                 0x01, // one action
                 0x03, 0x03, 0x03, // Drop: the action, its const type, three items
-                0x1c, 0x00, 0x02, 0x00, 0x00, // source: hotbar 28, slot 2, server stack 0
+                0x1c, 0x00, 0x02, 0x00, // source: hotbar 28, slot 2, no stack id
                 0x00, // not scattered
                 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
