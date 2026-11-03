@@ -1085,6 +1085,10 @@ mod translate {
                 };
                 let stack = map_item(ctx, item);
                 ctx.drops.insert(*runtime_id, item.clone());
+                bedrock_core::nethernet::trace(format!(
+                    "ITEM SPAWN id={runtime_id} stack={:?}",
+                    (item.runtime_id, item.count)
+                ));
                 ctx.entities
                     .insert(*runtime_id, (*position, 0.0, 0.0, 0.0));
                 vec![
@@ -1471,6 +1475,7 @@ mod translate {
             bp::Packet::RemoveEntity(id) => {
                 ctx.entities.remove(id);
                 ctx.drops.remove(id);
+                bedrock_core::nethernet::trace(format!("ITEM/ACTOR REMOVE id={id}"));
                 vec![Event::Packet(Box::new(
                     play::Clientbound::RemoveEntities(play::RemoveEntities {
                         ids: vec![*id as i32],
