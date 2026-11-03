@@ -639,16 +639,9 @@ fn write_slot(w: &mut Writer, slot: &SlotRef) {
         }
     }
     w.u8(slot.slot);
-    // The stack id is optional, and where it is carried it is a tagged
-    // variant: variant zero is the server's own id for the stack. A slot the
-    // bridge has no id for carries no id at all.
-    if slot.stack_id == 0 {
-        w.bool(false);
-    } else {
-        w.bool(true);
-        w.varint(0); // ItemStackNetId
-        w.zigzag32(slot.stack_id);
-    }
+    // The stack id here is a plain little-endian int, unlike the varint the
+    // item descriptors carry.
+    w.i32(slot.stack_id);
 }
 
 /// Encode one outbound packet (id + body).
@@ -1181,8 +1174,8 @@ mod inventory_tests {
                 0x01, // one action
                 0x00, 0x00, // Take, then its const action type
                 0x01, // one item
-                0x1d, 0x00, 0x09, 0x00, // source: inventory 29, slot 9, no stack id
-                0x3b, 0x00, 0x00, 0x00, // destination: cursor 59, slot 0, no stack id
+                0x1d, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, // source: inventory 29, slot 9, stack id 0
+                0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // destination: cursor 59, slot 0, stack id 0
                 0x00, // no filter strings
                 0x00, 0x00, 0x00, 0x00, // filter string cause
             ]
@@ -1208,7 +1201,7 @@ mod inventory_tests {
                 0x08, // request id 4, zigzag
                 0x01, // one action
                 0x03, 0x03, 0x03, // Drop: the action, its const type, three items
-                0x1c, 0x00, 0x02, 0x00, // source: hotbar 28, slot 2, no stack id
+                0x1c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, // source: hotbar 28, slot 2, stack id 0
                 0x00, // not scattered
                 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
@@ -1222,6 +1215,7 @@ mod inventory_tests {
         let mut w = Writer::new();
         w.u8(0) // applied
             .zigzag32(5) // request id
+            .bool(true) // a container list follows
             .varint(1) // one container
             .u8(29) // inventory
             .bool(false) // no dynamic id
@@ -1229,6 +1223,7 @@ mod inventory_tests {
             .u8(9) // slot
             .u8(9) // hotbar slot
             .u8(3) // count
+            .bool(true) // a stack id follows
             .zigzag32(7) // the server's stack id
             .varint(0) // custom name
             .varint(0) // filtered name
@@ -1247,7 +1242,7 @@ mod inventory_tests {
         assert_eq!((slot.slot, slot.count, slot.stack_id), (9, 3, 7));
 
         let mut w = Writer::new();
-        w.u8(1).zigzag32(5); // refused: no container list follows
+        w.u8(1).zigzag32(5).bool(false); // refused: no container list follows
         let packet = decode(ids::ITEM_STACK_RESPONSE, &w.into_inner()).unwrap();
         let Packet::ItemStackResponse(response) = packet else {
             panic!("expected a stack response");

@@ -976,7 +976,8 @@ impl ItemStackResponse {
         let result = r.u8()?;
         let request_id = r.zigzag32()?;
         let mut containers = Vec::new();
-        if result == 0 {
+        // The container list is an optional that a refused request leaves out.
+        if r.bool()? {
             let count = r.varint()?;
             for _ in 0..count {
                 let container = FullContainerName::read(r)?;
@@ -986,9 +987,9 @@ impl ItemStackResponse {
                     let slot = r.u8()?;
                     let hotbar_slot = r.u8()?;
                     let count = r.u8()?;
-                    // The stack id is carried only for a slot that holds
-                    // something.
-                    let stack_id = if count > 0 { r.zigzag32()? } else { 0 };
+                    // The stack id is optional, and only the server's own id
+                    // for the stack is carried.
+                    let stack_id = if r.bool()? { r.zigzag32()? } else { 0 };
                     let _custom_name = read_string(r)?;
                     let _filtered = read_string(r)?;
                     let durability_correction = r.zigzag32()?;
