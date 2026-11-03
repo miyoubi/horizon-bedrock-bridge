@@ -1134,46 +1134,14 @@ mod translate {
                     }),
                 ))];
                 if *actor == ctx.runtime_id as u64 {
-                    let changed = if let Some(drop) = ctx.drops.remove(item) {
-                        let mut items = bridge.items.lock().unwrap();
-                        // Top up a stack already holding the same item first, so
-                        // a pickup adds to what is carried instead of appearing
-                        // as its own stack.
-                        descriptor(&drop)
-                            .and_then(|d| {
-                                items
-                                    .iter_mut()
-                                    .enumerate()
-                                    .find(|(_, s)| {
-                                        s.as_ref().is_some_and(|e| {
-                                            e.runtime_id == d.runtime_id
-                                                && e.damage == d.damage
-                                                && e.count < 64
-                                        })
-                                    })
-                                    .map(|(i, s)| {
-                                        let e = s.as_mut().unwrap();
-                                        let add = d.count.min(64 - e.count);
-                                        e.count += add;
-                                        i
-                                    })
-                                    .or_else(|| {
-                                        items.iter().position(|s| s.is_none()).map(|i| {
-                                            items[i] = Some(d);
-                                            i
-                                        })
-                                    })
-                            })
-                            .is_some()
-                    } else {
-                        false
-                    };
-                    // Send the whole container, not one slot: the server sends
-                    // no inventory packet for a pickup, and a single slot update
-                    // is discarded when its menu state does not match.
-                    if changed {
-                        events.push(inventory_content(ctx, bridge));
-                    }
+                    // The server picked the stack up on its own side and never
+                    // told us what our inventory holds. Inventing the stack here
+                    // is what put our copy out of step with the server, so ask
+                    // it to resend the inventories and show what it holds.
+                    ctx.drops.remove(item);
+                    let _ = bridge
+                        .outbound
+                        .send(vec![bedrock_core::protocol::Out::InventoryMismatch]);
                 }
                 events
             }

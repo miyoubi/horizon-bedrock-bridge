@@ -266,6 +266,8 @@ pub enum Out {
         runtime_id: u64,
         action: i32,
     },
+    /// Ask the server to resend the inventories, because ours has drifted.
+    InventoryMismatch,
     /// Serverbound disconnect: tells the server this client is leaving so it
     /// removes the player at once instead of waiting out the transport timeout.
     Disconnect {
@@ -829,6 +831,15 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(*slot as u32);
             write_item(&mut w, Some(held));
             write_item(&mut w, Some(remaining));
+        }
+        Out::InventoryMismatch => {
+            // The server answers an inventory mismatch by resending everything
+            // it holds, which is how a client gets back in step.
+            w.varint(ids::INVENTORY_TRANSACTION);
+            w.varint(0); // legacy request id
+            w.bool(false); // no legacy data
+            w.varint(1); // InventoryMismatch
+            w.varint(0); // actions count
         }
         Out::Text {
             kind,
