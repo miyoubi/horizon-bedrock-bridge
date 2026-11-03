@@ -160,6 +160,9 @@ struct Bridge {
     /// server's `Respawn` is answered only for their own request and not for
     /// the one that ends the join handshake.
     respawn_asked: AtomicBool,
+    /// Set when a teleport (a respawn) has just been applied, so the next input
+    /// tells the server it was handled.
+    teleport_ack: AtomicBool,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -218,6 +221,7 @@ pub fn try_connect(
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
         respawn_asked: AtomicBool::new(false),
+        teleport_ack: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -2003,6 +2007,13 @@ mod translate {
                     position[2] as f64,
                 ];
                 ctx.spawn = feet;
+                // The server simulates the player from our input, so the input
+                // must already hold the new position or it drags the player
+                // straight back to where they died.
+                let at = [feet[0] as f32, feet[1] as f32, feet[2] as f32];
+                *bridge.position.lock().unwrap() = at;
+                *bridge.last_sent.lock().unwrap() = at;
+                bridge.teleport_ack.store(true, Ordering::Relaxed);
                 events.push(Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                     play::PlayerPosition {
                         teleport: 0,
@@ -2372,6 +2383,11 @@ mod translate {
         if !actions.is_empty() {
             flags |= 1 << 35; // perform_block_actions
         }
+        // A respawn's teleport is not settled on the server until an input
+        // reports it handled.
+        if bridge.teleport_ack.swap(false, Ordering::Relaxed) {
+            flags |= 1 << 37; // handled_teleport
+        }
         // The delta is a velocity in Bedrock's movement maths, which the
         // reference translator builds from the raw position change: horizontal
         // * 0.98 * friction * 0.91, and vertical minus gravity then * 0.98.
@@ -2661,10 +2677,11 @@ mod translate {
             // is ready to spawn, and the server then places the player.
             play::Serverbound::ClientCommand(c) if c.action == 0 => {
                 bridge.respawn_asked.store(true, Ordering::Relaxed);
-                let position = *bridge.position.lock().unwrap();
                 let runtime_id = bridge.runtime_id.load(Ordering::Relaxed).max(0) as u64;
+                // The client-ready respawn carries no position; the server
+                // places the player where its own spawn is.
                 vec![bp::Out::Respawn {
-                    position,
+                    position: [0.0; 3],
                     state: 2,
                     runtime_id,
                 }]
