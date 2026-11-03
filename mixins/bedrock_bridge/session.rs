@@ -1145,6 +1145,51 @@ mod translate {
                     saturation: 5.0,
                 }),
             ))],
+            // Time of day. Bedrock sends only the tick count, and the game takes
+            // it as the overworld's own clock; without it the sky sits still.
+            bp::Packet::SetTime(time) => {
+                let clock = ctx
+                    .builtin
+                    .get("minecraft:world_clock")
+                    .and_then(|ids| ids.id("minecraft:overworld"))
+                    .unwrap_or(0);
+                let ticks = i64::from(*time);
+                vec![Event::Packet(Box::new(play::Clientbound::SetTime(
+                    play::SetTime {
+                        game_time: ticks,
+                        clocks: vec![play::ClockState {
+                            clock,
+                            total_ticks: ticks,
+                            partial_tick: 0.0,
+                            rate: 1.0,
+                        }],
+                    },
+                )))]
+            }
+            // Weather. Bedrock announces rain and thunder as level events, and
+            // the game wants both the state and the level it rains at -- the
+            // state alone does not make it rain.
+            bp::Packet::LevelEvent(e) if (3001..=3004).contains(&e.event) => {
+                let (event, param) = match e.event {
+                    3001 => (1u8, 0.0f32),
+                    3003 => (2, 0.0),
+                    3002 => (8, 1.0),
+                    3004 => (8, 0.0),
+                    _ => return Vec::new(),
+                };
+                let mut events = vec![Event::Packet(Box::new(play::Clientbound::GameEvent(
+                    play::GameEvent { event, param },
+                )))];
+                if e.event == 3001 || e.event == 3003 {
+                    events.push(Event::Packet(Box::new(play::Clientbound::GameEvent(
+                        play::GameEvent {
+                            event: 7,
+                            param: if e.event == 3001 { 1.0 } else { 0.0 },
+                        },
+                    ))));
+                }
+                events
+            }
             bp::Packet::AddEntity(entity) => {
                 let java_name = ctx.mappings.java_entity(&entity.identifier);
                 // An entity the client has no type for is skipped rather than
