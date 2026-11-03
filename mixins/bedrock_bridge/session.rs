@@ -2922,7 +2922,7 @@ mod translate {
                         action: 1, // attack
                         hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
                         item: held_item(bridge),
-                        position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                        position: pos,
                         click: [0.0; 3],
                     },
                 ]
@@ -2936,7 +2936,7 @@ mod translate {
                     action: 0, // interact
                     hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
                     item: held_item(bridge),
-                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    position: pos,
                     click: [0.0; 3],
                 }]
             }
@@ -3019,7 +3019,9 @@ mod translate {
                         action: 0, // place
                         item: held,
                         cursor: u.cursor,
-                        position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                        // The transaction carries the feet position, not the
+                        // eye: the server measures reach from here.
+                        position: pos,
                         block_id,
                     },
                     bp::Out::PlayerAction {

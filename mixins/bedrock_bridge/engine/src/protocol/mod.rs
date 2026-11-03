@@ -783,7 +783,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             // Everything else we send uses action 0, where the two encodings
             // agree, so this is the first value that can show the difference.
             w.zigzag32(*action);
-            w.varint(*hotbar_slot as u32); // slot
+            w.zigzag32(*hotbar_slot); // slot
             w.u8(0); // hand slot: main hand
             // The held item, as a network item stack descriptor.
             write_item(&mut w, *item);
@@ -846,7 +846,10 @@ pub fn encode(packet: &Out) -> Vec<u8> {
                 .zigzag32(block[1])
                 .zigzag32(block[2]);
             w.u8(*face as u8);
-            w.varint(*hotbar_slot as u32);
+            // The slot is a signed varint here, and the action's slot below is
+            // unsigned: writing this one plain made every slot but zero read
+            // back as a negative number, which the server refused.
+            w.zigzag32(*hotbar_slot);
             w.u8(0); // hand: main
             write_item(&mut w, *item);
             w.f32(position[0]);
