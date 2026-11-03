@@ -741,7 +741,10 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(3); // ItemUseOnEntityTransaction
             w.varint(0); // actions count
             w.varlong(*runtime_id);
-            w.varint(*action as u32); // ItemUseOnActorActionType (plain varint)
+            // The action type is a compressed int32, so it is zigzag encoded.
+            // Everything else we send uses action 0, where the two encodings
+            // agree, so this is the first value that can show the difference.
+            w.zigzag32(*action);
             w.varint(*hotbar_slot as u32); // slot
             w.u8(0); // hand slot: main hand
             // The held item, as a network item stack descriptor.

@@ -135,6 +135,9 @@ struct Bridge {
     items: Mutex<Vec<Option<bedrock_core::protocol::ItemDescriptor>>>,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
+    /// The tick at which to ask the server for the inventories again, because a
+    /// pickup changed them; zero when nothing is pending.
+    resync_at: AtomicI64,
 }
 
 static BRIDGES: OnceLock<Mutex<HashMap<String, Arc<Bridge>>>> = OnceLock::new();
@@ -167,6 +170,7 @@ pub fn try_connect(
         collision: AtomicBool::new(false),
         hotbar: AtomicI64::new(0),
         items: Mutex::new(vec![None; 36]),
+        resync_at: AtomicI64::new(0),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1134,14 +1138,36 @@ mod translate {
                     }),
                 ))];
                 if *actor == ctx.runtime_id as u64 {
-                    // The server picked the stack up on its own side and never
-                    // told us what our inventory holds. Inventing the stack here
-                    // is what put our copy out of step with the server, so ask
-                    // it to resend the inventories and show what it holds.
-                    ctx.drops.remove(item);
-                    let _ = bridge
-                        .outbound
-                        .send(vec![bedrock_core::protocol::Out::InventoryMismatch]);
+                    // The server grants the pickup on its own side but applies it
+                    // a moment later, so add the stack here for an immediate
+                    // display, then ask for the authoritative contents once the
+                    // server has caught up.
+                    if let Some(drop) = ctx.drops.remove(item) {
+                        let mut items = bridge.items.lock().unwrap();
+                        if let Some(d) = descriptor(&drop) {
+                            let taken = items.iter_mut().find(|s| {
+                                s.as_ref().is_some_and(|e| {
+                                    e.runtime_id == d.runtime_id
+                                        && e.damage == d.damage
+                                        && e.count < 64
+                                })
+                            });
+                            match taken {
+                                Some(s) => {
+                                    let e = s.as_mut().unwrap();
+                                    e.count += d.count.min(64 - e.count);
+                                }
+                                None => {
+                                    if let Some(free) = items.iter().position(|s| s.is_none()) {
+                                        items[free] = Some(d);
+                                    }
+                                }
+                            }
+                        }
+                        events.push(inventory_content(ctx, bridge));
+                    }
+                    let now = bridge.tick.load(Ordering::Relaxed);
+                    bridge.resync_at.store(now + 10, Ordering::Relaxed);
                 }
                 events
             }
@@ -2008,7 +2034,16 @@ mod translate {
     pub fn heartbeat(bridge: &Bridge) -> Vec<bp::Out> {
         let pos = *bridge.position.lock().unwrap();
         let [yaw, pitch] = *bridge.rotation.lock().unwrap();
-        auth_input(bridge, pos, yaw, pitch)
+        let mut out = auth_input(bridge, pos, yaw, pitch);
+        // A pickup is granted on the server a moment after it happens, so ask
+        // for the inventories once it has had time to apply it. Asking straight
+        // away returned the state from before the pickup and undid it.
+        let due = bridge.resync_at.load(Ordering::Relaxed);
+        if due != 0 && bridge.tick.load(Ordering::Relaxed) >= due {
+            bridge.resync_at.store(0, Ordering::Relaxed);
+            out.push(bedrock_core::protocol::Out::InventoryMismatch);
+        }
+        out
     }
 
     /// Java serverbound → Bedrock.
