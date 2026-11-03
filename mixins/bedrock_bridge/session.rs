@@ -1754,12 +1754,33 @@ mod translate {
                     velocity: [velocity[0] as f64, velocity[1] as f64, velocity[2] as f64],
                 },
             )))],
-            bp::Packet::Animate { action, runtime_id } => vec![Event::Packet(Box::new(
-                play::Clientbound::Animate(play::Animate {
-                    id: *runtime_id as i32,
-                    action: *action as u8,
-                }),
-            ))],
+            // Bedrock's `Animate`: 1 swing, 3 wake up, 4 critical hit, 5 magic
+            // critical hit. Horizon has no swing action on `Animate` any more
+            // (its actions are 0 wake up, 1 crit, 2 magic crit), so a swing
+            // goes out as its own packet and only real crits as particles.
+            bp::Packet::Animate { action, runtime_id } => {
+                let id = *runtime_id as i32;
+                match *action {
+                    1 => vec![Event::Packet(Box::new(play::Clientbound::SwingAnimation(
+                        play::SwingAnimation {
+                            id,
+                            hand: 0,
+                            kind: 1,
+                            duration: 6,
+                        },
+                    )))],
+                    3 => vec![Event::Packet(Box::new(play::Clientbound::Animate(
+                        play::Animate { id, action: 0 },
+                    )))],
+                    4 => vec![Event::Packet(Box::new(play::Clientbound::Animate(
+                        play::Animate { id, action: 1 },
+                    )))],
+                    5 => vec![Event::Packet(Box::new(play::Clientbound::Animate(
+                        play::Animate { id, action: 2 },
+                    )))],
+                    _ => Vec::new(),
+                }
+            }
             bp::Packet::SetSpawnPosition { position } => vec![Event::Packet(Box::new(
                 play::Clientbound::SetDefaultSpawnPosition(play::SetDefaultSpawnPosition {
                     pos: play::GlobalPos {
