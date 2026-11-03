@@ -1541,25 +1541,42 @@ mod translate {
                 }),
             ))],
             bp::Packet::RemoveEntity(unique) => {
-                // The server names the entity by its unique id here, not by the
-                // runtime id the game was given, so resolve it first: without
-                // that no removal ever matched an entity and collected stacks
-                // stayed drawn.
                 let id = ctx.uniques.remove(unique).unwrap_or(*unique);
-                ctx.entities.remove(&id);
-                ctx.drops.remove(&id);
                 bedrock_core::nethernet::trace(format!("ITEM/ACTOR REMOVE uid={unique} id={id}"));
-                let owner = ctx.drop_owner.remove(&id).unwrap_or(id);
-                if ctx.drop_owner.values().any(|o| *o == owner) {
-                    return drop_stack(ctx, owner)
-                        .map_or_else(Vec::new, |stack| vec![drop_stack_data(owner, stack)]);
+                // The server folds a pile of dropped stacks by taking the
+                // absorbed actors away. Each of them still stands for a part of
+                // that pile, so keep it on the ground and take it away with the
+                // stack it joined: removing them here is what collapsed twelve
+                // thrown blocks into a single one.
+                if let Some(item) = ctx.drops.get(&id).cloned() {
+                    let joined = ctx
+                        .drops
+                        .iter()
+                        .find(|(other, d)| {
+                            **other != id
+                                && d.runtime_id == item.runtime_id
+                                && d.damage == item.damage
+                        })
+                        .map(|(other, _)| *other);
+                    if let Some(parent) = joined {
+                        ctx.drop_children.entry(parent).or_default().push(id);
+                        return Vec::new();
+                    }
                 }
-                ctx.entities.remove(&owner);
-                vec![Event::Packet(Box::new(
-                    play::Clientbound::RemoveEntities(play::RemoveEntities {
-                        ids: vec![owner as i32],
-                    }),
-                ))]
+                let children = ctx.drop_children.remove(&id).unwrap_or_default();
+                let mut gone = vec![id];
+                gone.extend(children);
+                let mut events = Vec::new();
+                for entity in gone {
+                    ctx.entities.remove(&entity);
+                    ctx.drops.remove(&entity);
+                    events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
+                        play::RemoveEntities {
+                            ids: vec![entity as i32],
+                        },
+                    ))));
+                }
+                events
             }
             bp::Packet::Disconnect(d) => vec![Event::Disconnected {
                 reason: if d.message.is_empty() {
