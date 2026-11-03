@@ -541,3 +541,39 @@ content and some addon behaviour will be approximations.
 - No hardcoded machine paths in code; use env and temp dirs.
 - Scope structural edits precisely. A global search for `window_id` in `packets.rs` hits
   `ContainerOpen`, not `MobEquipment`; that mistake cost a compile and a revert.
+
+## Lighting (current state)
+
+The Bedrock stream carries **no light** at all — chunks are blocks, block
+actors and a heightmap, and a Bedrock client lights itself. A Java client
+trusts the light it is given, so the bridge has to produce it.
+
+Two attempts are in the tree and neither is the answer:
+
+- A flood fill (sky + block light over the column). Correct in shape, but the
+  renderer and the fill disagree about what a level means, so slopes band.
+- The current heightmap engine: sky light 15 at and above the surface, zero
+  below; block light as stamped spheres per emitter. Surface and caves read
+  well; walls still show bands.
+
+**The next step is to stop hand-rolling it.** The game computes light itself
+for LAN hosts: `crates/horizon-client/src/lan/chunks.rs` — `light_sections`,
+`light_masks`, `sent_layers`, `light_data_of`, plus the `LightEngine` in
+`crates/horizon-world/src/level/tick.rs`. `light_sections` takes
+`&[Arc<Section>]`, which are the same sections the bridge already builds in
+`column()` for the chunk packet, so there is no conversion layer — hand them
+over and let `light_data_of` fill the chunk. `light_update(chunk, changed)`
+then gives incremental relighting on block changes, which is also still
+missing (a placed torch does not relight until the chunk reloads).
+
+Needs `pub(crate)` on those helpers so the injected bridge can reach them.
+
+## Pitfalls hit in this area
+
+- Bedrock chunks carry no light; do not look for it.
+- The light arrays are 98,304 bytes; an index with a negative coordinate wraps
+  to a huge usize and panics the session thread. That panic looks like "stuck
+  on loading terrain, then kicked into an empty world" — read the panic line
+  before optimising anything.
+- Read crashes from the play log first: `crates/horizon-client/src/net.rs:<n>`
+  maps into the injected `session.rs`.
