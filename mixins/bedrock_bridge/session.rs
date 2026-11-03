@@ -1137,6 +1137,17 @@ mod translate {
                         amount: 1,
                     }),
                 ))];
+                // Bedrock destroys the actor on this packet; Java keeps the
+                // entity until told to remove it, which the server does with a
+                // separate packet. Without this the items absorbed into a
+                // merged stack stayed on the ground for the game to render.
+                ctx.entities.remove(item);
+                ctx.drops.remove(item);
+                events.push(Event::Packet(Box::new(
+                    play::Clientbound::RemoveEntities(play::RemoveEntities {
+                        ids: vec![*item as i32],
+                    }),
+                )));
                 if *actor == ctx.runtime_id as u64 {
                     // The server grants the pickup on its own side but applies it
                     // a moment later, and synthesising the stack here crashed the
