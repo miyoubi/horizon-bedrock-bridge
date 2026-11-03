@@ -1797,7 +1797,7 @@ mod translate {
                     return Vec::new();
                 };
                 let degrees =
-                    |v: Option<u8>, last: f32| v.map_or(last, |v| f32::from(v) * (360.0 / 256.0));
+                    |v: Option<i8>, last: f32| v.map_or(last, |v| f32::from(v) * (360.0 / 256.0));
                 // Bedrock sends (pitch, yaw, head yaw).
                 let pitch = degrees(m.rotation[0], last_pitch);
                 let yaw = degrees(m.rotation[1], last_yaw);

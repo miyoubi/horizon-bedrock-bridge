@@ -607,9 +607,9 @@ impl MoveActorDelta {
                 Ok(None)
             }
         }
-        fn opt_u8(r: &mut Reader) -> Result<Option<u8>> {
+        fn opt_i8(r: &mut Reader) -> Result<Option<i8>> {
             if r.bool()? {
-                Ok(Some(r.u8()?))
+                Ok(Some(r.i8()?))
             } else {
                 Ok(None)
             }
@@ -617,7 +617,7 @@ impl MoveActorDelta {
         Ok(MoveActorDelta {
             runtime_id: r.varlong()?,
             position: [opt_f32(r)?, opt_f32(r)?, opt_f32(r)?],
-            rotation: [opt_u8(r)?, opt_u8(r)?, opt_u8(r)?],
+            rotation: [opt_i8(r)?, opt_i8(r)?, opt_i8(r)?],
             on_ground: r.bool()?,
             force_move: r.bool()?,
             force_move_local_entity: r.bool()?,
@@ -845,11 +845,11 @@ impl MoveEntityAbsolute {
         let runtime_id = r.varlong()?;
         let flags = r.u8()?;
         let position = [r.f32()?, r.f32()?, r.f32()?];
-        // Rotation bytes are 360/256 degrees.
-        let to_deg = |b: u8| f32::from(b) * (360.0 / 256.0);
-        let pitch = to_deg(r.u8()?);
-        let head_yaw = to_deg(r.u8()?);
-        let yaw = to_deg(r.u8()?);
+        // Rotation bytes are signed 360/256 degrees, in (pitch, yaw, head).
+        let to_deg = |b: i8| f32::from(b) * (360.0 / 256.0);
+        let pitch = to_deg(r.i8()?);
+        let yaw = to_deg(r.i8()?);
+        let head_yaw = to_deg(r.i8()?);
         Ok(MoveEntityAbsolute {
             runtime_id,
             on_ground: flags & 1 != 0,
