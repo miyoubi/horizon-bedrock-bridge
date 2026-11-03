@@ -157,6 +157,8 @@ struct Bridge {
     /// The id of the next inventory move. The server answers each request with
     /// the same id, so the two can be paired up.
     request_id: AtomicI32,
+    /// The container the server opened, if one is open.
+    window: Mutex<Option<OpenWindow>>,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
     /// The tick at which to ask the server for the inventories again, because a
@@ -202,6 +204,94 @@ impl Default for Vitals {
     }
 }
 
+/// A container the server opened. Bedrock names the container in every packet
+/// about it instead of numbering it, so the name is kept from the content the
+/// server sent and quoted back when the game moves an item.
+struct OpenWindow {
+    /// The Bedrock container id, which doubles as the game's window id.
+    id: u8,
+    /// The Bedrock window type it was opened as, which closing it has to name.
+    bedrock_type: u8,
+    /// Which menu the game shows for it, and how many slots it holds.
+    kind: WindowKind,
+    title: String,
+    slots: Vec<Option<bedrock_core::protocol::ItemDescriptor>>,
+    name: Option<bedrock_core::protocol::FullContainerName>,
+}
+
+impl OpenWindow {
+    fn store(&mut self, slot: usize, item: Option<bedrock_core::protocol::ItemDescriptor>) {
+        if let Some(entry) = self.slots.get_mut(slot) {
+            *entry = item;
+        }
+    }
+}
+
+/// The container menus the bridge can show. Everything else is closed again
+/// rather than opened as a screen whose clicks would go nowhere.
+#[derive(Clone, Copy, PartialEq)]
+enum WindowKind {
+    /// A chest, barrel, shulker box or chest minecart: 27 slots.
+    Container27,
+}
+
+impl WindowKind {
+    fn of(bedrock_type: u8) -> Option<WindowKind> {
+        match bedrock_type {
+            // Container, chest minecart and chest boat all hold 27 slots.
+            0 | 10 | 34 => Some(WindowKind::Container27),
+            _ => None,
+        }
+    }
+
+    fn slots(self) -> usize {
+        match self {
+            WindowKind::Container27 => 27,
+        }
+    }
+
+    /// The game's menu id for it.
+    fn menu(self) -> i32 {
+        match self {
+            // minecraft:generic_9x3
+            WindowKind::Container27 => 2,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            WindowKind::Container27 => "Container",
+        }
+    }
+
+    /// Where the player's own slots sit in the game's menu for it: the main
+    /// inventory after the container's slots, then the hotbar.
+    fn java_player_slot(self, slot: u8) -> Option<i16> {
+        let start = self.slots() as i16;
+        let hotbar = start + 27;
+        if slot < 9 {
+            Some(hotbar + i16::from(slot))
+        } else if slot < 36 {
+            Some(start + i16::from(slot) - 9)
+        } else {
+            None
+        }
+    }
+
+    /// The other direction, for a slot the game names.
+    fn bedrock_player_slot(self, java: i16) -> Option<u8> {
+        let start = self.slots() as i16;
+        let hotbar = start + 27;
+        if java >= hotbar && java < hotbar + 9 {
+            Some((java - hotbar) as u8)
+        } else if java >= start && java < start + 27 {
+            Some((java - start + 9) as u8)
+        } else {
+            None
+        }
+    }
+}
+
 static BRIDGES: OnceLock<Mutex<HashMap<String, Arc<Bridge>>>> = OnceLock::new();
 
 fn bridges() -> &'static Mutex<HashMap<String, Arc<Bridge>>> {
@@ -241,6 +331,7 @@ pub fn try_connect(
         offhand: Mutex::new(None),
         cursor: Mutex::new(None),
         request_id: AtomicI32::new(1),
+        window: Mutex::new(None),
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
         respawn_asked: AtomicBool::new(false),
@@ -596,7 +687,7 @@ fn run(
 // Translation: Bedrock packets → Horizon's Java clientbound packets.
 // -------------------------------------------------------------------------
 mod translate {
-    use super::{Bridge, Event};
+    use super::{Bridge, Event, OpenWindow, WindowKind};
     use bedrock_core::protocol as bp;
     use crate::chunk::{
         BIOME_STRATEGY, Chunk, Section as ClientSection, Light as ClientLight,
@@ -2476,14 +2567,20 @@ mod translate {
                 if let Some(item) = c.slots.get(40) {
                     *bridge.offhand.lock().unwrap() = descriptor(item);
                 }
-                vec![Event::Packet(Box::new(
+                let mut events = vec![Event::Packet(Box::new(
                     play::Clientbound::ContainerSetContent(play::ContainerSetContent {
                         container: 0,
                         state: 0,
                         items,
                         carried: None,
                     }),
-                ))]
+                ))];
+                // The same slots are shown inside an open window's menu.
+                let guard = bridge.window.lock().unwrap();
+                if let Some(window) = guard.as_ref() {
+                    events.push(window_content(ctx, bridge, window));
+                }
+                events
             }
             // The server's answer to an inventory move: it settles the counts
             // and says which stacks it acted on.
@@ -2511,12 +2608,49 @@ mod translate {
                     return Vec::new();
                 };
                 let item = map_item(ctx, &s.item);
-                vec![Event::Packet(Box::new(
+                let mut events = vec![Event::Packet(Box::new(
                     play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
                         container: 0,
                         state: 0,
                         slot,
                         item,
+                    }),
+                ))];
+                // The player's slots are shown again inside an open window's
+                // menu, so they have to be updated there too.
+                let guard = bridge.window.lock().unwrap();
+                if let Some(window) = guard.as_ref() {
+                    if let Some(event) = window_player_slot(ctx, bridge, window, s.slot as u8) {
+                        events.push(event);
+                    }
+                }
+                events
+            }
+            // A slot of a container the server opened.
+            bp::Packet::InventorySlot(s) => {
+                let mut guard = bridge.window.lock().unwrap();
+                let Some(window) = guard.as_mut() else {
+                    return Vec::new();
+                };
+                if s.window_id != u32::from(window.id) {
+                    return Vec::new();
+                }
+                if s.container.is_some() {
+                    window.name = s.container;
+                }
+                let Ok(index) = usize::try_from(s.slot) else {
+                    return Vec::new();
+                };
+                window.store(index, descriptor(&s.item));
+                if index >= window.kind.slots() {
+                    return Vec::new();
+                }
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                        container: i32::from(window.id),
+                        state: 0,
+                        slot: index as i16,
+                        item: map_item(ctx, &s.item),
                     }),
                 ))]
             }
@@ -2530,7 +2664,61 @@ mod translate {
                     }),
                 ))]
             }
+            // A container the server opened. Bedrock sends no title with it, so
+            // the game is given the name of the kind of menu it is. A kind the
+            // bridge cannot translate is closed again rather than shown, since
+            // its clicks would go nowhere.
+            bp::Packet::ContainerOpen(c) => {
+                let Some(kind) = WindowKind::of(c.window_type) else {
+                    bedrock_core::nethernet::trace(format!(
+                        "container type {} is not supported; refusing it",
+                        c.window_type
+                    ));
+                    ctx.requests.push(bp::Out::ContainerClose {
+                        window_id: c.window_id,
+                        window_type: c.window_type,
+                    });
+                    return Vec::new();
+                };
+                let window = OpenWindow {
+                    id: c.window_id,
+                    kind,
+                    title: kind.title().to_string(),
+                    slots: vec![None; kind.slots()],
+                    name: None,
+                    bedrock_type: c.window_type,
+                };
+                let title = window.title.clone();
+                let event = Event::Packet(Box::new(play::Clientbound::OpenScreen(
+                    play::OpenScreen {
+                        container: i32::from(c.window_id),
+                        menu: kind.menu(),
+                        title: text_component(&title),
+                    },
+                )));
+                *bridge.window.lock().unwrap() = Some(window);
+                vec![event]
+            }
+            // The contents of an open container: the game shows the container's
+            // slots along with the player's, as one menu.
+            bp::Packet::InventoryContent(c) if c.window_id != 0 => {
+                let mut guard = bridge.window.lock().unwrap();
+                let Some(window) = guard.as_mut() else {
+                    return Vec::new();
+                };
+                if c.window_id != u32::from(window.id) {
+                    return Vec::new();
+                }
+                if c.container.is_some() {
+                    window.name = c.container;
+                }
+                for (i, item) in c.slots.iter().enumerate() {
+                    window.store(i, descriptor(item));
+                }
+                vec![window_content(ctx, bridge, window)]
+            }
             bp::Packet::ContainerClose { window_id } => {
+                *bridge.window.lock().unwrap() = None;
                 vec![Event::Packet(Box::new(play::Clientbound::ContainerClose(
                     play::ContainerClose {
                         container: i32::from(*window_id),
@@ -2776,12 +2964,19 @@ mod translate {
         })
     }
 
-    /// What the bridge believes is in a slot the server names.
+    /// What the bridge believes is in a slot the server names. A container the
+    /// server opened is named by the server rather than numbered, so it is
+    /// matched against the open window first.
     fn item_at(
         bridge: &Bridge,
         container: u8,
         slot: u8,
     ) -> Option<bedrock_core::protocol::ItemDescriptor> {
+        if let Some(window) = bridge.window.lock().unwrap().as_ref() {
+            if window.name.map(|name| name.name) == Some(container) {
+                return window.slots.get(usize::from(slot)).copied().flatten();
+            }
+        }
         match container {
             CONTAINER_COMBINED => bridge
                 .items
@@ -2810,6 +3005,12 @@ mod translate {
         slot: u8,
         item: Option<bedrock_core::protocol::ItemDescriptor>,
     ) {
+        if let Some(window) = bridge.window.lock().unwrap().as_mut() {
+            if window.name.map(|name| name.name) == Some(container) {
+                window.store(usize::from(slot), item);
+                return;
+            }
+        }
         match container {
             CONTAINER_COMBINED => {
                 if let Some(entry) = bridge
@@ -2844,35 +3045,135 @@ mod translate {
         bp::SlotRef::new(container, slot, stack_id)
     }
 
+    /// Which server slot a click on the game's menu refers to, whether that is
+    /// the player's own window or a container the server opened.
+    fn click_slot(bridge: &Bridge, container: i32, slot: i16) -> Option<bp::SlotRef> {
+        if let Some(window) = bridge.window.lock().unwrap().as_ref() {
+            if container != i32::from(window.id) {
+                return None;
+            }
+            let count = window.kind.slots() as i16;
+            if (0..count).contains(&slot) {
+                let item = window.slots.get(slot as usize).copied().flatten();
+                return Some(bp::SlotRef {
+                    container: window.name.unwrap_or_default(),
+                    slot: slot as u8,
+                    stack_id: item.and_then(|d| d.net_id).map_or(0, |id| id as i32),
+                });
+            }
+            let bedrock = window.kind.bedrock_player_slot(slot)?;
+            return Some(slot_ref(bridge, CONTAINER_COMBINED, bedrock));
+        }
+        if container != 0 {
+            return None;
+        }
+        let (name, at) = bedrock_slot_of(slot)?;
+        Some(slot_ref(bridge, name, at))
+    }
+
+    /// The whole menu of an open window as the game wants it: the container's
+    /// slots and then the player's.
+    fn window_content(ctx: &Context, bridge: &Bridge, window: &OpenWindow) -> Event {
+        let mut slots: Vec<Option<Stack>> =
+            (0..window.kind.slots() + 36).map(|_| None).collect();
+        for (i, entry) in window.slots.iter().enumerate() {
+            if let Some(d) = entry {
+                slots[i] = map_item_by_id(ctx, d.runtime_id, i32::from(d.count));
+            }
+        }
+        for (i, entry) in bridge.items.lock().unwrap().iter().enumerate() {
+            let Some(d) = entry else { continue };
+            let Some(java) = window.kind.java_player_slot(i as u8) else {
+                continue;
+            };
+            if let Ok(index) = usize::try_from(java) {
+                if index < slots.len() {
+                    slots[index] = map_item_by_id(ctx, d.runtime_id, i32::from(d.count));
+                }
+            }
+        }
+        Event::Packet(Box::new(play::Clientbound::ContainerSetContent(
+            play::ContainerSetContent {
+                container: i32::from(window.id),
+                state: 0,
+                items: slots,
+                carried: None,
+            },
+        )))
+    }
+
+    /// One of the player's own slots, shown inside the open window's menu.
+    fn window_player_slot(
+        ctx: &Context,
+        bridge: &Bridge,
+        window: &OpenWindow,
+        bedrock_slot: u8,
+    ) -> Option<Event> {
+        let java = window.kind.java_player_slot(bedrock_slot)?;
+        let item = bridge
+            .items
+            .lock()
+            .unwrap()
+            .get(usize::from(bedrock_slot))
+            .copied()
+            .flatten();
+        Some(Event::Packet(Box::new(
+            play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                container: i32::from(window.id),
+                state: 0,
+                slot: java,
+                item: item.and_then(|d| map_item_by_id(ctx, d.runtime_id, i32::from(d.count))),
+            }),
+        )))
+    }
+
     /// Where a shift-click sends a stack: a stack of the same item with room
-    /// first, then the first empty slot. Returns the slot and how many items
-    /// fit. Like the game, a stack in the hotbar goes to the main inventory and
-    /// the other way round, and anything worn goes back to the inventory.
+    /// first, then the first empty slot, and how many items fit. Like the game,
+    /// a stack in the hotbar goes to the main inventory and the other way
+    /// round, and anything worn goes back to the inventory. With a container
+    /// open the two sides are the container and the player.
     fn quick_move_target(
         bridge: &Bridge,
-        from: u8,
-        from_slot: u8,
+        from: bp::SlotRef,
         item: bedrock_core::protocol::ItemDescriptor,
-    ) -> Option<(u8, u8, u8)> {
-        let region: Vec<u8> = match from {
-            CONTAINER_COMBINED if from_slot < 9 => (9..36).collect(),
-            CONTAINER_COMBINED => (0..9).collect(),
-            // Armour and the off hand hand their items back.
-            _ => (0..36).collect(),
-        };
-        for container in [CONTAINER_COMBINED] {
-            for slot in region.iter().copied() {
-                match item_at(bridge, container, slot) {
-                    Some(existing) if existing.runtime_id == item.runtime_id => {
-                        let room = 64u8.saturating_sub(existing.count.max(0) as u8);
-                        let count = (item.count.max(0) as u8).min(room);
-                        if count > 0 {
-                            return Some((container, slot, count));
-                        }
-                    }
-                    None => return Some((container, slot, item.count.max(1) as u8)),
-                    _ => {}
+    ) -> Option<(bp::SlotRef, u8)> {
+        // Which side of the open window the stack is on, and where it goes.
+        let (container, from_slot, region): (u8, u8, Vec<u8>) = {
+            let window = bridge.window.lock().unwrap();
+            match window.as_ref() {
+                Some(w) if w.name.map(|n| n.name) == Some(from.container.name) => {
+                    // Out of the container and into the player's inventory.
+                    (CONTAINER_COMBINED, 0, (0..36).collect())
                 }
+                Some(w) => {
+                    let name = w.name.unwrap_or_default().name;
+                    (name, from.slot, (0..w.kind.slots() as u8).collect())
+                }
+                None => match from.container.name {
+                    CONTAINER_COMBINED if from.slot < 9 => (CONTAINER_COMBINED, from.slot, (9..36).collect()),
+                    CONTAINER_COMBINED => (CONTAINER_COMBINED, from.slot, (0..9).collect()),
+                    // Armour and the off hand hand their items back.
+                    _ => (CONTAINER_COMBINED, from.slot, (0..36).collect()),
+                },
+            }
+        };
+        let _ = from_slot;
+        for slot in region {
+            match item_at(bridge, container, slot) {
+                Some(existing) if existing.runtime_id == item.runtime_id => {
+                    let room = 64u8.saturating_sub(existing.count.max(0) as u8);
+                    let count = (item.count.max(0) as u8).min(room);
+                    if count > 0 {
+                        return Some((slot_ref(bridge, container, slot), count));
+                    }
+                }
+                None => {
+                    return Some((
+                        slot_ref(bridge, container, slot),
+                        item.count.max(1) as u8,
+                    ));
+                }
+                _ => {}
             }
         }
         None
@@ -2882,21 +3183,17 @@ mod translate {
     /// The server owns the inventory, so nothing can be changed without asking
     /// it with the exact slots involved.
     fn container_click(bridge: &Bridge, c: &play::ContainerClick) -> Vec<bp::Out> {
-        if c.container != 0 {
-            // Only the player's own window for now.
-            return Vec::new();
-        }
         let request_id = bridge.request_id.fetch_add(1, Ordering::Relaxed);
         let cursor = slot_ref(bridge, CONTAINER_CURSOR, 0);
+        let clicked = clicked_slot(bridge, c);
         let actions = match c.input {
             // Pick up: the stack, or one item of it with the right button.
             0 => {
-                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                let Some(clicked) = clicked else {
                     return Vec::new();
                 };
-                let clicked = slot_ref(bridge, container, slot);
                 let held = *bridge.cursor.lock().unwrap();
-                let here = item_at(bridge, container, slot);
+                let here = item_at(bridge, clicked.container.name, clicked.slot);
                 let count = if c.button == 1 {
                     1
                 } else {
@@ -2933,31 +3230,31 @@ mod translate {
                     (None, None) => Vec::new(),
                 }
             }
-            // Shift-click: move the stack towards the other part of the window.
+            // Shift-click: move the stack towards the other side of the window.
             1 => {
-                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                let Some(clicked) = clicked else {
                     return Vec::new();
                 };
-                let Some(item) = item_at(bridge, container, slot) else {
+                let Some(item) = item_at(bridge, clicked.container.name, clicked.slot) else {
                     return Vec::new();
                 };
-                let Some((to, at, count)) = quick_move_target(bridge, container, slot, item) else {
+                let Some((to, count)) = quick_move_target(bridge, clicked, item) else {
                     return Vec::new();
                 };
                 vec![bp::StackAction::Take {
                     count,
-                    source: slot_ref(bridge, container, slot),
-                    destination: slot_ref(bridge, to, at),
+                    source: clicked,
+                    destination: to,
                 }]
             }
             // A number key: swap the slot with that hotbar slot.
             2 => {
-                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                let Some(clicked) = clicked else {
                     return Vec::new();
                 };
                 let hotbar = c.button.clamp(0, 8) as u8;
                 vec![bp::StackAction::Swap {
-                    first: slot_ref(bridge, container, slot),
+                    first: clicked,
                     second: slot_ref(bridge, CONTAINER_COMBINED, hotbar),
                 }]
             }
@@ -2974,10 +3271,10 @@ mod translate {
                         randomly: false,
                     }]
                 } else {
-                    let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                    let Some(clicked) = clicked else {
                         return Vec::new();
                     };
-                    let Some(item) = item_at(bridge, container, slot) else {
+                    let Some(item) = item_at(bridge, clicked.container.name, clicked.slot) else {
                         return Vec::new();
                     };
                     vec![bp::StackAction::Drop {
@@ -2986,7 +3283,7 @@ mod translate {
                         } else {
                             item.count.max(0) as u8
                         },
-                        source: slot_ref(bridge, container, slot),
+                        source: clicked,
                         randomly: false,
                     }]
                 }
@@ -2994,7 +3291,7 @@ mod translate {
             // Dragging: each slot the drag passes over gives one item to the
             // cursor, and the release leaves them there.
             5 => {
-                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                let Some(clicked) = clicked else {
                     return Vec::new();
                 };
                 let add = c.button == 1 || c.button == 5;
@@ -3003,17 +3300,17 @@ mod translate {
                 }
                 vec![bp::StackAction::Take {
                     count: 1,
-                    source: slot_ref(bridge, container, slot),
+                    source: clicked,
                     destination: cursor,
                 }]
             }
             // Double-click: collect the stacks that match what is on the
             // cursor, one slot at a time.
             6 => {
-                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                let Some(clicked) = clicked else {
                     return Vec::new();
                 };
-                let Some(here) = item_at(bridge, container, slot) else {
+                let Some(here) = item_at(bridge, clicked.container.name, clicked.slot) else {
                     return Vec::new();
                 };
                 let held = *bridge.cursor.lock().unwrap();
@@ -3022,12 +3319,12 @@ mod translate {
                         vec![bp::StackAction::Place {
                             count: holding.count.max(0) as u8,
                             source: cursor,
-                            destination: slot_ref(bridge, container, slot),
+                            destination: clicked,
                         }]
                     }
                     _ => vec![bp::StackAction::Take {
                         count: here.count.max(0) as u8,
-                        source: slot_ref(bridge, container, slot),
+                        source: clicked,
                         destination: cursor,
                     }],
                 }
@@ -3041,6 +3338,15 @@ mod translate {
             request_id,
             actions,
         }]
+    }
+
+    /// The server slot a click refers to, if the bridge knows it. A click
+    /// outside the window has no slot.
+    fn clicked_slot(bridge: &Bridge, c: &play::ContainerClick) -> Option<bp::SlotRef> {
+        if c.slot < 0 {
+            return None;
+        }
+        click_slot(bridge, c.container, c.slot)
     }
 
     /// The server's answer to a move. It names the slots it settled on, which is
@@ -3492,6 +3798,20 @@ mod translate {
                     position: pos,
                     block_id: 0,
                 }]
+            }
+            // The game closed a container: tell the server, which is the only
+            // side that can actually close it.
+            play::Serverbound::ContainerClose(c) => {
+                let window = bridge.window.lock().unwrap().take();
+                match window {
+                    Some(w) if i32::from(w.id) == c.container => {
+                        vec![bp::Out::ContainerClose {
+                            window_id: w.id,
+                            window_type: w.bedrock_type,
+                        }]
+                    }
+                    _ => Vec::new(),
+                }
             }
             // A click in the game's inventory: it becomes the move the server
             // wants, since the server owns the inventory.
