@@ -726,7 +726,10 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(ids::MOB_EQUIPMENT);
             w.varlong(*runtime_id);
             write_item(&mut w, None);
-            w.u8(*slot).u8(*window_id);
+            // Slot, selected slot and container id: three bytes, not two. The
+            // missing one truncated the packet, which is what made merely
+            // selecting an item drop the connection.
+            w.u8(*slot).u8(*slot).u8(*window_id);
         }
         Out::ItemUseOnEntity {
             runtime_id,

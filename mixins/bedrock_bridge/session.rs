@@ -1457,11 +1457,15 @@ mod translate {
                     pitch: 0.0,
                 }),
             ))],
-            bp::Packet::RemoveEntity(id) => vec![Event::Packet(Box::new(
-                play::Clientbound::RemoveEntities(play::RemoveEntities {
-                    ids: vec![*id as i32],
-                }),
-            ))],
+            bp::Packet::RemoveEntity(id) => {
+                ctx.entities.remove(id);
+                ctx.drops.remove(id);
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::RemoveEntities(play::RemoveEntities {
+                        ids: vec![*id as i32],
+                    }),
+                ))]
+            }
             bp::Packet::Disconnect(d) => vec![Event::Disconnected {
                 reason: if d.message.is_empty() {
                     format!("Bedrock disconnect reason {}", d.reason)
