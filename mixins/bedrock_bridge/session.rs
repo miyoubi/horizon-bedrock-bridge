@@ -159,6 +159,9 @@ struct Bridge {
     /// them. Bedrock carries hunger in its attributes and health in `SetHealth`,
     /// while Java sends all three together, so they are kept here.
     vitals: Mutex<Vitals>,
+    /// Whether the server has killed the player, so a `Respawn` is a real one
+    /// and not the one at the end of the join handshake.
+    dead: AtomicBool,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -217,6 +220,7 @@ pub fn try_connect(
         items: Mutex::new(vec![None; 36]),
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
+        dead: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1326,6 +1330,7 @@ mod translate {
             bp::Packet::SetHealth(health) => {
                 let mut vitals = bridge.vitals.lock().unwrap();
                 vitals.health = *health as f32;
+                bridge.dead.store(*health <= 0, Ordering::Relaxed);
                 let set = play::SetHealth {
                     health: vitals.health,
                     food: vitals.food,
@@ -1978,6 +1983,7 @@ mod translate {
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
                     bridge.respawn_due.store(now + 1500, Ordering::Relaxed);
+                    bridge.dead.store(true, Ordering::Relaxed);
                     return vec![Event::Packet(Box::new(
                         play::Clientbound::PlayerCombatKill(play::PlayerCombatKill {
                             id: id as i32,
@@ -2015,6 +2021,11 @@ mod translate {
             // alone is not one Java understands, which is why the screen used
             // to sit there until the client rejoined.
             bp::Packet::Respawn { position, state } if *state == 1 => {
+                // The same handshake ends the join too, before the player has
+                // ever been hurt; only a death needs the Java respawn.
+                if !bridge.dead.swap(false, Ordering::Relaxed) {
+                    return Vec::new();
+                }
                 // The server has respawned us; the nudge its death screen asked
                 // for has been answered.
                 bridge.respawn_due.store(0, Ordering::Relaxed);
@@ -2039,6 +2050,14 @@ mod translate {
                         yaw: ctx.spawn_yaw,
                         pitch: ctx.spawn_pitch,
                         relatives: 0,
+                    },
+                ))));
+                // The game's respawn starts its level tracker again, and it
+                // leaves `WaitingForServer` only on this event.
+                events.push(Event::Packet(Box::new(play::Clientbound::GameEvent(
+                    play::GameEvent {
+                        event: 13,
+                        param: 0.0,
                     },
                 ))));
                 events
