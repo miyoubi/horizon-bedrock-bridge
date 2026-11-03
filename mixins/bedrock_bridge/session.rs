@@ -1138,10 +1138,6 @@ mod translate {
                 let owner: Option<u64> = None;
                 ctx.drops.insert(*runtime_id, item.clone());
                 ctx.uniques.insert(*unique_id as u64, *runtime_id);
-                bedrock_core::nethernet::trace(format!(
-                    "ITEM SPAWN id={runtime_id} stack={:?} owner={owner:?}",
-                    (item.runtime_id, item.count)
-                ));
                 let merged = match owner {
                     Some(owner) => {
                         ctx.drop_owner.insert(*runtime_id, owner);
@@ -1189,12 +1185,6 @@ mod translate {
             // server sends no inventory packet for the pickup, so put the stack
             // into the player's first free slot ourselves.
             bp::Packet::TakeItemEntity { item, actor } => {
-                bedrock_core::nethernet::trace(format!(
-                    "PICKUP item={item} actor={actor} self={} cached={:?} drops={}",
-                    ctx.runtime_id,
-                    ctx.drops.get(item).map(|d| (d.runtime_id, d.count)),
-                    ctx.drops.len()
-                ));
                 if *actor != ctx.runtime_id as u64 && ctx.drops.contains_key(item) {
                     // The server folded this stack into another dropped one. Keep
                     // it on the ground to be seen on its own, and remember the
@@ -1542,7 +1532,6 @@ mod translate {
             ))],
             bp::Packet::RemoveEntity(unique) => {
                 let id = ctx.uniques.remove(unique).unwrap_or(*unique);
-                bedrock_core::nethernet::trace(format!("ITEM/ACTOR REMOVE uid={unique} id={id}"));
                 // The server folds a pile of dropped stacks by taking the
                 // absorbed actors away. Each of them still stands for a part of
                 // that pile, so keep it on the ground and take it away with the
@@ -1751,15 +1740,6 @@ mod translate {
             // Bedrock order, which is not Java's inventory-menu order, so place
             // each item at its Java slot. Other windows still need mapping.
             bp::Packet::InventoryContent(c) if c.window_id == 0 => {
-                bedrock_core::nethernet::trace(format!(
-                    "SERVER CONTENT {:?}",
-                    c.slots
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, i)| i.runtime_id != 0)
-                        .map(|(n, i)| (n, i.runtime_id, i.count))
-                        .collect::<Vec<_>>()
-                ));
                 let mut items: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
                 for (i, item) in c.slots.iter().enumerate() {
                     let Some(slot) = java_inventory_slot(i as u32) else {
@@ -1785,11 +1765,6 @@ mod translate {
                 ))]
             }
             bp::Packet::InventorySlot(s) if s.window_id == 0 => {
-                bedrock_core::nethernet::trace(format!(
-                    "SERVER SLOT {} = {:?}",
-                    s.slot,
-                    (s.item.runtime_id, s.item.count)
-                ));
                 if let Ok(index) = usize::try_from(s.slot) {
                     let mut held = bridge.items.lock().unwrap();
                     if let Some(slot) = held.get_mut(index) {
