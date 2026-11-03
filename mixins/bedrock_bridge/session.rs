@@ -364,6 +364,7 @@ fn run(
         wanted_center: None,
         entities: std::collections::HashMap::new(),
         drops: std::collections::HashMap::new(),
+        drop_owner: std::collections::HashMap::new(),
         name: name.to_string(),
         items: Vec::new(),
         biomes,
@@ -548,6 +549,11 @@ mod translate {
         /// The stack each dropped item entity carries, so a pickup can put it
         /// into the inventory: the server sends no inventory packet for one.
         pub drops: std::collections::HashMap<u64, bp::NetworkItem>,
+        /// Which drawn item entity each item actor belongs to. A Bedrock client
+        /// renders dropped items of one kind that lie together as a single
+        /// stack while the server keeps them as separate actors, so several
+        /// actors share one entity here and it goes when the last of them does.
+        pub drop_owner: std::collections::HashMap<u64, u64>,
         /// The player's own name, for its tab entry: the server's `PlayerList`
         /// entry for the local player carries no name.
         pub name: String,
@@ -897,6 +903,39 @@ mod translate {
         }
     }
 
+    /// The stack a drawn item entity shows: every actor folded into it, summed.
+    fn drop_stack(ctx: &Context, owner: u64) -> Option<Stack> {
+        let mut net: Option<&bp::NetworkItem> = None;
+        let mut count: i32 = 0;
+        for (actor, item) in ctx.drops.iter() {
+            if ctx.drop_owner.get(actor) == Some(&owner) {
+                net.get_or_insert(item);
+                count += i32::from(item.count);
+            }
+        }
+        let net = net?;
+        let id = item_by_network_id(ctx.mappings, ctx.builtin, &ctx.items, net.runtime_id);
+        if id == 0 {
+            return None;
+        }
+        Some(Stack::new(id, count.max(1)))
+    }
+
+    /// An item entity's stack as a data update, which is how a merged stack
+    /// shows its new count without being respawned.
+    fn drop_stack_data(owner: u64, stack: Stack) -> Event {
+        Event::Packet(Box::new(play::Clientbound::SetEntityData(
+            play::SetEntityData {
+                id: owner as i32,
+                values: vec![(
+                    8,
+                    horizon_protocol::entity_data::serializer::ITEM_STACK,
+                    horizon_protocol::entity_data::Value::Item(Some(stack)),
+                )],
+            },
+        )))
+    }
+
     pub fn clientbound(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
         match packet {
             bp::Packet::StartGame(g) => {
@@ -1083,14 +1122,54 @@ mod translate {
                 let Some(kind) = entity_type_id(ctx, &java_name) else {
                     return Vec::new();
                 };
-                let stack = map_item(ctx, item);
+                // A Bedrock client draws dropped items of one kind that lie
+                // together as a single stack, while the server keeps them as
+                // separate actors. Fold this one into the entity already
+                // standing where it landed, or the game keeps drawing items
+                // the server has long since collected.
+                let owner = ctx
+                    .drop_owner
+                    .iter()
+                    .filter(|(actor, _)| {
+                        ctx.drops.get(*actor).is_some_and(|d| {
+                            d.runtime_id == item.runtime_id && d.damage == item.damage
+                        })
+                    })
+                    .filter(|(actor, _)| {
+                        ctx.entities.get(*actor).is_some_and(|e| {
+                            let dx = e.0[0] - position[0];
+                            let dy = e.0[1] - position[1];
+                            let dz = e.0[2] - position[2];
+                            dx * dx + dy * dy + dz * dz < 2.25
+                        })
+                    })
+                    .map(|(_, owner)| *owner)
+                    .next();
                 ctx.drops.insert(*runtime_id, item.clone());
                 bedrock_core::nethernet::trace(format!(
-                    "ITEM SPAWN id={runtime_id} stack={:?}",
+                    "ITEM SPAWN id={runtime_id} stack={:?} owner={owner:?}",
                     (item.runtime_id, item.count)
                 ));
-                ctx.entities
-                    .insert(*runtime_id, (*position, 0.0, 0.0, 0.0));
+                let merged = match owner {
+                    Some(owner) => {
+                        ctx.drop_owner.insert(*runtime_id, owner);
+                        owner
+                    }
+                    None => {
+                        ctx.drop_owner.insert(*runtime_id, *runtime_id);
+                        ctx.entities
+                            .insert(*runtime_id, (*position, 0.0, 0.0, 0.0));
+                        *runtime_id
+                    }
+                };
+                let shown = drop_stack(ctx, merged);
+                if merged != *runtime_id {
+                    // Already drawn: only the stack's count changes.
+                    return shown.map_or_else(Vec::new, |s| vec![drop_stack_data(merged, s)]);
+                }
+                let Some(stack) = shown.or_else(|| map_item(ctx, item)) else {
+                    return Vec::new();
+                };
                 vec![
                     Event::Packet(Box::new(play::Clientbound::AddEntity(play::AddEntity {
                         id: *runtime_id as i32,
@@ -1111,16 +1190,7 @@ mod translate {
                         head_yaw: 0,
                         data: 0,
                     }))),
-                    Event::Packet(Box::new(play::Clientbound::SetEntityData(
-                        play::SetEntityData {
-                            id: *runtime_id as i32,
-                            values: vec![(
-                                8,
-                                horizon_protocol::entity_data::serializer::ITEM_STACK,
-                                horizon_protocol::entity_data::Value::Item(stack),
-                            )],
-                        },
-                    ))),
+                    drop_stack_data(*runtime_id, stack),
                 ]
             }
             // Picking an item up: it flies to the actor and despawns. The
@@ -1142,16 +1212,24 @@ mod translate {
                     }),
                 ))];
                 // Bedrock destroys the actor on this packet; Java keeps the
-                // entity until told to remove it, which the server does with a
-                // separate packet. Without this the items absorbed into a
-                // merged stack stayed on the ground for the game to render.
+                // entity until told to remove it. The drawn stack goes only with
+                // the last actor folded into it, and until then it shows what is
+                // left.
                 ctx.entities.remove(item);
                 ctx.drops.remove(item);
-                events.push(Event::Packet(Box::new(
-                    play::Clientbound::RemoveEntities(play::RemoveEntities {
-                        ids: vec![*item as i32],
-                    }),
-                )));
+                let owner = ctx.drop_owner.remove(item).unwrap_or(*item);
+                if ctx.drop_owner.values().any(|o| *o == owner) {
+                    if let Some(stack) = drop_stack(ctx, owner) {
+                        events.push(drop_stack_data(owner, stack));
+                    }
+                } else {
+                    ctx.entities.remove(&owner);
+                    events.push(Event::Packet(Box::new(
+                        play::Clientbound::RemoveEntities(play::RemoveEntities {
+                            ids: vec![owner as i32],
+                        }),
+                    )));
+                }
                 if *actor == ctx.runtime_id as u64 {
                     // The server grants the pickup on its own side but applies it
                     // a moment later, and synthesising the stack here crashed the
@@ -1476,9 +1554,15 @@ mod translate {
                 ctx.entities.remove(id);
                 ctx.drops.remove(id);
                 bedrock_core::nethernet::trace(format!("ITEM/ACTOR REMOVE id={id}"));
+                let owner = ctx.drop_owner.remove(id).unwrap_or(*id);
+                if ctx.drop_owner.values().any(|o| *o == owner) {
+                    return drop_stack(ctx, owner)
+                        .map_or_else(Vec::new, |stack| vec![drop_stack_data(owner, stack)]);
+                }
+                ctx.entities.remove(&owner);
                 vec![Event::Packet(Box::new(
                     play::Clientbound::RemoveEntities(play::RemoveEntities {
-                        ids: vec![*id as i32],
+                        ids: vec![owner as i32],
                     }),
                 ))]
             }
