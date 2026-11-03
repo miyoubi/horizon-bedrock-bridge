@@ -104,6 +104,9 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
+    /// When to ask the server to revive the player, in epoch milliseconds.
+    /// Zero means alive.
+    respawn_due: AtomicI64,
     /// Last position sent to the server; rotation-only updates reuse it, so a
     /// MovePlayerRot never looks like a teleport to (0,0,0).
     position: Mutex<[f32; 3]>,
@@ -161,6 +164,7 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
+        respawn_due: AtomicI64::new(0),
         position: Mutex::new([0.0; 3]),
         rotation: Mutex::new([0.0; 2]),
         input: AtomicI64::new(0),
@@ -436,6 +440,26 @@ fn run(
         // never sees the player go silent (other clients would see it frozen).
         // Only once we are in-world: a `PlayerAuthInput` during login is an
         // unexpected packet and the server kicks with reason 49.
+        if ctx.runtime_id != 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let due = bridge.respawn_due.load(Ordering::Relaxed);
+            if due != 0 && now >= due {
+                bridge.respawn_due.store(0, Ordering::Relaxed);
+                let position = *bridge.position.lock().unwrap();
+                bedrock_core::nethernet::trace(format!("respawn at {position:?}"));
+                let packet = bedrock_core::protocol::Out::Respawn {
+                    position,
+                    state: 2,
+                    runtime_id: ctx.runtime_id,
+                };
+                if let Err(e) = client.send(&[packet]) {
+                    log::warn!("bedrock: respawn failed: {e}");
+                }
+            }
+        }
         if ctx.runtime_id != 0 && last_heartbeat.elapsed() >= std::time::Duration::from_millis(50) {
             let batch = translate::heartbeat(&bridge);
             if let Err(e) = client.send(&batch) {
@@ -1626,6 +1650,15 @@ mod translate {
                     // Our own death. The game shows its death screen from this
                     // packet and nothing else announces it, so the player died
                     // with no screen and stayed on their feet.
+                    // The game's death screen cannot be dismissed back to the
+                    // bridge -- pressing respawn sends it nothing -- so the
+                    // server is asked to revive us shortly after the screen
+                    // appears and the position packet that follows closes it.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    bridge.respawn_due.store(now + 1500, Ordering::Relaxed);
                     return vec![Event::Packet(Box::new(
                         play::Clientbound::PlayerCombatKill(play::PlayerCombatKill {
                             id: id as i32,
