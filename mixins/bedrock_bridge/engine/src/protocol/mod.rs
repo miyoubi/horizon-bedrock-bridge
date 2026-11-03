@@ -787,24 +787,48 @@ pub fn encode(packet: &Out) -> Vec<u8> {
         Out::ItemRelease {
             slot,
             count,
-            item: _,
+            item,
             position: _,
         } => {
-            // An item stack request with one drop action: the stack leaves the
-            // combined hotbar-and-inventory container (12) for the world.
-            w.varint(ids::ITEM_STACK_REQUEST);
-            w.varint(1); // one request
-            w.varint(0); // client request id
-            w.varint(1); // actions count
-            w.u8(3); // action: drop
-            w.u8(*count);
-            w.u8(12); // container: combined hotbar and inventory
-            w.varint(0); // dynamic container id
-            w.u8(*slot as u8);
-            w.varint(0); // stack net id: none
-            w.bool(false); // not random
-            w.varint(0); // strings to filter
-            w.varint(0); // strings-to-filter origin
+            // A drop is a normal transaction with two actions: the stack
+            // appears in the world from a world-interaction source, and leaves
+            // the inventory container. The world source carries no flag.
+            let held = item.unwrap_or_default();
+            let amount = *count as i16;
+            let dropped = ItemDescriptor {
+                count: amount,
+                ..held
+            };
+            let remaining = if held.count > amount {
+                ItemDescriptor {
+                    count: held.count - amount,
+                    ..held
+                }
+            } else {
+                ItemDescriptor::default()
+            };
+
+            w.varint(ids::INVENTORY_TRANSACTION);
+            w.varint(0); // legacy request id
+            w.bool(false); // no legacy data
+            w.varint(0); // NormalTransaction
+            w.varint(2); // actions count
+            // 1. the stack enters the world.
+            w.varint(2); // source: world interaction
+            w.bool(false); // no container id
+            w.bool(true); // flags present
+            w.varint(0); // no flag
+            w.varint(0); // slot
+            write_item(&mut w, None);
+            write_item(&mut w, Some(dropped));
+            // 2. the stack leaves the player's inventory.
+            w.varint(0); // source: container inventory
+            w.bool(true); // container id present
+            w.u8(0); // container id: the player's inventory
+            w.bool(false); // no flags
+            w.varint(*slot as u32);
+            write_item(&mut w, Some(held));
+            write_item(&mut w, Some(remaining));
         }
         Out::Text {
             kind,
