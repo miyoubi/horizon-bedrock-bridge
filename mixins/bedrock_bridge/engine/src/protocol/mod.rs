@@ -131,6 +131,13 @@ pub enum Packet {
     LevelSoundEvent,
     BossEvent,
     AvailableCommands,
+    /// An actor state change. Death (3) and instant death (61) mean the entity
+    /// is gone, whether or not the server removes it afterwards.
+    ActorEvent {
+        runtime_id: u64,
+        event: i32,
+        data: i32,
+    },
     /// The packet id is known but its body is not modelled here.
     Raw(u32, Vec<u8>),
     /// The packet id is unknown to this build.
@@ -290,6 +297,16 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
             packet_id: r.zigzag32()?,
             message: r.string()?,
         },
+        ids::ACTOR_EVENT => {
+            let runtime_id = r.varlong()?;
+            let event = r.varint()? as i32;
+            let data = r.varint()? as i32;
+            Packet::ActorEvent {
+                runtime_id,
+                event,
+                data,
+            }
+        }
         ids::DISCONNECT => Packet::Disconnect(Disconnect::read(&mut r)?),
         ids::SERVER_TO_CLIENT_HANDSHAKE => Packet::ServerToClientHandshake(r.string()?),
         ids::RESOURCE_PACKS_INFO => Packet::ResourcePacksInfo,

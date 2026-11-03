@@ -1567,6 +1567,41 @@ mod translate {
                 }
                 events
             }
+            // An entity died. The game is shown the death and the entity is
+            // taken away, rather than left standing as a corpse until the
+            // server gets round to removing it.
+            bp::Packet::ActorEvent {
+                runtime_id,
+                event,
+                data: _,
+            } if *event == 3 || *event == 61 => {
+                let id = *runtime_id;
+                if id == ctx.runtime_id as u64 {
+                    return Vec::new();
+                }
+                ctx.uniques.retain(|_, runtime| *runtime != id);
+                let children = ctx.drop_children.remove(&id).unwrap_or_default();
+                let mut gone = vec![id];
+                gone.extend(children);
+                let mut events = Vec::new();
+                for entity in gone {
+                    ctx.entities.remove(&entity);
+                    ctx.drops.remove(&entity);
+                    events.push(Event::Packet(Box::new(play::Clientbound::EntityEvent(
+                        play::EntityEvent {
+                            id: entity as i32,
+                            event: 3,
+                        },
+                    ))));
+                    events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
+                        play::RemoveEntities {
+                            ids: vec![entity as i32],
+                        },
+                    ))));
+                }
+                events
+            }
+            bp::Packet::ActorEvent { .. } => Vec::new(),
             bp::Packet::Disconnect(d) => vec![Event::Disconnected {
                 reason: if d.message.is_empty() {
                     format!("Bedrock disconnect reason {}", d.reason)

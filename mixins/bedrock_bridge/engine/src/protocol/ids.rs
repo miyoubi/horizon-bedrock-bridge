@@ -23,6 +23,7 @@ pub const MOVE_ACTOR_DELTA: u32 = 0x6f;
 pub const MOVE_PLAYER: u32 = 0x13;
 pub const UPDATE_BLOCK: u32 = 0x15;
 pub const LEVEL_EVENT: u32 = 0x19;
+pub const ACTOR_EVENT: u32 = 0x1b;
 pub const MOB_EFFECT: u32 = 0x1c;
 pub const UPDATE_ATTRIBUTES: u32 = 0x1d;
 pub const SET_COMMANDS_ENABLED: u32 = 0x3b;
