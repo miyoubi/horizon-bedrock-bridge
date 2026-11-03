@@ -1569,7 +1569,15 @@ mod translate {
             } if *event == 3 || *event == 61 => {
                 let id = *runtime_id;
                 if id == ctx.runtime_id as u64 {
-                    return Vec::new();
+                    // Our own death. The game shows its death screen from this
+                    // packet and nothing else announces it, so the player died
+                    // with no screen and stayed on their feet.
+                    return vec![Event::Packet(Box::new(
+                        play::Clientbound::PlayerCombatKill(play::PlayerCombatKill {
+                            id: id as i32,
+                            message: text_component("You died"),
+                        }),
+                    ))];
                 }
                 ctx.uniques.retain(|_, runtime| *runtime != id);
                 let children = ctx.drop_children.remove(&id).unwrap_or_default();
@@ -2206,6 +2214,18 @@ mod translate {
                 bridge.input.store(i64::from(p.flags), Ordering::Relaxed);
                 bedrock_core::nethernet::trace(format!("recv PlayerInput flags={:#04x}", p.flags));
                 Vec::new()
+            }
+            // The game asks to respawn when the death screen is dismissed.
+            // Bedrock respawns through its own handshake, sent as a client that
+            // is ready to spawn, and the server then places the player.
+            play::Serverbound::ClientCommand(c) if c.action == 0 => {
+                let position = *bridge.position.lock().unwrap();
+                let runtime_id = bridge.runtime_id.load(Ordering::Relaxed).max(0) as u64;
+                vec![bp::Out::Respawn {
+                    position,
+                    state: 2,
+                    runtime_id,
+                }]
             }
             // Swinging the arm. Bedrock has no local swing packet: it is an
             // `Animate` of the swing-arm action on the player's own runtime id.

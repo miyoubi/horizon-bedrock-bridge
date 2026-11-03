@@ -184,8 +184,14 @@ All pushed to `main` on the mod repo.
 - NetherNet join (signalling + ICE + data channel).
 - Bedrock login, resource packs, `StartGame`, spawn — the server logs the player.
 - Chunk streaming with correct block ids, heightmaps and heightmap-derived sky light.
+- **Terrain and entities at the same heights** — a live column reads bedrock at −64 through
+  grass at 68 to air, and the player stands on it (§10.1).
 - **The loading screen closes** (requires `GameEvent{event:13}`).
 - Entity movement, block changes, player names in the player list, server-list MOTD.
+- `ItemRegistry` (162) decoded, and `MobEquipment` translated to `SetEquipment`.
+- **Biome tint** — the `minecraft:worldgen/biome` registry is sent so grass and plants are
+  green instead of falling back to badlands (§8.15); the world is plains everywhere for now.
+- `SetHealth` decodes (it is a `zigzag32`, §8.16).
 - A probe held a NetherNet session for 90 s with no ICE failure.
 
 ---
@@ -201,7 +207,11 @@ Reuse these rather than re-deriving them.
   string**; pack ids only for `send_packs`.
 - **`RequestChunkRadius`:** varint radius plus a trailing `u8` max radius.
 - **`SubChunkRequest` (175):** `dimension` **zigzag32**, `center = [chunkX, subChunkY, chunkZ]`,
-  then offsets `[i8;3]`.
+  then offsets `[i8;3]`. **The sub-chunk Y is an absolute section index** (`floor(blockY/16)`),
+  so the overworld runs `-4..=19` (min_y −64 → +319). A real client sends base Y **0** and
+  carries the absolute index in the offset; the reply's section is `center.y + offset.y`.
+  The Java section slot is that index **plus** `|min_y|/16` (4), which is what `column()`
+  does. Using a non-zero base Y or subtracting 4 puts every section 64 blocks off (§10.1).
 - **`LevelChunk`:** `x zz32, z zz32, dimension zz32, sub_chunk_count varint,
   highest_subchunk_count option zigzag32, cache_enabled bool, blobs array(varint, lu64),
   payload ByteArray, client_biome_update bool`.
@@ -236,10 +246,16 @@ Reuse these rather than re-deriving them.
   bool + one varint net id, varint blockRuntimeId, string userData. The non-cereal
   network form instead uses a varint id where `0` means empty — that is the form the
   inventory packets use.
-- **`StartGame` item palette:** follows the block palette — varint count, then per entry
-  `identifier string`, `i16 network id`, `bool component_based`, and for component-based
-  items a varint version and, from version 1, a varint component count of
-  `name + network NBT`.
+- **`ItemRegistry` (162):** the item palette — varint count, then per entry
+  `identifier string`, `i16 network id`, `bool component_based`, **version** (`zigzag32`:
+  0 legacy, 1 data-driven, 2 none) and the item's **component NBT** (a named compound).
+  The version and NBT are **always** present, whatever the flag says; reading them only
+  for component-based entries desynchronises the stream.
+- **`StartGame` has no item palette in 1.26.** It ends at the block palette
+  (`block_properties`: varint count of `identifier + state NBT`) after `enchantment_seed`;
+  the items arrive in `ItemRegistry` (162), which is sent once, right after `StartGame`.
+  (An earlier build read an item palette out of `StartGame`, ran off the end of the
+  packet and dropped the whole `StartGame` — 0f50d2f, fixed here.)
 
 **Horizon packets to target:** `BlockUpdate {pos, state}` (play.rs:77),
 `SectionBlocksUpdate` (:803), `PlayerInfoUpdate {actions: u8, entries}` (:675) with
@@ -305,6 +321,19 @@ and `Stack {item: i32, count: i32, added, removed, wire}` with `Stack::new(item,
     `remote.rs:4646`, `self.player = Some(…)` at `:4687`).
 14. **`remote_chunk_in_range`** = `view_distance.max(2) + 3` (`remote.rs:1712`), so the
     "Ignoring chunk since it's not in the view range" warnings are normal.
+15. **Biome ids are network-registry indices, and an empty registry tints the world wrong.**
+    `set_registries` (`remote.rs:1572`) builds the chunk biome table from the
+    `minecraft:worldgen/biome` entries of the `Event::Joined` registries — each name mapped
+    to the client's own id through `res.biomes().id(name)` — and sizes the palette with
+    `ceil_log2(len)`. With `Dynamic::default()` (empty) that table is empty, so the biome id
+    in every chunk (we sent `1`) fell back to the first biome (badlands) and the grass was
+    brown. Send the registry in the client's own id order — the files under
+    `data/minecraft/worldgen/biome`, sorted, which is exactly `Biomes::load`'s order and, for
+    all-vanilla lists, `registry_order` — and use the plains index (42) as the chunk value.
+    The world is plains everywhere until real per-chunk biomes are decoded, but the tint is
+    correct and the plants are no longer black.
+16. **`SetHealth` (42) is a `zigzag32`, not an `f32`.** Reading an `f32` needs 4 bytes, the
+    packet is 1, so it failed to decode and health never reached the HUD.
 
 ---
 
@@ -332,15 +361,17 @@ and `Stack {item: i32, count: i32, added, removed, wire}` with `Stack::new(item,
 
 ## 10. Open questions and bugs
 
-1. **Terrain draws lower than the entities**, which appear to float at eye level. Either
-   the sections are placed roughly four sections (64 blocks) low, or the entity Ys are
-   roughly four high. `column()` hardcodes
-   `DimensionType::vanilla("minecraft:overworld")` (min_y = −64) while the client takes
-   its dimension from `SpawnInfo.dimension_type`; a `min_y` mismatch shifts every column.
-   `1ab7f77` (committed, not yet built) traces
-   `column (x,z) min_y=… sections=… first_y=…` and
-   `add entity <id> <identifier> at [x,y,z]` into the NetherNet trace file. **Build it,
-   join once near an entity, and read the trace.**
+1. **RESOLVED — terrain drew 64 blocks low (four sections).** The cause was the
+   `SubChunkRequest` base Y and the reply decode, and the `min_y` theory was wrong:
+   `DimensionType::vanilla("minecraft:overworld")` (min_y −64) matches the client's
+   dimension. The request sent `center.y = 4` with offsets `-4..=19` — so the server
+   answered absolute section indices `0..=23` (y 0..383) — and the decode then subtracted 4
+   again, so the section at world y 0 was filed at slot 0 (−64) instead of slot 4. Fixed:
+   the request now uses base Y **0** (`center: [cx, 0, cz]`) and the reply's section is
+   `position[1] + offset[1]` with no adjustment. Live-verified: a column at (35,89) reads
+   bedrock at −64, stone, dirt, grass at 68, air above, and the player stands on it. The
+   trace from `1ab7f77` (`column … first_y=Some(-4)`, `add entity … at …`) is what confirmed
+   the sections now span the whole column.
 2. **`PlayerAuthInput` is rejected** by the server (session dropped, world reset to the
    spawn sentinel). The encoder lives in `protocol/mod.rs` (`Out::PlayerAuthInput`) and is
    used by `auth_input()` in `session.rs`, currently bypassed. Field order matches
@@ -388,9 +419,9 @@ item stacks), `bedrock-protocol-docs` (movement/deprecation), `mappings-master`
 ## 12. Remaining work
 
 ### Critical path
-1. Height offset (§10.1) — blocks everything visual.
+1. ~~Height offset (§10.1)~~ — **done**, live-verified.
 2. `PlayerAuthInput` (§10.2) — blocks being a real player.
-3. `MobEquipment → SetEquipment` — small; every lookup now exists.
+3. ~~`MobEquipment → SetEquipment`~~ — **wired** (needs visual confirmation on a held item).
 4. Entity metadata table.
 5. Populate the `Dynamic` registries.
 
@@ -415,8 +446,9 @@ metadata-key → Java index/type table · `MobEquipment` → `SetEquipment` ·
 
 ### C. World, blocks, chunks
 `BlockEntityData` → Java `BlockEntityData` (chests, signs; `translate::nbt` exists and is
-marked dead) · real biomes (`BiomeDefinitionList` decodes as a unit today; the chunk
-biome array is hardcoded plains) · `LevelEvent` → particles and sounds ·
+marked dead) · real per-chunk biomes (`BiomeDefinitionList` decodes as a unit today and the
+`minecraft:worldgen/biome` registry is sent, but every chunk still says plains — decode the
+sub-chunk biome palettes and map Bedrock biome ids) · `LevelEvent` → particles and sounds ·
 `LevelSoundEvent` payload → sounds · real light (probably trailing a `LevelChunk`
 payload) · a proper chunk streamer (radius from `SetChunkCacheRadius`, priority by
 distance, cancellation on movement, per-column state) · `LevelChunk` blob cache
@@ -427,7 +459,7 @@ distance, cancellation on movement, per-column state) · `LevelChunk` blob cache
 `ContainerOpen`/`Close` → `OpenScreen`/`ContainerClose` · `ContainerSetData` ·
 `PlayerHotbar` → `SetHeldSlot` · `InventoryTransaction` and `ItemStackRequest` (147) →
 clicks and item use · crafting (`CraftingData` 52, `CraftingEvent` 53,
-`CreativeContent` 145) · `ItemComponent` (162).
+`CreativeContent` 145) · item components from `ItemRegistry` (162).
 
 ### E. Chat, commands, HUD
 `SetTitle` 88 · scoreboard (`SetScore`, `RemoveObjective`, `SetDisplayObjective`) ·
@@ -437,8 +469,7 @@ forms and emotes.
 
 ### F. Registries
 Populate `Dynamic` — we still send `Dynamic::default()` — with biomes, dimension types,
-damage types, chat types and item components; decode `BiomeDefinitionList` and
-`ItemComponent` into it.
+damage types, chat types and item components; decode `BiomeDefinitionList` into it.
 
 ### G. NetherNet robustness
 Verify the server's `a=identity` (TOFU pinning) · reconnect with backoff on ICE failure ·
@@ -465,17 +496,18 @@ content and some addon behaviour will be approximations.
 
 ## 13. Immediate next steps
 
-1. **Build `1ab7f77`** (a build was started at the end of the session and was still
-   compiling `horizon-client`). Launch, join once near an entity, then read
-   `/tmp/horizon-bedrock-nethernet.log` and compare the `column … first_y=…` lines with
-   the `add entity … at [x,y,z]` lines.
-2. **Capture one `PlayerAuthInput`.** `references/nethernet` is a Rust workspace; use
-   `nethernet-tokio`'s accept path for a listener on 7551 with a logger on the message
-   path, join from the vanilla client, walk/jump/sneak for a few seconds, and diff one
-   frame against `protocol/mod.rs`'s encoder. Alternative: log the JS `bedrock-protocol`
-   client's outgoing packets.
-3. **`MobEquipment → SetEquipment`.** `item_by_network_id(ctx, palette, id)` and
-   `Stack::new(item, count)` are both in place and tested.
+1. **DONE — height offset (§10.1).** The `SubChunkRequest` base Y and reply decode were
+   fixed; terrain and entities now share the same Y, live-verified on a BDS join. Also fixed
+   in the same build: `StartGame` stopped decoding because `0f50d2f` read an item palette
+   that 1.26 does not put there (§7) — the palette moved to `ItemRegistry` (162).
+2. **`MobEquipment → SetEquipment`.** Wired: `ItemRegistry` fills `ctx.items`, and a
+   `MobEquipment` on the inventory/hotbar container (0/28/29) maps to main hand, off hand
+   (34/119) to off hand, with `Stack::new(java_item, count)`; an unknown id clears the
+   slot. Compiles and runs; visual confirmation on another player's held item is still
+   open.
+3. **Capture one `PlayerAuthInput`** (§10.2) — still the gate on being a real player. Use
+   `references/nethernet`'s `nethernet-tokio` accept path for a localhost listener on 7551,
+   or log the JS `bedrock-protocol` client's outgoing packets.
 
 ---
 
