@@ -168,6 +168,10 @@ struct Bridge {
     pending_use: Mutex<Vec<play::UseItemOn>>,
     /// The block of the last use, so a resync can be tied to it.
     last_use: Mutex<Option<[i32; 3]>>,
+    /// Entities to take away once their death has been shown, with the tick it
+    /// is due on. The game plays the fall-over animation for a second, and
+    /// removing the entity in the same tick skipped it.
+    removals: Mutex<Vec<(i64, u64)>>,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -229,6 +233,7 @@ pub fn try_connect(
         teleport_ack: AtomicBool::new(false),
         pending_use: Mutex::new(Vec::new()),
         last_use: Mutex::new(None),
+        removals: Mutex::new(Vec::new()),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1282,6 +1287,26 @@ mod translate {
     }
 
     pub fn clientbound(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
+        let mut events = clientbound_inner(ctx, bridge, packet);
+        // Any entity whose death animation has run its course leaves now, on
+        // whichever packet comes next.
+        let now = bridge.tick.load(Ordering::Relaxed);
+        let mut removals = bridge.removals.lock().unwrap();
+        if removals.iter().any(|(due, _)| *due <= now) {
+            let ids: Vec<i32> = removals
+                .iter()
+                .filter(|(due, _)| *due <= now)
+                .map(|(_, id)| *id as i32)
+                .collect();
+            removals.retain(|(due, _)| *due > now);
+            events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
+                play::RemoveEntities { ids },
+            ))));
+        }
+        events
+    }
+
+    fn clientbound_inner(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
         match packet {
             bp::Packet::StartGame(g) => {
                 let spawn = play::SpawnInfo {
@@ -2104,6 +2129,7 @@ mod translate {
                 if let Some((position, ..)) = ctx.entities.get(&id) {
                     events.push(death_sound(&ctx, id, *position));
                 }
+                let due = bridge.tick.load(Ordering::Relaxed) + 20;
                 for entity in gone {
                     ctx.entities.remove(&entity);
                     ctx.kinds.remove(&entity);
@@ -2115,11 +2141,9 @@ mod translate {
                             event: 3,
                         },
                     ))));
-                    events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
-                        play::RemoveEntities {
-                            ids: vec![entity as i32],
-                        },
-                    ))));
+                    // The game falls the body over for a second; taking it away
+                    // straight after the death event cut the animation short.
+                    bridge.removals.lock().unwrap().push((due, entity));
                 }
                 events
             }
@@ -3052,7 +3076,7 @@ mod translate {
                     action: 1, // use
                     item: held_item(bridge),
                     cursor: [0.0; 3],
-                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    position: pos,
                     block_id: 0,
                 }]
             }
@@ -3076,7 +3100,7 @@ mod translate {
                     slot,
                     count: item.map_or(1, |i| i.count.max(1) as u8),
                     item,
-                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    position: pos,
                 }]
             }
             // A creative-screen drop: the game sets slot -1, which drops the
@@ -3095,7 +3119,7 @@ mod translate {
                     slot,
                     count: item.map_or(1, |i| i.count.max(1) as u8),
                     item,
-                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    position: pos,
                 }]
             }
             // Block breaking, with the action ids a real 1.26 client sends:
@@ -3139,7 +3163,7 @@ mod translate {
                                 item.map_or(1, |i| i.count.max(1) as u8)
                             },
                             item,
-                            position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                            position: pos,
                         }];
                     }
                     _ => return Vec::new(),
