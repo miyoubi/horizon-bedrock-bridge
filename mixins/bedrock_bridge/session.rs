@@ -1124,6 +1124,21 @@ mod translate {
         } else {
             "minecraft:entity.generic.hurt"
         };
+        sound_at(name, position)
+    }
+
+    /// A positional death sound. The game only plays one by itself for the
+    /// local player, so any other dead entity would go quietly.
+    fn death_sound(player: bool, position: [f32; 3]) -> Event {
+        let name = if player {
+            "minecraft:entity.player.death"
+        } else {
+            "minecraft:entity.generic.death"
+        };
+        sound_at(name, position)
+    }
+
+    fn sound_at(name: &str, position: [f32; 3]) -> Event {
         Event::Packet(Box::new(play::Clientbound::Sound(play::Sound {
             sound: (-1, Some((name.to_owned(), None))),
             source: crate::settings::sound_source(name) as i32,
@@ -1995,6 +2010,9 @@ mod translate {
                 let mut gone = vec![id];
                 gone.extend(children);
                 let mut events = Vec::new();
+                if let Some((position, ..)) = ctx.entities.get(&id) {
+                    events.push(death_sound(ctx.players.contains(&id), *position));
+                }
                 for entity in gone {
                     ctx.entities.remove(&entity);
                     ctx.players.remove(&entity);
@@ -2788,6 +2806,23 @@ mod translate {
                     bridge.hotbar.load(Ordering::Relaxed),
                     held_item(bridge)
                 ));
+                // A placement consumes one of the stack, and the server does
+                // not echo that back, so the slot the next transaction names
+                // would otherwise still hold the old count.
+                if let Some(from) = held_item(bridge) {
+                    let slot = bridge.hotbar.load(Ordering::Relaxed).max(0) as usize;
+                    let mut items = bridge.items.lock().unwrap();
+                    if let Some(entry) = items.get_mut(slot) {
+                        *entry = if from.count > 1 {
+                            Some(bedrock_core::protocol::ItemDescriptor {
+                                count: from.count - 1,
+                                ..from
+                            })
+                        } else {
+                            None
+                        };
+                    }
+                }
                 let normal = match u.face {
                     0 => [0, -1, 0],
                     1 => [0, 1, 0],
