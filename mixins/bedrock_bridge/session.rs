@@ -155,7 +155,8 @@ struct Bridge {
     /// The item on the mouse cursor, which Bedrock keeps in its own container.
     cursor: Mutex<Option<bedrock_core::protocol::ItemDescriptor>>,
     /// The id of the next inventory move. The server answers each request with
-    /// the same id, so the two can be paired up.
+    /// the same id, so the two can be paired up. It has to be a negative odd
+    /// number, and each request steps it down by two.
     request_id: AtomicI32,
     /// The container the server opened, if one is open.
     window: Mutex<Option<OpenWindow>>,
@@ -330,7 +331,7 @@ pub fn try_connect(
         armor: Mutex::new(vec![None; 4]),
         offhand: Mutex::new(None),
         cursor: Mutex::new(None),
-        request_id: AtomicI32::new(1),
+        request_id: AtomicI32::new(-1),
         window: Mutex::new(None),
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
@@ -3183,7 +3184,7 @@ mod translate {
     /// The server owns the inventory, so nothing can be changed without asking
     /// it with the exact slots involved.
     fn container_click(bridge: &Bridge, c: &play::ContainerClick) -> Vec<bp::Out> {
-        let request_id = bridge.request_id.fetch_add(1, Ordering::Relaxed);
+        let request_id = bridge.request_id.fetch_sub(2, Ordering::Relaxed);
         let cursor = slot_ref(bridge, CONTAINER_CURSOR, 0);
         let clicked = clicked_slot(bridge, c);
         let actions = match c.input {
