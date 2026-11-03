@@ -613,7 +613,7 @@ fn write_item(w: &mut Writer, item: Option<ItemDescriptor>) {
     match d.net_id {
         Some(id) => {
             w.bool(true);
-            w.varint(id);
+            w.zigzag32(id as i32);
         }
         None => {
             w.bool(false);

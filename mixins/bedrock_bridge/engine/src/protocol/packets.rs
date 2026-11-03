@@ -104,7 +104,7 @@ impl NetworkItem {
         let runtime_id = r.i16()?;
         let count = r.i16()?;
         let damage = r.varint()?;
-        let net_id = if r.bool()? { Some(r.varint()?) } else { None };
+        let net_id = if r.bool()? { Some(r.zigzag32()? as u32) } else { None };
         let block_runtime_id = r.varint()?;
         let mut nbt = None;
         let user = r.byte_slice()?;
