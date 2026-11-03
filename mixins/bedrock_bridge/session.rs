@@ -1607,24 +1607,28 @@ mod translate {
                     ))));
                 }
                 let center = (position[0] >> 4, position[2] >> 4);
-                // Only refill once the player has really moved on, or the queue
-                // is emptied again before it is ever drained. The player's own
-                // column goes first: the client lights a column only when it
-                // receives it, and that is the one the loading screen wants.
-                let moved = ctx.wanted_center.is_none_or(|last| {
-                    (last.0 - center.0).abs() > 2 || (last.1 - center.1).abs() > 2
-                });
-                if moved {
+                // Ask for the columns around the player every time they cross a
+                // chunk boundary, and keep what is already queued. Refilling only
+                // after several chunks, and emptying the queue to do it, left the
+                // client without the columns it was standing in: it draws those as
+                // holes, and the player falls through them.
+                if ctx.wanted_center != Some(center) {
+                    if ctx.wanted_center.is_none() {
+                        ctx.wanted.push_back((
+                            (ctx.spawn[0].floor() as i32) >> 4,
+                            (ctx.spawn[2].floor() as i32) >> 4,
+                        ));
+                    }
                     ctx.wanted_center = Some(center);
-                    ctx.wanted.clear();
-                    ctx.wanted.push_back((
-                        (ctx.spawn[0].floor() as i32) >> 4,
-                        (ctx.spawn[2].floor() as i32) >> 4,
-                    ));
-                    let r = i32::try_from((*radius).min(12)).unwrap_or(4);
+                    // Only what the client will accept: anything further out is
+                    // ignored on arrival ("not in the view range") and wasted.
+                    let r = i32::try_from((*radius).min(8)).unwrap_or(4);
                     for dx in -r..=r {
                         for dz in -r..=r {
-                            ctx.wanted.push_back((center.0 + dx, center.1 + dz));
+                            let column = (center.0 + dx, center.1 + dz);
+                            if !ctx.wanted.contains(&column) {
+                                ctx.wanted.push_back(column);
+                            }
                         }
                     }
                 }
