@@ -1120,6 +1120,12 @@ mod translate {
             // into the player's first free slot ourselves.
             bp::Packet::TakeItemEntity { item, actor } => {
                 ctx.entities.remove(item);
+                bedrock_core::nethernet::trace(format!(
+                    "PICKUP item={item} actor={actor} self={} cached={:?} drops={}",
+                    ctx.runtime_id,
+                    ctx.drops.get(item).map(|d| (d.runtime_id, d.count)),
+                    ctx.drops.len()
+                ));
                 let mut events = vec![Event::Packet(Box::new(
                     play::Clientbound::TakeItemEntity(play::TakeItemEntity {
                         item: *item as i32,
@@ -1654,6 +1660,15 @@ mod translate {
             // Bedrock order, which is not Java's inventory-menu order, so place
             // each item at its Java slot. Other windows still need mapping.
             bp::Packet::InventoryContent(c) if c.window_id == 0 => {
+                bedrock_core::nethernet::trace(format!(
+                    "SERVER CONTENT {:?}",
+                    c.slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, i)| i.runtime_id != 0)
+                        .map(|(n, i)| (n, i.runtime_id, i.count))
+                        .collect::<Vec<_>>()
+                ));
                 let mut items: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
                 for (i, item) in c.slots.iter().enumerate() {
                     let Some(slot) = java_inventory_slot(i as u32) else {
@@ -1679,6 +1694,11 @@ mod translate {
                 ))]
             }
             bp::Packet::InventorySlot(s) if s.window_id == 0 => {
+                bedrock_core::nethernet::trace(format!(
+                    "SERVER SLOT {} = {:?}",
+                    s.slot,
+                    (s.item.runtime_id, s.item.count)
+                ));
                 if let Ok(index) = usize::try_from(s.slot) {
                     let mut held = bridge.items.lock().unwrap();
                     if let Some(slot) = held.get_mut(index) {
