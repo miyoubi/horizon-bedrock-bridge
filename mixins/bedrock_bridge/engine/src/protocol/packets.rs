@@ -986,7 +986,9 @@ impl ItemStackResponse {
                     let slot = r.u8()?;
                     let hotbar_slot = r.u8()?;
                     let count = r.u8()?;
-                    let stack_id = r.zigzag32()?;
+                    // The stack id is carried only for a slot that holds
+                    // something.
+                    let stack_id = if count > 0 { r.zigzag32()? } else { 0 };
                     let _custom_name = read_string(r)?;
                     let _filtered = read_string(r)?;
                     let durability_correction = r.zigzag32()?;
