@@ -801,39 +801,12 @@ mod translate {
 
         // Light sections run from one below the lowest block section upwards.
         let light_sections = count + 2;
-        // Sky light from the heightmap: the surface of each column and
-        // everything above it is fully lit, below it is dark. This is not the
-        // server's light — that is not in the sub-chunk stream — but it shades
-        // terrain instead of lighting every face equally, which is what made
-        // the shadows look wrong.
-        let sky: Vec<Vec<u8>> = (0..light_sections)
-            .map(|section| {
-                let mut layer = vec![0u8; 2048];
-                // Light section i covers block section i - 1.
-                let base = dimension.min_y + (section as i32 - 1) * 16;
-                for z in 0..16usize {
-                    for x in 0..16usize {
-                        let top = heights[z * 16 + x] + dimension.min_y;
-                        for y in 0..16usize {
-                            // The top solid block is at `top - 1` and is exposed
-                            // to the sky, so it is fully lit too — lighting only
-                            // `>= top` left the surface block itself dark.
-                            if base + (y as i32) < top - 1 {
-                                continue;
-                            }
-                            let index = y * 256 + z * 16 + x;
-                            let byte = index >> 1;
-                            if index & 1 == 0 {
-                                layer[byte] |= 15;
-                            } else {
-                                layer[byte] |= 15 << 4;
-                            }
-                        }
-                    }
-                }
-                layer
-            })
-            .collect();
+        // Full sky light for every light section. The sub-chunk stream carries
+        // no light of the server's own, and deriving it from the heightmap drew
+        // a black stripe along the terrain: shading a slope is not the same as
+        // leaving it unlit, and a shadow that follows the ground is worse than
+        // an evenly lit surface.
+        let sky: Vec<Vec<u8>> = (0..light_sections).map(|_| vec![0xFFu8; 2048]).collect();
         let light = LightData {
             sky_mask: bitset(light_sections),
             block_mask: Vec::new(),
