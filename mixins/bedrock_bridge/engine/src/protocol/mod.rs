@@ -800,7 +800,33 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(0); // legacy request id
             w.bool(false); // no legacy data
             w.varint(2); // ItemUseTransaction
-            w.varint(0); // actions count
+            // A placement says which slot changed: the held stack becomes one
+            // smaller. The server checks the transaction against it, and with
+            // no action it treats the placement as not matching the inventory.
+            let placed = if *action == 0 { *item } else { None };
+            match placed.filter(|from| from.count > 0) {
+                Some(from) => {
+                    w.varint(1); // actions count
+                    w.varint(0); // source: container inventory
+                    w.bool(true); // a container id follows
+                    w.u8(0); // the player's inventory
+                    w.bool(false); // no source flags
+                    w.varint(*hotbar_slot as u32);
+                    write_item(&mut w, Some(from));
+                    let remaining = if from.count > 1 {
+                        Some(ItemDescriptor {
+                            count: from.count - 1,
+                            ..from
+                        })
+                    } else {
+                        None
+                    };
+                    write_item(&mut w, remaining);
+                }
+                None => {
+                    w.varint(0); // actions count
+                }
+            }
             // The action type is a compressed int32, so it is zigzag encoded.
             // Placing sends action zero, where a plain varint reads the same,
             // which is why placing worked while using an item in the air did

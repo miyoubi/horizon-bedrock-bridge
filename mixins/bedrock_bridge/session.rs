@@ -2780,6 +2780,14 @@ mod translate {
             play::Serverbound::UseItemOn(u) => {
                 let pos = *bridge.position.lock().unwrap();
                 let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
+                bedrock_core::nethernet::trace(format!(
+                    "use item on {:?} face={} inside={} hotbar={} item={:?}",
+                    u.pos,
+                    u.face,
+                    u.inside,
+                    bridge.hotbar.load(Ordering::Relaxed),
+                    held_item(bridge)
+                ));
                 let normal = match u.face {
                     0 => [0, -1, 0],
                     1 => [0, 1, 0],
