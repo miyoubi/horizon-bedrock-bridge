@@ -1139,33 +1139,10 @@ mod translate {
                 ))];
                 if *actor == ctx.runtime_id as u64 {
                     // The server grants the pickup on its own side but applies it
-                    // a moment later, so add the stack here for an immediate
-                    // display, then ask for the authoritative contents once the
+                    // a moment later, and synthesising the stack here crashed the
+                    // game, so just ask for the authoritative contents once the
                     // server has caught up.
-                    if let Some(drop) = ctx.drops.remove(item) {
-                        let mut items = bridge.items.lock().unwrap();
-                        if let Some(d) = descriptor(&drop) {
-                            let taken = items.iter_mut().find(|s| {
-                                s.as_ref().is_some_and(|e| {
-                                    e.runtime_id == d.runtime_id
-                                        && e.damage == d.damage
-                                        && e.count < 64
-                                })
-                            });
-                            match taken {
-                                Some(s) => {
-                                    let e = s.as_mut().unwrap();
-                                    e.count += d.count.min(64 - e.count);
-                                }
-                                None => {
-                                    if let Some(free) = items.iter().position(|s| s.is_none()) {
-                                        items[free] = Some(d);
-                                    }
-                                }
-                            }
-                        }
-                        events.push(inventory_content(ctx, bridge));
-                    }
+                    ctx.drops.remove(item);
                     let now = bridge.tick.load(Ordering::Relaxed);
                     bridge.resync_at.store(now + 10, Ordering::Relaxed);
                 }

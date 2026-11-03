@@ -770,7 +770,11 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.bool(false); // no legacy data
             w.varint(2); // ItemUseTransaction
             w.varint(0); // actions count
-            w.varint(*action as u32); // ItemUseActionType (plain varint)
+            // The action type is a compressed int32, so it is zigzag encoded.
+            // Placing sends action zero, where a plain varint reads the same,
+            // which is why placing worked while using an item in the air did
+            // not.
+            w.zigzag32(*action);
             w.u8(1); // ItemUseTriggerType: player input
             w.zigzag32(block[0])
                 .zigzag32(block[1])
