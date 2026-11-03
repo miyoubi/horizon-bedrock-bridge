@@ -286,6 +286,17 @@ fn run(
         if raknet { "RakNet" } else { "NetherNet" }
     ));
 
+    // The block and light tables are read from the prepared resources and take
+    // a moment; build them before the connection exists so the WebRTC pump is
+    // never left waiting on them.
+    let blocks = translate::Blocks::new(resources);
+    if blocks.is_none() {
+        log::warn!(
+            "bedrock: no block registry at {}; chunks will be skipped",
+            resources.display()
+        );
+    }
+
     // Sign-in comes first: over NetherNet the identity key and the multiplayer
     // token signed over it are what the WebRTC join asserts.
     let login = match auth::sign_in(&host, port, &status) {
@@ -338,14 +349,6 @@ fn run(
         .unwrap_or_default();
     let mappings = bedrock_core::mapping::Mappings::defaults();
 
-    let blocks = translate::Blocks::new(&resources);
-    if blocks.is_none() {
-        log::warn!(
-            "bedrock: no block registry at {}; chunks will be skipped",
-            resources.display()
-        );
-    }
-
     // The client's biome ids: its own file order, with plains as the default
     // tint for every chunk until real per-chunk biomes are decoded.
     let biomes = translate::biome_names(&resources);
@@ -362,7 +365,7 @@ fn run(
         spawn_yaw: 0.0,
         spawn_pitch: 0.0,
         published: 0,
-        sections: std::collections::HashMap::new(),
+        chunks: std::collections::HashMap::new(),
         requests: Vec::new(),
         wanted: std::collections::VecDeque::new(),
         request_limit: 24,
@@ -538,6 +541,13 @@ fn run(
 mod translate {
     use super::{Bridge, Event};
     use bedrock_core::protocol as bp;
+    use crate::chunk::{
+        BIOME_STRATEGY, Chunk, Section as ClientSection, Light as ClientLight,
+    };
+    use crate::light::{
+        LightChanges, LightTables, apply_lighting, apply_relighting, light_chunk,
+    };
+    use horizon_core::paletted::PalettedContainer;
     use horizon_protocol::chunk::{ChunkData, LightData, Paletted, Section, Strategy};
     use horizon_protocol::item::Stack;
     use horizon_protocol::packets::configuration::{RegistryData, RegistryEntry};
@@ -559,11 +569,10 @@ mod translate {
         pub spawn_pitch: f32,
         /// How many times the position has been repeated since `StartGame`.
         pub published: u8,
-        /// The runtime ids of every section received for a column, by Java
-        /// section index. A partial chunk carries no blocks, so the column is
-        /// built from these as the sub-chunk replies arrive.
-        pub sections:
-            std::collections::HashMap<(i32, i32), std::collections::BTreeMap<i8, Vec<u32>>>,
+        /// The columns received so far, as the client's own chunks: the same
+        /// type the renderer streams and the light engine reads. A partial
+        /// column starts empty and fills as the sub-chunk replies arrive.
+        pub chunks: std::collections::HashMap<(i32, i32), Chunk>,
         /// Sub-chunk requests queued while translating; the session loop sends
         /// them.
         pub requests: Vec<bedrock_core::protocol::Out>,
@@ -657,6 +666,11 @@ mod translate {
         /// filled from the bottom up, and a layer of air means the block is in
         /// one of the layers above it.
         pub air_runtime: i32,
+        /// The game's own light rules: emission, dampening and occlusion per
+        /// block state, built from the same prepared resources the client
+        /// loads its copy from. `None` only if the block facts or the
+        /// occlusion table could not be read at all.
+        pub light: Option<LightTables>,
     }
 
     impl Blocks {
@@ -670,12 +684,24 @@ mod translate {
                     matches!(table.get(*id), Some((name, _)) if name == "minecraft:air")
                 })
                 .unwrap_or(0);
+            // The occlusion table is the expensive part; without it, light is
+            // still correct for blocks that do not rely on shape occlusion.
+            let light = crate::blocks::BlockFacts::load(resources, &registry)
+                .ok()
+                .map(|facts| {
+                    LightTables::load(resources, &registry, &facts)
+                        .unwrap_or_else(|_| LightTables::new(&facts))
+                });
+            if light.is_none() {
+                log::warn!("bedrock: no block facts; chunks will be unlit");
+            }
             Some(Self {
                 registry,
                 table,
                 cache: std::collections::HashMap::new(),
                 air,
                 air_runtime,
+                light,
             })
         }
 
@@ -731,90 +757,187 @@ mod translate {
         bytes
     }
 
-    /// One Bedrock chunk column as the Java client wants it: every section of
-    /// the dimension in order, its heightmaps, and full sky light.
-    ///
-    /// Bedrock sends only the sections it has, at their own indices, and no
-    /// light, so the column is padded with air and lit uniformly. Real light
-    /// needs the server's light data, which NetherNet does not forward.
+    /// The client's own column for (x, z), created on the first section.
+    fn new_chunk(x: i32, z: i32, biome: i32) -> Chunk {
+        let mut chunk = Chunk::with_layout(x, z, crate::chunk::ColumnLayout::VANILLA);
+        for section in &mut chunk.sections {
+            Arc::make_mut(section).biomes = PalettedContainer::new(BIOME_STRATEGY, biome as u32);
+        }
+        chunk
+    }
+
+    /// Store one Bedrock sub-chunk into the client's column, translating each
+    /// block to the game's own state id. `ids` is in `java_index` order.
+    fn put_section(ctx: &mut Context, x: i32, z: i32, y: i32, ids: &[u32]) -> bool {
+        let dimension = DimensionType::vanilla("minecraft:overworld");
+        let Some(slot) = usize::try_from((y * 16 - dimension.min_y) / 16)
+            .ok()
+            .filter(|slot| *slot < dimension.sections())
+        else {
+            return false;
+        };
+        let biome = ctx.biome;
+        let Some(blocks) = ctx.blocks.as_mut() else {
+            return false;
+        };
+        let mut values = [0u32; 4096];
+        for (value, runtime_id) in values.iter_mut().zip(ids) {
+            *value = blocks.java(*runtime_id as i32);
+        }
+        let mut section = ClientSection {
+            blocks: ClientSection::from_blocks(&values),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, biome as u32),
+            light: ClientLight::Uniform(0),
+        };
+        section.compact();
+        let chunk = ctx
+            .chunks
+            .entry((x, z))
+            .or_insert_with(|| new_chunk(x, z, biome));
+        if let Some(target) = chunk.sections.get_mut(slot) {
+            *target = Arc::new(section);
+        }
+        true
+    }
+
+    /// One column as the Java client wants it: every section, its heightmaps
+    /// and the light the game's own engine computes for it. The column is lit
+    /// over its 3x3 neighbourhood, so light crosses chunk borders exactly as
+    /// the renderer expects.
     fn column(ctx: &mut Context, x: i32, z: i32) -> Option<play::LevelChunkWithLight> {
-        // Taken out of the map so the block registry can be borrowed while
-        // building from it, and put back before returning.
-        let known = ctx.sections.remove(&(x, z))?;
-        if known.is_empty() {
-            ctx.sections.insert((x, z), known);
+        if !ctx.chunks.contains_key(&(x, z)) {
             return None;
         }
-        let biome = ctx.biome;
-        let blocks = ctx.blocks.as_mut()?;
-        let dimension = DimensionType::vanilla("minecraft:overworld");
-        // Where the column's sections were put, so a vertical offset against
-        // the entities can be read off rather than guessed.
-        bedrock_core::nethernet::trace(format!(
-            "column ({x},{z}) min_y={} sections={} first_y={:?}",
-            dimension.min_y,
-            dimension.sections(),
-            known.keys().next(),
-        ));
-        let count = dimension.sections();
-        let mut filled: Vec<Option<Section>> = (0..count).map(|_| None).collect();
-        let mut heights = [0i32; 256];
-        // Which cells hold a block, so the light can travel through air only.
-        // Spreading it through solids as well stepped the level down once per
-        // block and drew a contour of dark bands across every slope.
-        let mut solid = vec![false; 384 * 256];
-        for (&y, ids) in &known {
-            let base = i32::from(y) * 16;
-            let Some(slot) = usize::try_from((base - dimension.min_y) / 16)
-                .ok()
-                .filter(|i| *i < count)
-            else {
+        let air = ctx.blocks.as_ref()?.air;
+        let lights = {
+            let tables = ctx.blocks.as_ref()?.light.as_ref()?;
+            let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
+                std::array::from_fn(|dx| {
+                    ctx.chunks
+                        .get(&(x + dx as i32 - 1, z + dz as i32 - 1))
+                })
+            });
+            light_chunk(&region, tables, true)
+        };
+        let chunk = ctx.chunks.get_mut(&(x, z))?;
+        apply_lighting(chunk, lights);
+        chunk.lit = true;
+        Some(chunk_packet(chunk, ctx.biome, air))
+    }
+
+    /// The packed light of one section as a DataLayer (two nibbles a byte).
+    fn light_layer(light: &ClientLight, sky: bool) -> Vec<u8> {
+        let at = |packed: u8| if sky { packed >> 4 } else { packed & 15 };
+        match light {
+            ClientLight::Uniform(packed) => {
+                let value = at(*packed);
+                vec![value | value << 4; 2048]
+            }
+            ClientLight::Full(data) => data
+                .chunks_exact(2)
+                .map(|pair| at(pair[0]) | at(pair[1]) << 4)
+                .collect(),
+        }
+    }
+
+    /// Every light section of a freshly lit column. Light section `b` holds
+    /// block section `b - 1`; the two around the column are dark below and
+    /// open sky above.
+    fn full_light(chunk: &Chunk) -> LightData {
+        let light_sections = chunk.sections.len() + 2;
+        let mut sky = Vec::with_capacity(light_sections);
+        let mut block = Vec::with_capacity(light_sections);
+        sky.push(vec![0u8; 2048]);
+        block.push(vec![0u8; 2048]);
+        for section in &chunk.sections {
+            sky.push(light_layer(&section.light, true));
+            block.push(light_layer(&section.light, false));
+        }
+        sky.push(vec![0xF0u8; 2048]);
+        block.push(vec![0u8; 2048]);
+        LightData {
+            // Every section carries light, so both masks are full.
+            sky_mask: bitset(light_sections),
+            block_mask: bitset(light_sections),
+            empty_sky_mask: Vec::new(),
+            empty_block_mask: Vec::new(),
+            sky,
+            block,
+        }
+    }
+
+    /// Set one bit, as the packet's little-endian `BitSet` codec expects.
+    fn set_bit(mask: &mut Vec<u8>, bit: usize) {
+        let byte = bit / 8;
+        if mask.len() <= byte {
+            mask.resize(byte + 1, 0);
+        }
+        mask[byte] |= 1 << (bit % 8);
+    }
+
+    /// A light update naming exactly `sections` (block-section indices).
+    fn changed_light(chunk: &Chunk, sections: &[i32]) -> LightData {
+        let mut sky = Vec::with_capacity(sections.len());
+        let mut block = Vec::with_capacity(sections.len());
+        let mut sky_mask = Vec::new();
+        let mut block_mask = Vec::new();
+        for &section in sections {
+            let Ok(index) = usize::try_from(section) else {
                 continue;
             };
-            let mut values = [0i32; 4096];
+            let Some(section) = chunk.sections.get(index) else {
+                continue;
+            };
+            // Light section b holds block section b - 1.
+            let b = index + 1;
+            set_bit(&mut sky_mask, b);
+            set_bit(&mut block_mask, b);
+            sky.push(light_layer(&section.light, true));
+            block.push(light_layer(&section.light, false));
+        }
+        LightData {
+            sky_mask,
+            block_mask,
+            empty_sky_mask: Vec::new(),
+            empty_block_mask: Vec::new(),
+            sky,
+            block,
+        }
+    }
+
+    /// The Java column packet for a lit client chunk.
+    fn chunk_packet(chunk: &Chunk, biome: i32, air: u32) -> play::LevelChunkWithLight {
+        let dimension = DimensionType::vanilla("minecraft:overworld");
+        let mut sections = Vec::with_capacity(chunk.sections.len());
+        let mut heights = [0i32; 256];
+        for (slot, section) in chunk.sections.iter().enumerate() {
+            let mut values = [0u32; 4096];
+            section.unpack(&mut values);
+            let mut states = [0i32; 4096];
             let mut non_empty = 0i16;
-            for (i, runtime_id) in ids.iter().enumerate() {
-                let id = blocks.java(*runtime_id as i32);
-                values[i] = id as i32;
-                if id == blocks.air {
+            for (index, value) in values.iter().enumerate() {
+                states[index] = *value as i32;
+                if *value == air {
                     continue;
                 }
-                non_empty += 1;
-                // Column order matches `chunk::java_index`: the section index
-                // packs x, then z, then y, so the height is the y component and
-                // not x, which put every heightmap entry somewhere else.
-                let x = (i >> 8) & 15;
-                let z = (i >> 4) & 15;
-                let y = i & 15;
+                non_empty = non_empty.saturating_add(1);
+                // `java_index`: y major, then z, then x.
+                let x = index & 15;
+                let z = (index >> 4) & 15;
+                let y = index >> 8;
                 let column = z * 16 + x;
-                let world_y = base + y as i32 - dimension.min_y;
-                if (0..384).contains(&world_y) {
-                    solid[world_y as usize * 256 + column] = true;
-                }
-                let height = base + y as i32 - dimension.min_y + 1;
+                let height = (slot * 16 + y + 1) as i32;
                 if height > heights[column] {
                     heights[column] = height;
                 }
             }
-            filled[slot] = Some(Section {
+            sections.push(Section {
                 non_empty,
                 fluids: 0,
-                states: Paletted::from_values(&values, Strategy::Blocks, 16),
+                states: Paletted::from_values(&states, Strategy::Blocks, 16),
                 biomes: Paletted::from_values(&[biome; 64], Strategy::Biomes, 7),
             });
         }
-        let air = blocks.air;
-        let air_section = move || Section {
-            non_empty: 0,
-            fluids: 0,
-            states: Paletted::from_values(&[air as i32; 4096], Strategy::Blocks, 16),
-            biomes: Paletted::from_values(&[biome; 64], Strategy::Biomes, 7),
-        };
-        let sections: Vec<Section> = filled
-            .into_iter()
-            .map(|section| section.unwrap_or_else(air_section))
-            .collect();
-
         // WORLD_SURFACE (1) and MOTION_BLOCKING (4); this decoder does not
         // distinguish them, since it sees no fluids or leaf shapes.
         let bits = (dimension.height as u32 + 1).ilog2() as u8 + 1;
@@ -830,36 +953,80 @@ mod translate {
                 .collect()
         };
         let heightmaps = vec![(1, packed(&heights)), (4, packed(&heights))];
-
-        // Light sections run from one below the lowest block section upwards.
-        let light_sections = count + 2;
-        // Full sky light for every section. Hand-computed light bands badly no
-        // matter how the spread is constrained, and an empty light section is
-        // only relit around the player, leaving a dark ring. Flat light is dull
-        // but stable, and it is what the result actually looks like.
-        let sky: Vec<Vec<u8>> = (0..light_sections).map(|_| vec![0xFFu8; 2048]).collect();
-        let light = LightData {
-            sky_mask: bitset(light_sections),
-            block_mask: Vec::new(),
-            empty_sky_mask: Vec::new(),
-            // Block light is zero everywhere, which the empty mask conveys
-            // without sending 2048 bytes per section.
-            empty_block_mask: bitset(light_sections),
-            sky,
-            block: Vec::new(),
-        };
-
-        ctx.sections.insert((x, z), known);
-        Some(play::LevelChunkWithLight {
-            x,
-            z,
+        play::LevelChunkWithLight {
+            x: chunk.x,
+            z: chunk.z,
             chunk: ChunkData {
                 heightmaps,
                 buffer: ChunkData::from_sections(&sections),
                 block_entities: Vec::new(),
             },
-            light,
-        })
+            light: full_light(chunk),
+        }
+    }
+
+    /// The columns a block change can reach light into.
+    fn columns_around(pos: [i32; 3]) -> impl Iterator<Item = (i32, i32)> {
+        let (cx, cz) = (pos[0] >> 4, pos[2] >> 4);
+        (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (cx + dx, cz + dz)))
+    }
+
+    /// Put a block into the client's cached column, if that column is loaded.
+    fn set_block(ctx: &mut Context, pos: [i32; 3], state: u32) {
+        if let Some(chunk) = ctx.chunks.get_mut(&(pos[0] >> 4, pos[2] >> 4)) {
+            chunk.set(pos[0] & 15, pos[1], pos[2] & 15, state);
+        }
+    }
+
+    /// Re-light `columns` from the blocks they hold now and return the light
+    /// updates for the sections that actually changed. Only columns the client
+    /// has already been sent are touched.
+    fn relight_columns(
+        ctx: &mut Context,
+        columns: &std::collections::BTreeSet<(i32, i32)>,
+    ) -> Vec<Event> {
+        let Some(tables) = ctx.blocks.as_ref().and_then(|blocks| blocks.light.as_ref()) else {
+            return Vec::new();
+        };
+        let mut changed = LightChanges::default();
+        for &(x, z) in columns {
+            if !ctx.chunks.get(&(x, z)).is_some_and(|chunk| chunk.lit) {
+                continue;
+            }
+            let lights = {
+                let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
+                    std::array::from_fn(|dx| {
+                        ctx.chunks
+                            .get(&(x + dx as i32 - 1, z + dz as i32 - 1))
+                    })
+                });
+                light_chunk(&region, tables, true)
+            };
+            if let Some(chunk) = ctx.chunks.get_mut(&(x, z)) {
+                apply_relighting(chunk, lights, &mut changed);
+            }
+        }
+        let mut by_chunk: std::collections::BTreeMap<(i32, i32), Vec<i32>> =
+            std::collections::BTreeMap::new();
+        for (x, section, z) in changed.sections() {
+            by_chunk.entry((x, z)).or_default().push(section);
+        }
+        let mut events = Vec::new();
+        for ((x, z), mut sections) in by_chunk {
+            let Some(chunk) = ctx.chunks.get(&(x, z)) else {
+                continue;
+            };
+            sections.sort_unstable();
+            sections.dedup();
+            events.push(Event::Packet(Box::new(play::Clientbound::LightUpdate(
+                play::LightUpdate {
+                    x,
+                    z,
+                    light: changed_light(chunk, &sections),
+                },
+            ))));
+        }
+        events
     }
 
     /// A standing player's eye height above its feet. Bedrock player positions
@@ -1836,48 +2003,64 @@ mod translate {
                 // sub-chunk replies.
                 let air = ctx.blocks.as_ref().map(|b| b.air_runtime).unwrap_or(0);
                 if let Ok(decoded) = bedrock_core::chunk::decode_sections(c, air) {
-                    let entry = ctx.sections.entry((c.chunk_x, c.chunk_z)).or_default();
                     for section in decoded {
-                        entry.insert(section.y, section.blocks);
+                        put_section(
+                            ctx,
+                            c.chunk_x,
+                            c.chunk_z,
+                            i32::from(section.y),
+                            &section.blocks,
+                        );
                     }
                 }
                 emit_column(ctx, c.chunk_x, c.chunk_z)
             }
             // A changed block. Without it, nothing built or broken shows up
-            // until the column is sent again.
+            // until the column is sent again. The block also changes the light
+            // around it, which goes out as a light update.
             bp::Packet::UpdateBlock {
                 position,
                 runtime_id,
                 flags: _,
             } => {
-                let Some(blocks) = ctx.blocks.as_mut() else {
+                let Some(state) = ctx.blocks.as_mut().map(|blocks| blocks.java(*runtime_id as i32))
+                else {
                     return Vec::new();
                 };
-                let state = blocks.java(*runtime_id as i32);
-                vec![Event::Packet(Box::new(play::Clientbound::BlockUpdate(
+                set_block(ctx, *position, state);
+                let mut events = vec![Event::Packet(Box::new(play::Clientbound::BlockUpdate(
                     play::BlockUpdate {
                         pos: *position,
                         state: state as i32,
                     },
-                )))]
+                )))];
+                let columns = columns_around(*position).collect();
+                events.extend(relight_columns(ctx, &columns));
+                events
             }
             // The batched form of the change above.
             bp::Packet::UpdateSubChunkBlocks { blocks, .. } => {
-                let Some(registry) = ctx.blocks.as_mut() else {
-                    return Vec::new();
-                };
-                blocks
-                    .iter()
-                    .map(|block| {
-                        let state = registry.java(block.runtime_id as i32);
-                        Event::Packet(Box::new(play::Clientbound::BlockUpdate(
-                            play::BlockUpdate {
-                                pos: block.position,
-                                state: state as i32,
-                            },
-                        )))
-                    })
-                    .collect()
+                let mut events = Vec::new();
+                let mut columns = std::collections::BTreeSet::new();
+                for block in blocks {
+                    let Some(state) = ctx
+                        .blocks
+                        .as_mut()
+                        .map(|registry| registry.java(block.runtime_id as i32))
+                    else {
+                        return Vec::new();
+                    };
+                    set_block(ctx, block.position, state);
+                    columns.extend(columns_around(block.position));
+                    events.push(Event::Packet(Box::new(play::Clientbound::BlockUpdate(
+                        play::BlockUpdate {
+                            pos: block.position,
+                            state: state as i32,
+                        },
+                    ))));
+                }
+                events.extend(relight_columns(ctx, &columns));
+                events
             }
             // The player's own inventory. Bedrock's window 0 lists its slots in
             // Bedrock order, which is not Java's inventory-menu order, so place
@@ -1973,10 +2156,7 @@ mod translate {
                             }
                         }
                     }
-                    ctx.sections
-                        .entry((sub.position[0], sub.position[2]))
-                        .or_default()
-                        .insert(y, ids);
+                    put_section(ctx, sub.position[0], sub.position[2], i32::from(y), &ids);
                     any = true;
                 }
                 if any {
