@@ -9,7 +9,7 @@
 // The Bedrock stack lives in the bundle crate `bedrock_core`; this file is glue.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use horizon_protocol::packets::play;
@@ -147,6 +147,16 @@ struct Bridge {
     /// The player's inventory slots as reported by the server, so transactions
     /// (place, use, attack) can carry the real held item.
     items: Mutex<Vec<Option<bedrock_core::protocol::ItemDescriptor>>>,
+    /// The armour the server reports, in its own order: helmet, chest, legs,
+    /// boots.
+    armor: Mutex<Vec<Option<bedrock_core::protocol::ItemDescriptor>>>,
+    /// The off-hand item.
+    offhand: Mutex<Option<bedrock_core::protocol::ItemDescriptor>>,
+    /// The item on the mouse cursor, which Bedrock keeps in its own container.
+    cursor: Mutex<Option<bedrock_core::protocol::ItemDescriptor>>,
+    /// The id of the next inventory move. The server answers each request with
+    /// the same id, so the two can be paired up.
+    request_id: AtomicI32,
     /// Set when the game drops the session, so the thread ends.
     shutdown: AtomicBool,
     /// The tick at which to ask the server for the inventories again, because a
@@ -227,6 +237,10 @@ pub fn try_connect(
         collision: AtomicBool::new(false),
         hotbar: AtomicI64::new(0),
         items: Mutex::new(vec![None; 36]),
+        armor: Mutex::new(vec![None; 4]),
+        offhand: Mutex::new(None),
+        cursor: Mutex::new(None),
+        request_id: AtomicI32::new(1),
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
         respawn_asked: AtomicBool::new(false),
@@ -2447,7 +2461,20 @@ mod translate {
                 }
                 {
                     let mut held = bridge.items.lock().unwrap();
-                    *held = c.slots.iter().map(descriptor).collect();
+                    *held = c.slots.iter().take(36).map(descriptor).collect();
+                }
+                // The window also reports the armour and the off hand, past the
+                // inventory's own slots.
+                {
+                    let mut armor = bridge.armor.lock().unwrap();
+                    for (i, entry) in c.slots.iter().enumerate().skip(36).take(4) {
+                        if let Some(slot) = armor.get_mut(i - 36) {
+                            *slot = descriptor(entry);
+                        }
+                    }
+                }
+                if let Some(item) = c.slots.get(40) {
+                    *bridge.offhand.lock().unwrap() = descriptor(item);
                 }
                 vec![Event::Packet(Box::new(
                     play::Clientbound::ContainerSetContent(play::ContainerSetContent {
@@ -2457,6 +2484,21 @@ mod translate {
                         carried: None,
                     }),
                 ))]
+            }
+            // The server's answer to an inventory move: it settles the counts
+            // and says which stacks it acted on.
+            bp::Packet::ItemStackResponse(response) => {
+                stack_response(ctx, bridge, response)
+            }
+            // The item on the cursor lives in its own container, and the game
+            // shows it as the carried stack.
+            bp::Packet::InventorySlot(s) if s.window_id == 124 => {
+                *bridge.cursor.lock().unwrap() = descriptor(&s.item);
+                vec![Event::Packet(Box::new(play::Clientbound::SetCursorItem(
+                    play::SetCursorItem {
+                        item: map_item(ctx, &s.item),
+                    },
+                )))]
             }
             bp::Packet::InventorySlot(s) if s.window_id == 0 => {
                 if let Ok(index) = usize::try_from(s.slot) {
@@ -2625,6 +2667,12 @@ mod translate {
         (id != 0 && item.count > 0).then(|| Stack::new(id, i32::from(item.count)))
     }
 
+    /// The same, for an item the bridge knows by its own id and count.
+    fn map_item_by_id(ctx: &Context, runtime_id: i16, count: i32) -> Option<Stack> {
+        let id = item_by_network_id(ctx.mappings, ctx.builtin, &ctx.items, runtime_id);
+        (id != 0 && count > 0).then(|| Stack::new(id, count))
+    }
+
     /// The stack in the selected hotbar slot, as a descriptor for transactions.
     fn held_item(bridge: &Bridge) -> Option<bedrock_core::protocol::ItemDescriptor> {
         let slot = bridge.hotbar.load(Ordering::Relaxed).max(0) as usize;
@@ -2687,6 +2735,370 @@ mod translate {
             40 => 45,
             _ => return None,
         })
+    }
+
+    /// The container names a stack request uses. A container is named in the
+    /// request rather than identified by a number, and the player's own window
+    /// is made of several of them.
+    const CONTAINER_COMBINED: u8 = 12;
+    const CONTAINER_ARMOR: u8 = 6;
+    const CONTAINER_CRAFTING_INPUT: u8 = 13;
+    const CONTAINER_OFFHAND: u8 = 34;
+    const CONTAINER_CURSOR: u8 = 59;
+
+    /// Where a slot in the game's own inventory window lives on the server,
+    /// as its container name and the slot within it.
+    fn bedrock_slot_of(java: i16) -> Option<(u8, u8)> {
+        Some(match java {
+            1..=4 => (CONTAINER_CRAFTING_INPUT, (java - 1) as u8),
+            5..=8 => (CONTAINER_ARMOR, (java - 5) as u8),
+            9..=35 => (CONTAINER_COMBINED, java as u8),
+            36..=44 => (CONTAINER_COMBINED, (java - 36) as u8),
+            45 => (CONTAINER_OFFHAND, 0),
+            _ => return None,
+        })
+    }
+
+    /// The other direction, for something the server reports.
+    fn java_slot_of(container: u8, slot: u8) -> Option<i16> {
+        Some(match container {
+            CONTAINER_COMBINED => {
+                if slot < 9 {
+                    36 + i16::from(slot)
+                } else {
+                    i16::from(slot)
+                }
+            }
+            CONTAINER_ARMOR => 5 + i16::from(slot),
+            CONTAINER_OFFHAND => 45,
+            CONTAINER_CRAFTING_INPUT => 1 + i16::from(slot),
+            _ => return None,
+        })
+    }
+
+    /// What the bridge believes is in a slot the server names.
+    fn item_at(
+        bridge: &Bridge,
+        container: u8,
+        slot: u8,
+    ) -> Option<bedrock_core::protocol::ItemDescriptor> {
+        match container {
+            CONTAINER_COMBINED => bridge
+                .items
+                .lock()
+                .unwrap()
+                .get(usize::from(slot))
+                .copied()
+                .flatten(),
+            CONTAINER_ARMOR => bridge
+                .armor
+                .lock()
+                .unwrap()
+                .get(usize::from(slot))
+                .copied()
+                .flatten(),
+            CONTAINER_OFFHAND => *bridge.offhand.lock().unwrap(),
+            CONTAINER_CURSOR => *bridge.cursor.lock().unwrap(),
+            _ => None,
+        }
+    }
+
+    /// Record what the server settled on for a slot.
+    fn set_item_at(
+        bridge: &Bridge,
+        container: u8,
+        slot: u8,
+        item: Option<bedrock_core::protocol::ItemDescriptor>,
+    ) {
+        match container {
+            CONTAINER_COMBINED => {
+                if let Some(entry) = bridge
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(usize::from(slot))
+                {
+                    *entry = item;
+                }
+            }
+            CONTAINER_ARMOR => {
+                if let Some(entry) = bridge
+                    .armor
+                    .lock()
+                    .unwrap()
+                    .get_mut(usize::from(slot))
+                {
+                    *entry = item;
+                }
+            }
+            CONTAINER_OFFHAND => *bridge.offhand.lock().unwrap() = item,
+            CONTAINER_CURSOR => *bridge.cursor.lock().unwrap() = item,
+            _ => {}
+        }
+    }
+
+    fn slot_ref(bridge: &Bridge, container: u8, slot: u8) -> bp::SlotRef {
+        let stack_id = item_at(bridge, container, slot)
+            .and_then(|d| d.net_id)
+            .map_or(0, |id| id as i32);
+        bp::SlotRef::new(container, slot, stack_id)
+    }
+
+    /// Where a shift-click sends a stack: a stack of the same item with room
+    /// first, then the first empty slot. Returns the slot and how many items
+    /// fit. Like the game, a stack in the hotbar goes to the main inventory and
+    /// the other way round, and anything worn goes back to the inventory.
+    fn quick_move_target(
+        bridge: &Bridge,
+        from: u8,
+        from_slot: u8,
+        item: bedrock_core::protocol::ItemDescriptor,
+    ) -> Option<(u8, u8, u8)> {
+        let region: Vec<u8> = match from {
+            CONTAINER_COMBINED if from_slot < 9 => (9..36).collect(),
+            CONTAINER_COMBINED => (0..9).collect(),
+            // Armour and the off hand hand their items back.
+            _ => (0..36).collect(),
+        };
+        for container in [CONTAINER_COMBINED] {
+            for slot in region.iter().copied() {
+                match item_at(bridge, container, slot) {
+                    Some(existing) if existing.runtime_id == item.runtime_id => {
+                        let room = 64u8.saturating_sub(existing.count.max(0) as u8);
+                        let count = (item.count.max(0) as u8).min(room);
+                        if count > 0 {
+                            return Some((container, slot, count));
+                        }
+                    }
+                    None => return Some((container, slot, item.count.max(1) as u8)),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// One click in the game's inventory, turned into the move the server wants.
+    /// The server owns the inventory, so nothing can be changed without asking
+    /// it with the exact slots involved.
+    fn container_click(bridge: &Bridge, c: &play::ContainerClick) -> Vec<bp::Out> {
+        if c.container != 0 {
+            // Only the player's own window for now.
+            return Vec::new();
+        }
+        let request_id = bridge.request_id.fetch_add(1, Ordering::Relaxed);
+        let cursor = slot_ref(bridge, CONTAINER_CURSOR, 0);
+        let actions = match c.input {
+            // Pick up: the stack, or one item of it with the right button.
+            0 => {
+                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                    return Vec::new();
+                };
+                let clicked = slot_ref(bridge, container, slot);
+                let held = *bridge.cursor.lock().unwrap();
+                let here = item_at(bridge, container, slot);
+                let count = if c.button == 1 {
+                    1
+                } else {
+                    here.map_or(0, |d| d.count.max(0) as u8)
+                };
+                match (held, here) {
+                    (None, Some(_)) => vec![bp::StackAction::Take {
+                        count,
+                        source: clicked,
+                        destination: cursor,
+                    }],
+                    (Some(holding), Some(existing))
+                        if holding.runtime_id == existing.runtime_id =>
+                    {
+                        vec![bp::StackAction::Place {
+                            count: if c.button == 1 {
+                                1
+                            } else {
+                                holding.count.max(0) as u8
+                            },
+                            source: cursor,
+                            destination: clicked,
+                        }]
+                    }
+                    (Some(_), Some(_)) => vec![bp::StackAction::Swap {
+                        first: clicked,
+                        second: cursor,
+                    }],
+                    (Some(holding), None) => vec![bp::StackAction::Place {
+                        count: holding.count.max(0) as u8,
+                        source: cursor,
+                        destination: clicked,
+                    }],
+                    (None, None) => Vec::new(),
+                }
+            }
+            // Shift-click: move the stack towards the other part of the window.
+            1 => {
+                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                    return Vec::new();
+                };
+                let Some(item) = item_at(bridge, container, slot) else {
+                    return Vec::new();
+                };
+                let Some((to, at, count)) = quick_move_target(bridge, container, slot, item) else {
+                    return Vec::new();
+                };
+                vec![bp::StackAction::Take {
+                    count,
+                    source: slot_ref(bridge, container, slot),
+                    destination: slot_ref(bridge, to, at),
+                }]
+            }
+            // A number key: swap the slot with that hotbar slot.
+            2 => {
+                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                    return Vec::new();
+                };
+                let hotbar = c.button.clamp(0, 8) as u8;
+                vec![bp::StackAction::Swap {
+                    first: slot_ref(bridge, container, slot),
+                    second: slot_ref(bridge, CONTAINER_COMBINED, hotbar),
+                }]
+            }
+            // Throwing an item out of a slot, or out of the cursor when the
+            // click is outside the window.
+            4 => {
+                if c.slot == -999 {
+                    let Some(holding) = *bridge.cursor.lock().unwrap() else {
+                        return Vec::new();
+                    };
+                    vec![bp::StackAction::Drop {
+                        count: holding.count.max(0) as u8,
+                        source: cursor,
+                        randomly: false,
+                    }]
+                } else {
+                    let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                        return Vec::new();
+                    };
+                    let Some(item) = item_at(bridge, container, slot) else {
+                        return Vec::new();
+                    };
+                    vec![bp::StackAction::Drop {
+                        count: if c.button == 1 {
+                            1
+                        } else {
+                            item.count.max(0) as u8
+                        },
+                        source: slot_ref(bridge, container, slot),
+                        randomly: false,
+                    }]
+                }
+            }
+            // Dragging: each slot the drag passes over gives one item to the
+            // cursor, and the release leaves them there.
+            5 => {
+                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                    return Vec::new();
+                };
+                let add = c.button == 1 || c.button == 5;
+                if !add {
+                    return Vec::new();
+                }
+                vec![bp::StackAction::Take {
+                    count: 1,
+                    source: slot_ref(bridge, container, slot),
+                    destination: cursor,
+                }]
+            }
+            // Double-click: collect the stacks that match what is on the
+            // cursor, one slot at a time.
+            6 => {
+                let Some((container, slot)) = bedrock_slot_of(c.slot) else {
+                    return Vec::new();
+                };
+                let Some(here) = item_at(bridge, container, slot) else {
+                    return Vec::new();
+                };
+                let held = *bridge.cursor.lock().unwrap();
+                match held {
+                    Some(holding) if holding.runtime_id == here.runtime_id => {
+                        vec![bp::StackAction::Place {
+                            count: holding.count.max(0) as u8,
+                            source: cursor,
+                            destination: slot_ref(bridge, container, slot),
+                        }]
+                    }
+                    _ => vec![bp::StackAction::Take {
+                        count: here.count.max(0) as u8,
+                        source: slot_ref(bridge, container, slot),
+                        destination: cursor,
+                    }],
+                }
+            }
+            _ => Vec::new(),
+        };
+        if actions.is_empty() {
+            return Vec::new();
+        }
+        vec![bp::Out::ItemStackRequest {
+            request_id,
+            actions,
+        }]
+    }
+
+    /// The server's answer to a move. It names the slots it settled on, which is
+    /// where the counts come from; a refusal means the game has to be shown the
+    /// truth again.
+    fn stack_response(
+        ctx: &Context,
+        bridge: &Bridge,
+        response: &bp::ItemStackResponse,
+    ) -> Vec<Event> {
+        if response.result != 0 {
+            bedrock_core::nethernet::trace(format!(
+                "inventory move {} refused: result {}",
+                response.request_id, response.result
+            ));
+            return vec![inventory_content(ctx, bridge)];
+        }
+        let mut events = Vec::new();
+        for container in &response.containers {
+            let name = container.container.name;
+            for slot in &container.slots {
+                let count = i16::from(slot.count);
+                let existing = item_at(bridge, name, slot.slot);
+                let settled = if count <= 0 {
+                    None
+                } else {
+                    existing.map(|mut d| {
+                        d.count = count;
+                        d.net_id = Some(slot.stack_id as u32);
+                        d
+                    })
+                };
+                set_item_at(bridge, name, slot.slot, settled);
+                if name == CONTAINER_CURSOR {
+                    events.push(Event::Packet(Box::new(play::Clientbound::SetCursorItem(
+                        play::SetCursorItem {
+                            item: settled.and_then(|d| {
+                                map_item_by_id(ctx, d.runtime_id, i32::from(d.count))
+                            }),
+                        },
+                    ))));
+                    continue;
+                }
+                let Some(java) = java_slot_of(name, slot.slot) else {
+                    continue;
+                };
+                events.push(Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                        container: 0,
+                        state: 0,
+                        slot: java,
+                        item: settled
+                            .and_then(|d| map_item_by_id(ctx, d.runtime_id, i32::from(d.count))),
+                    }),
+                )));
+            }
+        }
+        events
     }
 
     /// The Bedrock input flags and move vector for one tick. Held keys come
@@ -3081,28 +3493,14 @@ mod translate {
                     block_id: 0,
                 }]
             }
-            // Dropping an item: the game clicks "outside" the window (slot
-            // -999). Bedrock performs it as an item-release transaction.
-            play::Serverbound::ContainerClick(c) if c.slot == -999 => {
-                let pos = *bridge.position.lock().unwrap();
-                let slot = bridge.hotbar.load(Ordering::Relaxed) as i32;
-                let item = held_item(bridge);
+            // A click in the game's inventory: it becomes the move the server
+            // wants, since the server owns the inventory.
+            play::Serverbound::ContainerClick(c) => {
                 bedrock_core::nethernet::trace(format!(
-                    "DROP click slot={} button={} input={} hotbar={slot} item={item:?}",
-                    c.slot, c.button, c.input
+                    "INV click container={} slot={} button={} input={}",
+                    c.container, c.slot, c.button, c.input
                 ));
-                {
-                    let mut items = bridge.items.lock().unwrap();
-                    if let Some(entry) = items.get_mut(slot.max(0) as usize) {
-                        *entry = None;
-                    }
-                }
-                vec![bp::Out::ItemRelease {
-                    slot,
-                    count: item.map_or(1, |i| i.count.max(1) as u8),
-                    item,
-                    position: pos,
-                }]
+                container_click(bridge, c)
             }
             // A creative-screen drop: the game sets slot -1, which drops the
             // stack from the hand. Bedrock does it as an item-release.
