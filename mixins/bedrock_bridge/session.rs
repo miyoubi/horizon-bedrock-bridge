@@ -104,9 +104,6 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
-    /// When to ask the server to revive the player, in epoch milliseconds.
-    /// Zero means alive.
-    respawn_due: AtomicI64,
     /// Last position sent to the server; rotation-only updates reuse it, so a
     /// MovePlayerRot never looks like a teleport to (0,0,0).
     position: Mutex<[f32; 3]>,
@@ -159,9 +156,10 @@ struct Bridge {
     /// them. Bedrock carries hunger in its attributes and health in `SetHealth`,
     /// while Java sends all three together, so they are kept here.
     vitals: Mutex<Vitals>,
-    /// Whether the server has killed the player, so a `Respawn` is a real one
-    /// and not the one at the end of the join handshake.
-    dead: AtomicBool,
+    /// Set when the player asks to respawn from the death screen, so the
+    /// server's `Respawn` is answered only for their own request and not for
+    /// the one that ends the join handshake.
+    respawn_asked: AtomicBool,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -203,7 +201,6 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
-        respawn_due: AtomicI64::new(0),
         position: Mutex::new([0.0; 3]),
         rotation: Mutex::new([0.0; 2]),
         input: AtomicI64::new(0),
@@ -220,7 +217,7 @@ pub fn try_connect(
         items: Mutex::new(vec![None; 36]),
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
-        dead: AtomicBool::new(false),
+        respawn_asked: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -482,30 +479,6 @@ fn run(
                     from_server: false,
                 });
                 return;
-            }
-        }
-        // Keep the input stream going, as a real client does, so the server
-        // never sees the player go silent (other clients would see it frozen).
-        // Only once we are in-world: a `PlayerAuthInput` during login is an
-        // unexpected packet and the server kicks with reason 49.
-        if ctx.runtime_id != 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let due = bridge.respawn_due.load(Ordering::Relaxed);
-            if due != 0 && now >= due {
-                bridge.respawn_due.store(0, Ordering::Relaxed);
-                let position = *bridge.position.lock().unwrap();
-                bedrock_core::nethernet::trace(format!("respawn at {position:?}"));
-                let packet = bedrock_core::protocol::Out::Respawn {
-                    position,
-                    state: 2,
-                    runtime_id: ctx.runtime_id,
-                };
-                if let Err(e) = client.send(&[packet]) {
-                    log::warn!("bedrock: respawn failed: {e}");
-                }
             }
         }
         // Translate more packets when a backlog built up, so received entities,
@@ -1330,7 +1303,6 @@ mod translate {
             bp::Packet::SetHealth(health) => {
                 let mut vitals = bridge.vitals.lock().unwrap();
                 vitals.health = *health as f32;
-                bridge.dead.store(*health <= 0, Ordering::Relaxed);
                 let set = play::SetHealth {
                     health: vitals.health,
                     food: vitals.food,
@@ -1973,17 +1945,8 @@ mod translate {
                 if id == ctx.runtime_id as u64 {
                     // Our own death. The game shows its death screen from this
                     // packet and nothing else announces it, so the player died
-                    // with no screen and stayed on their feet.
-                    // The game's death screen cannot be dismissed back to the
-                    // bridge -- pressing respawn sends it nothing -- so the
-                    // server is asked to revive us shortly after the screen
-                    // appears and the position packet that follows closes it.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    bridge.respawn_due.store(now + 1500, Ordering::Relaxed);
-                    bridge.dead.store(true, Ordering::Relaxed);
+                    // with no screen and stayed on their feet. The screen stays
+                    // up until the player asks for a respawn.
                     return vec![Event::Packet(Box::new(
                         play::Clientbound::PlayerCombatKill(play::PlayerCombatKill {
                             id: id as i32,
@@ -2021,14 +1984,12 @@ mod translate {
             // alone is not one Java understands, which is why the screen used
             // to sit there until the client rejoined.
             bp::Packet::Respawn { position, state } if *state == 1 => {
-                // The same handshake ends the join too, before the player has
-                // ever been hurt; only a death needs the Java respawn.
-                if !bridge.dead.swap(false, Ordering::Relaxed) {
+                // The same handshake ends the join handshake too, and the server
+                // may send it on its own; only the player's own respawn request
+                // closes the death screen.
+                if !bridge.respawn_asked.swap(false, Ordering::Relaxed) {
                     return Vec::new();
                 }
-                // The server has respawned us; the nudge its death screen asked
-                // for has been answered.
-                bridge.respawn_due.store(0, Ordering::Relaxed);
                 let mut events = Vec::new();
                 if let Some(spawn) = ctx.spawn_info.clone() {
                     events.push(Event::Packet(Box::new(play::Clientbound::Respawn(
@@ -2699,6 +2660,7 @@ mod translate {
             // Bedrock respawns through its own handshake, sent as a client that
             // is ready to spawn, and the server then places the player.
             play::Serverbound::ClientCommand(c) if c.action == 0 => {
+                bridge.respawn_asked.store(true, Ordering::Relaxed);
                 let position = *bridge.position.lock().unwrap();
                 let runtime_id = bridge.runtime_id.load(Ordering::Relaxed).max(0) as u64;
                 vec![bp::Out::Respawn {
@@ -2872,18 +2834,6 @@ mod translate {
                 source: String::new(),
                 message: format!("/{}", c.command),
             }],
-            // ServerboundClientCommandPacket: 0 is respawn. A dead player's
-            // respawn sends it, and the server revives the player only once it
-            // hears back, so report the client ready to spawn.
-            play::Serverbound::ClientCommand(c) if c.action == 0 => {
-                let position = *bridge.position.lock().unwrap();
-                bedrock_core::nethernet::trace(format!("recv ClientCommand respawn at {position:?}"));
-                vec![bp::Out::Respawn {
-                    position,
-                    state: 2, // ClientReadyToSpawn
-                    runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
-                }]
-            }
             _ => Vec::new(),
         }
     }
