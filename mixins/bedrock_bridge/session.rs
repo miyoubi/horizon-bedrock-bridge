@@ -163,6 +163,9 @@ struct Bridge {
     /// Set when a teleport (a respawn) has just been applied, so the next input
     /// tells the server it was handled.
     teleport_ack: AtomicBool,
+    /// Block uses wait for the network thread, which is where the column data
+    /// lives and the clicked block's state can be looked up.
+    pending_use: Mutex<Vec<play::UseItemOn>>,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -222,6 +225,7 @@ pub fn try_connect(
         vitals: Mutex::new(Vitals::default()),
         respawn_asked: AtomicBool::new(false),
         teleport_ack: AtomicBool::new(false),
+        pending_use: Mutex::new(Vec::new()),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -272,6 +276,12 @@ pub fn send(session: &Session, packet: &play::Serverbound) -> bool {
     let Some(bridge) = map.get(&session.address) else {
         return false;
     };
+    // A block use needs the clicked block's Bedrock state, and only the
+    // network thread holds the column data.
+    if let play::Serverbound::UseItemOn(u) = packet {
+        bridge.pending_use.lock().unwrap().push(u.clone());
+        return true;
+    }
     let out = translate::serverbound(bridge, packet);
     if !out.is_empty() {
         let _ = bridge.outbound.send(out);
@@ -500,6 +510,14 @@ fn run(
             for event in translate::clientbound(&mut ctx, &**bridge, &packet) {
                 let _ = events.send(event);
             }
+            // Block uses were queued by the game thread for this one, which
+            // holds the column data the transaction needs.
+            for u in bridge.pending_use.lock().unwrap().drain(..) {
+                let out = translate::use_item_on(&mut ctx, &**bridge, &u);
+                if !out.is_empty() {
+                    let _ = client.send(&out);
+                }
+            }
             // React to the resource-pack phase automatically.
             if let bedrock_core::protocol::Packet::PlayStatus(s) = &packet {
                 if *s == 0 {
@@ -682,6 +700,9 @@ mod translate {
         registry: horizon_world::registry::BlockRegistry,
         table: bedrock_core::blockstates::BlockStates,
         cache: std::collections::HashMap<i32, u32>,
+        /// The other direction, built when a block use needs the runtime id of
+        /// the block that was clicked.
+        reverse: Option<std::collections::HashMap<u32, i32>>,
         pub air: u32,
         /// The runtime id of air in the block palette. A sub-chunk's layers are
         /// filled from the bottom up, and a layer of air means the block is in
@@ -720,6 +741,7 @@ mod translate {
                 registry,
                 table,
                 cache: std::collections::HashMap::new(),
+                reverse: None,
                 air,
                 air_runtime,
                 light,
@@ -734,6 +756,23 @@ mod translate {
             let id = self.resolve(runtime_id);
             self.cache.insert(runtime_id, id);
             id
+        }
+
+        /// The Bedrock runtime id for one of the game's block states, which is
+        /// what a block-use transaction reports as the block it clicked.
+        pub fn bedrock(&mut self, java: u32) -> u32 {
+            if self.reverse.is_none() {
+                let mut map = std::collections::HashMap::new();
+                for id in 0..self.table.len() as i32 {
+                    let state = self.resolve(id);
+                    map.entry(state).or_insert(id);
+                }
+                self.reverse = Some(map);
+            }
+            self.reverse
+                .as_ref()
+                .and_then(|map| map.get(&java).copied())
+                .unwrap_or(0) as u32
         }
 
         fn resolve(&self, runtime_id: i32) -> u32 {
@@ -2681,8 +2720,33 @@ mod translate {
         out
     }
 
+    /// A block use, translated where the columns are: the state of the clicked
+    /// block goes into the transaction as the server's check.
+    pub fn use_item_on(ctx: &mut Context<'_>, bridge: &Bridge, u: &play::UseItemOn) -> Vec<bp::Out> {
+        let state = ctx
+            .chunks
+            .get(&(u.pos[0] >> 4, u.pos[2] >> 4))
+            .map_or(0, |chunk| chunk.get(u.pos[0] & 15, u.pos[1], u.pos[2]));
+        let block_id = ctx.blocks.as_mut().map_or(0, |blocks| blocks.bedrock(state));
+        serverbound_with(
+            bridge,
+            &play::Serverbound::UseItemOn(u.clone()),
+            block_id,
+        )
+    }
+
     /// Java serverbound → Bedrock.
     pub fn serverbound(bridge: &Bridge, packet: &play::Serverbound) -> Vec<bp::Out> {
+        serverbound_with(bridge, packet, 0)
+    }
+
+    /// A block use also reports the clicked block's Bedrock state, which only
+    /// the network thread can look up. Everything else passes zero.
+    pub fn serverbound_with(
+        bridge: &Bridge,
+        packet: &play::Serverbound,
+        block_id: u32,
+    ) -> Vec<bp::Out> {
         match packet {
             // Movement and input only update the bridge state; one
             // `PlayerAuthInput` goes out at the end of the client tick with all
@@ -2791,6 +2855,7 @@ mod translate {
                     runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
                     slot: i.slot as u8,
                     window_id: 0,
+                    item: held_item(bridge),
                 }]
             }
             // Placing or using an item on a block: Bedrock's item-use
@@ -2798,18 +2863,18 @@ mod translate {
             play::Serverbound::UseItemOn(u) => {
                 let pos = *bridge.position.lock().unwrap();
                 let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
+                // The packet must describe the slot as the server still has
+                // it; the tally moves only after that.
+                let held = held_item(bridge);
                 bedrock_core::nethernet::trace(format!(
-                    "use item on {:?} face={} inside={} hotbar={} item={:?}",
+                    "use item on {:?} face={} inside={} hotbar={} item={:?} block={block_id}",
                     u.pos,
                     u.face,
                     u.inside,
                     bridge.hotbar.load(Ordering::Relaxed),
-                    held_item(bridge)
+                    held
                 ));
-                // A placement consumes one of the stack, and the server does
-                // not echo that back, so the slot the next transaction names
-                // would otherwise still hold the old count.
-                if let Some(from) = held_item(bridge) {
+                if let Some(from) = held {
                     let slot = bridge.hotbar.load(Ordering::Relaxed).max(0) as usize;
                     let mut items = bridge.items.lock().unwrap();
                     if let Some(entry) = items.get_mut(slot) {
@@ -2844,6 +2909,11 @@ mod translate {
                     ]
                 };
                 vec![
+                    // Placing swings the arm, as a hit does.
+                    bp::Out::Animate {
+                        runtime_id,
+                        action: 1, // swing_arm
+                    },
                     bp::Out::PlayerAction {
                         runtime_id,
                         action: 28, // start item use on
@@ -2856,9 +2926,10 @@ mod translate {
                         face: u.face,
                         hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
                         action: 0, // place
-                        item: held_item(bridge),
+                        item: held,
                         cursor: u.cursor,
                         position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                        block_id,
                     },
                     bp::Out::PlayerAction {
                         runtime_id,
@@ -2866,6 +2937,14 @@ mod translate {
                         position: u.pos,
                         result: [0; 3],
                         face: 0,
+                    },
+                    // The stack shrank; the held item the server shows must say
+                    // so, or everyone else keeps seeing the old count.
+                    bp::Out::MobEquipment {
+                        runtime_id,
+                        slot: bridge.hotbar.load(Ordering::Relaxed).max(0) as u8,
+                        window_id: 0,
+                        item: held_item(bridge),
                     },
                 ]
             }
@@ -2881,6 +2960,7 @@ mod translate {
                     item: held_item(bridge),
                     cursor: [0.0; 3],
                     position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    block_id: 0,
                 }]
             }
             // Dropping an item: the game clicks "outside" the window (slot

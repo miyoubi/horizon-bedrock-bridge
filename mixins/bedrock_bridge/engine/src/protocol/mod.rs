@@ -241,6 +241,7 @@ pub enum Out {
         runtime_id: u64,
         slot: u8,
         window_id: u8,
+        item: Option<ItemDescriptor>,
     },
     /// Hitting or interacting with an entity. Bedrock does this as an
     /// `InventoryTransaction` of type item-use-on-entity, not a dedicated
@@ -269,6 +270,9 @@ pub enum Out {
         item: Option<ItemDescriptor>,
         cursor: [f32; 3],
         position: [f32; 3],
+        /// The clicked block's own runtime id; the server checks the use
+        /// against it.
+        block_id: u32,
     },
     Text {
         kind: u8,
@@ -749,10 +753,11 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             runtime_id,
             slot,
             window_id,
+            item,
         } => {
             w.varint(ids::MOB_EQUIPMENT);
             w.varlong(*runtime_id);
-            write_item(&mut w, None);
+            write_item(&mut w, *item);
             // Slot, selected slot and container id: three bytes, not two. The
             // missing one truncated the packet, which is what made merely
             // selecting an item drop the connection.
@@ -795,6 +800,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             item,
             cursor,
             position,
+            block_id,
         } => {
             w.varint(ids::INVENTORY_TRANSACTION);
             w.varint(0); // legacy request id
@@ -810,6 +816,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
                     w.varint(0); // source: container inventory
                     w.bool(true); // a container id follows
                     w.u8(0); // the player's inventory
+                    w.bool(true); // source flags follow
                     w.bool(false); // no source flags
                     w.varint(*hotbar_slot as u32);
                     write_item(&mut w, Some(from));
@@ -846,7 +853,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.f32(cursor[0]);
             w.f32(cursor[1]);
             w.f32(cursor[2]); // the position clicked on the block
-            w.varint(0); // the target block's runtime id
+            w.varint(*block_id); // the clicked block's runtime id
             w.u8(1); // ItemUsePredictedResult: success
             w.u8(0); // cooldown state: off
         }
