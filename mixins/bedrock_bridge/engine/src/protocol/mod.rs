@@ -970,7 +970,8 @@ pub fn encode(packet: &Out) -> Vec<u8> {
                         source,
                         destination,
                     } => {
-                        w.u8(0); // Take
+                        w.u8(0); // the action the list selects
+                        w.u8(0); // its own const action type
                         w.u8(*count);
                         write_slot(&mut w, source);
                         write_slot(&mut w, destination);
@@ -980,13 +981,15 @@ pub fn encode(packet: &Out) -> Vec<u8> {
                         source,
                         destination,
                     } => {
-                        w.u8(1); // Place
+                        w.u8(1); // the action the list selects
+                        w.u8(1); // its own const action type
                         w.u8(*count);
                         write_slot(&mut w, source);
                         write_slot(&mut w, destination);
                     }
                     StackAction::Swap { first, second } => {
-                        w.u8(2); // Swap
+                        w.u8(2); // the action the list selects
+                        w.u8(2); // its own const action type
                         write_slot(&mut w, first);
                         write_slot(&mut w, second);
                     }
@@ -995,13 +998,15 @@ pub fn encode(packet: &Out) -> Vec<u8> {
                         source,
                         randomly,
                     } => {
-                        w.u8(3); // Drop
+                        w.u8(3); // the action the list selects
+                        w.u8(3); // its own const action type
                         w.u8(*count);
                         write_slot(&mut w, source);
                         w.bool(*randomly);
                     }
                     StackAction::Destroy { count, source } => {
-                        w.u8(4); // Destroy
+                        w.u8(4); // the action the list selects
+                        w.u8(4); // its own const action type
                         w.u8(*count);
                         write_slot(&mut w, source);
                     }
@@ -1106,7 +1111,12 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(*id).bytes(body);
         }
     }
-    w.into_inner()
+    let out = w.into_inner();
+    if let Out::ItemStackRequest { request_id, .. } = packet {
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        crate::nethernet::trace(format!("STACK REQ id={request_id} {hex}"));
+    }
+    out
 }
 
 /// Frame packets into a batch payload (uncompressed).
@@ -1160,7 +1170,7 @@ mod inventory_tests {
                 0x01, // one request
                 0x02, // request id 1, zigzag
                 0x01, // one action
-                0x00, // Take
+                0x00, 0x00, // Take, then its const action type
                 0x01, // one item
                 0x1d, 0x00, 0x09, 0x00, // source: inventory 29, slot 9, stack 0
                 0x3b, 0x00, 0x00, 0x00, // destination: cursor 59, slot 0, stack 0
@@ -1188,7 +1198,7 @@ mod inventory_tests {
                 0x01, // one request
                 0x08, // request id 4, zigzag
                 0x01, // one action
-                0x03, 0x03, // Drop, three items
+                0x03, 0x03, 0x03, // Drop: the action, its const type, three items
                 0x1c, 0x00, 0x02, 0x00, // source: hotbar 28, slot 2, stack 0
                 0x00, // not scattered
                 0x00, 0x00, 0x00, 0x00, 0x00,
