@@ -736,9 +736,14 @@ mod translate {
                     continue;
                 }
                 non_empty += 1;
-                // Column order matches `chunk::java_index`.
-                let column = ((i >> 4) & 15) * 16 + (i & 15);
-                let height = base + (i >> 8) as i32 - dimension.min_y + 1;
+                // Column order matches `chunk::java_index`: the section index
+                // packs x, then z, then y, so the height is the y component and
+                // not x, which put every heightmap entry somewhere else.
+                let x = (i >> 8) & 15;
+                let z = (i >> 4) & 15;
+                let y = i & 15;
+                let column = z * 16 + x;
+                let height = base + y as i32 - dimension.min_y + 1;
                 if height > heights[column] {
                     heights[column] = height;
                 }

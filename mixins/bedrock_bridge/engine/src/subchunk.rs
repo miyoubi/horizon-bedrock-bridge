@@ -126,14 +126,14 @@ impl SubChunk {
             } else {
                 BitStorage::read(r, bits, 4096)?
             };
-            let palette_size = if bits == 0 { 1 } else { r.zigzag32()? };
+            let palette_size = if bits == 0 { 1 } else { r.varint()? as i32 };
             if palette_size < 0 {
                 return Err(Error::decode("negative palette size"));
             }
             let palette = if runtime {
                 let mut ids = Vec::with_capacity((palette_size as usize).min(4096));
                 for _ in 0..palette_size {
-                    ids.push(r.zigzag32()?);
+                    ids.push(r.varint()? as i32);
                 }
                 Palette::Runtime(ids)
             } else {
@@ -175,9 +175,9 @@ impl SubChunk {
                     let header = (storage.storage.bits() << 1) | 1;
                     w.u8(header);
                     storage.storage.write(w);
-                    w.zigzag32(ids.len() as i32);
+                    w.varint(ids.len() as u32);
                     for id in ids {
-                        w.zigzag32(*id);
+                        w.varint(*id as u32);
                     }
                 }
                 Palette::Persistent(entries) => {
