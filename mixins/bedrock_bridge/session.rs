@@ -2531,9 +2531,10 @@ mod translate {
             // respawn sends it, and the server revives the player only once it
             // hears back, so report the client ready to spawn.
             play::Serverbound::ClientCommand(c) if c.action == 0 => {
-                bedrock_core::nethernet::trace("recv ClientCommand respawn".to_string());
+                let position = *bridge.position.lock().unwrap();
+                bedrock_core::nethernet::trace(format!("recv ClientCommand respawn at {position:?}"));
                 vec![bp::Out::Respawn {
-                    position: [0.0; 3],
+                    position,
                     state: 2, // ClientReadyToSpawn
                     runtime_id: bridge.runtime_id.load(Ordering::Relaxed) as u64,
                 }]
