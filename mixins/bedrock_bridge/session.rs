@@ -629,6 +629,10 @@ mod translate {
         table: bedrock_core::blockstates::BlockStates,
         cache: std::collections::HashMap<i32, u32>,
         pub air: u32,
+        /// The runtime id of air in the block palette. A sub-chunk's layers are
+        /// filled from the bottom up, and a layer of air means the block is in
+        /// one of the layers above it.
+        pub air_runtime: i32,
     }
 
     impl Blocks {
@@ -636,11 +640,18 @@ mod translate {
             let file = std::fs::File::open(resources.join("facts.json")).ok()?;
             let registry = horizon_world::registry::BlockRegistry::from_facts_json(file).ok()?;
             let air = registry.default_state("minecraft:air")?.0;
+            let table = bedrock_core::blockstates::BlockStates::bundled();
+            let air_runtime = (0..table.len() as i32)
+                .find(|id| {
+                    matches!(table.get(*id), Some((name, _)) if name == "minecraft:air")
+                })
+                .unwrap_or(0);
             Some(Self {
                 registry,
-                table: bedrock_core::blockstates::BlockStates::bundled(),
+                table,
                 cache: std::collections::HashMap::new(),
                 air,
+                air_runtime,
             })
         }
 
@@ -1763,7 +1774,8 @@ mod translate {
                 }
                 // Whatever blocks the payload carries; the rest arrive as
                 // sub-chunk replies.
-                if let Ok(decoded) = bedrock_core::chunk::decode_sections(c) {
+                let air = ctx.blocks.as_ref().map(|b| b.air_runtime).unwrap_or(0);
+                if let Ok(decoded) = bedrock_core::chunk::decode_sections(c, air) {
                     let entry = ctx.sections.entry((c.chunk_x, c.chunk_z)).or_default();
                     for section in decoded {
                         entry.insert(section.y, section.blocks);
@@ -1891,11 +1903,12 @@ mod translate {
                     // Y 0). `column` then places it against the dimension's
                     // `min_y`, which is the shift that was missing before.
                     let y = (sub.position[1] + i32::from(entry.offset[1])) as i8;
+                    let air = ctx.blocks.as_ref().map(|b| b.air_runtime).unwrap_or(0);
                     let mut ids = vec![0u32; 4096];
                     for sy in 0..16usize {
                         for sz in 0..16usize {
                             for sx in 0..16usize {
-                                let id = sc.top_runtime_id(sx, sy, sz).unwrap_or(0);
+                                let id = sc.runtime_id(sx, sy, sz, air).unwrap_or(0);
                                 ids[(sy * 16 + sz) * 16 + sx] = u32::try_from(id).unwrap_or(0);
                             }
                         }

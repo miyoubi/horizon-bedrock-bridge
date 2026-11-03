@@ -193,12 +193,15 @@ impl SubChunk {
         }
     }
 
-    /// The runtime id of the top-most storage's block at `(x, y, z)`.
-    pub fn top_runtime_id(&self, x: usize, y: usize, z: usize) -> Option<i32> {
-        // Layer zero is the block itself. The layers above hold fluids and
-        // foliage, and taking the topmost one unconditionally painted water
-        // over the sand and stone underneath it.
-        self.storages.iter().find_map(|s| s.runtime_id_at(x, y, z))
+    /// The runtime id of the block at `(x, y, z)`, which is the lowest layer
+    /// that is not air. Layer zero is the block itself; the layers above it
+    /// carry the water, lava and foliage in cells whose block layer is air, so
+    /// a layer of air means "look above", not "this cell is air".
+    pub fn runtime_id(&self, x: usize, y: usize, z: usize, air: i32) -> Option<i32> {
+        self.storages
+            .iter()
+            .find_map(|s| s.runtime_id_at(x, y, z).filter(|id| *id != air))
+            .or_else(|| self.storages.first().map(|_| air))
     }
 }
 
@@ -237,10 +240,10 @@ mod tests {
         let version = r.u8().unwrap();
         let back = SubChunk::read(&mut r, version).unwrap();
         assert_eq!(back, section);
-        assert_eq!(back.top_runtime_id(1, 2, 3), Some(10));
-        assert_eq!(back.top_runtime_id(5, 6, 7), Some(20));
-        assert_eq!(back.top_runtime_id(10, 11, 12), Some(30));
-        assert_eq!(back.top_runtime_id(0, 0, 0), Some(0));
+        assert_eq!(back.runtime_id(1, 2, 3, 0), Some(10));
+        assert_eq!(back.runtime_id(5, 6, 7, 0), Some(20));
+        assert_eq!(back.runtime_id(10, 11, 12, 0), Some(30));
+        assert_eq!(back.runtime_id(0, 0, 0, 0), Some(0));
     }
 
     #[test]
@@ -249,7 +252,7 @@ mod tests {
         let mut r = Reader::new(&[0u8, 0u8]);
         let section = SubChunk::read(&mut r, 9).unwrap();
         assert!(section.empty);
-        assert_eq!(section.top_runtime_id(0, 0, 0), None);
+        assert_eq!(section.runtime_id(0, 0, 0, 0), None);
     }
 
     #[test]

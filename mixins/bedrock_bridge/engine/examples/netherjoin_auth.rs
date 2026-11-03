@@ -252,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for y in 0..16 {
                                         for z in 0..16 {
                                             for x in 0..16 {
-                                                let rid = sub.top_runtime_id(x, y, z).unwrap_or(0);
+                                                let rid = sub.runtime_id(x, y, z, 0).unwrap_or(0);
                                                 if rid != 0 {
                                                     rid_nonzero += 1;
                                                     sample_rid = rid;
@@ -317,7 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if chunk_seen <= 3 {
                         if let Some(t) = table.as_ref() {
-                            match bedrock_core::chunk::decode_sections(&c) {
+                            match bedrock_core::chunk::decode_sections(&c, 0) {
                                 Ok(sections) => {
                                     let total: usize =
                                         sections.iter().map(|s| s.blocks.len()).sum();

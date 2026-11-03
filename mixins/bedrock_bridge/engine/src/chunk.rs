@@ -37,7 +37,7 @@ pub fn bedrock_block(
 }
 
 /// Decode every sub-chunk of `chunk` into Java block states.
-pub fn decode_sections(chunk: &LevelChunk) -> Result<Vec<ChunkSection>> {
+pub fn decode_sections(chunk: &LevelChunk, air: i32) -> Result<Vec<ChunkSection>> {
     // The payload is the sections themselves, back to back; the count is on the
     // packet. Each section starts with its version byte, and only a version 9
     // one carries its own Y, so the rest are placed by their position in the
@@ -56,7 +56,7 @@ pub fn decode_sections(chunk: &LevelChunk) -> Result<Vec<ChunkSection>> {
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
-                    let runtime_id = sub.top_runtime_id(x, y, z).unwrap_or(0);
+                    let runtime_id = sub.runtime_id(x, y, z, air).unwrap_or(0);
                     // Runtime ids are the Bedrock block identity; the mod maps
                     // them to the game's block-state ids.
                     blocks[java_index(x, y, z)] = u32::try_from(runtime_id).unwrap_or(0);
