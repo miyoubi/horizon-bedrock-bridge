@@ -801,18 +801,90 @@ mod translate {
 
         // Light sections run from one below the lowest block section upwards.
         let light_sections = count + 2;
-        // Declare every light section empty rather than filling them in. The
-        // Bedrock stream carries no light of its own -- its client works its
-        // lighting out locally from the blocks and the heightmap -- so the only
-        // honest answer is to say there is none and let the game's light engine
-        // light the column. A flat fill lights everything evenly and a
-        // heightmap fill leaves slopes unlit; both fight the engine.
+        // Sky light, worked out here and spread sideways. The Bedrock stream
+        // carries no light of the server's own, and the game's light engine only
+        // relights the chunks around the player: marking the sections empty left
+        // a dark ring that never lifted. Seeding the open sky at 15 and letting
+        // it spread down and across puts the sides of slopes in shade instead of
+        // leaving them black, and every section is filled, so nothing is dark
+        // for want of data.
+        let world_height = dimension.height as usize;
+        let at = |y: usize, z: usize, x: usize| y * 256 + z * 16 + x;
+        let mut levels = vec![0u8; world_height * 256];
+        let mut queue: std::collections::VecDeque<(usize, usize, usize)> =
+            std::collections::VecDeque::new();
+        for z in 0..16usize {
+            for x in 0..16usize {
+                // `heights` counts from `min_y`, so the surface block's own cell
+                // is one below the value.
+                let top = (heights[z * 16 + x] as usize).min(world_height);
+                for y in top.saturating_sub(1)..world_height {
+                    levels[at(y, z, x)] = 15;
+                }
+                if top > 0 {
+                    queue.push_back((top - 1, z, x));
+                }
+            }
+        }
+        while let Some((y, z, x)) = queue.pop_front() {
+            let level = levels[at(y, z, x)];
+            if level <= 1 {
+                continue;
+            }
+            for (dz, dx) in [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
+                let nz = z as i32 + dz;
+                let nx = x as i32 + dx;
+                if !(0..16).contains(&nz) || !(0..16).contains(&nx) {
+                    continue;
+                }
+                let (nz, nx) = (nz as usize, nx as usize);
+                if levels[at(y, nz, nx)] < level - 1 {
+                    levels[at(y, nz, nx)] = level - 1;
+                    queue.push_back((y, nz, nx));
+                }
+            }
+            if y > 0 && levels[at(y - 1, z, x)] < level - 1 {
+                levels[at(y - 1, z, x)] = level - 1;
+                queue.push_back((y - 1, z, x));
+            }
+        }
+        let sky: Vec<Vec<u8>> = (0..light_sections)
+            .map(|section| {
+                let mut layer = vec![0u8; 2048];
+                // Light section i covers block section i - 1.
+                let base = dimension.min_y + (section as i32 - 1) * 16;
+                for y in 0..16usize {
+                    let world = base + y as i32 - dimension.min_y;
+                    if !(0..world_height as i32).contains(&world) {
+                        continue;
+                    }
+                    for z in 0..16usize {
+                        for x in 0..16usize {
+                            let level = levels[at(world as usize, z, x)];
+                            if level == 0 {
+                                continue;
+                            }
+                            let index = y * 256 + z * 16 + x;
+                            let byte = index >> 1;
+                            if index & 1 == 0 {
+                                layer[byte] |= level;
+                            } else {
+                                layer[byte] |= level << 4;
+                            }
+                        }
+                    }
+                }
+                layer
+            })
+            .collect();
         let light = LightData {
-            sky_mask: Vec::new(),
+            sky_mask: bitset(light_sections),
             block_mask: Vec::new(),
-            empty_sky_mask: bitset(light_sections),
+            empty_sky_mask: Vec::new(),
+            // Block light is zero everywhere, which the empty mask conveys
+            // without sending 2048 bytes per section.
             empty_block_mask: bitset(light_sections),
-            sky: Vec::new(),
+            sky,
             block: Vec::new(),
         };
 
