@@ -1626,12 +1626,16 @@ mod translate {
                             horizon_protocol::entity_data::serializer::BYTE,
                             horizon_protocol::entity_data::Value::Byte((*f as u64 & 0x2B) as i8),
                         )),
+                        // Bedrock sends an empty tag for almost every
+                        // entity. Translating it as a component puts an empty
+                        // name plate over them, so an empty tag clears the
+                        // name instead.
                         (4, bp::MetaValue::String(name)) => values.push((
                             2,
                             horizon_protocol::entity_data::serializer::OPTIONAL_COMPONENT,
-                            horizon_protocol::entity_data::Value::OptText(Some(
-                                text_component(name),
-                            )),
+                            horizon_protocol::entity_data::Value::OptText(
+                                (!name.trim().is_empty()).then(|| text_component(name)),
+                            ),
                         )),
                         (81, bp::MetaValue::Byte(show)) => values.push((
                             3,
