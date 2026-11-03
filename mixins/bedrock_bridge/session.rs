@@ -735,6 +735,10 @@ mod translate {
         let count = dimension.sections();
         let mut filled: Vec<Option<Section>> = (0..count).map(|_| None).collect();
         let mut heights = [0i32; 256];
+        // Which cells hold a block, so the light can travel through air only.
+        // Spreading it through solids as well stepped the level down once per
+        // block and drew a contour of dark bands across every slope.
+        let mut solid = vec![false; 384 * 256];
         for (&y, ids) in &known {
             let base = i32::from(y) * 16;
             let Some(slot) = usize::try_from((base - dimension.min_y) / 16)
@@ -759,6 +763,10 @@ mod translate {
                 let z = (i >> 4) & 15;
                 let y = i & 15;
                 let column = z * 16 + x;
+                let world_y = base + y as i32 - dimension.min_y;
+                if (0..384).contains(&world_y) {
+                    solid[world_y as usize * 256 + column] = true;
+                }
                 let height = base + y as i32 - dimension.min_y + 1;
                 if height > heights[column] {
                     heights[column] = height;
@@ -838,12 +846,15 @@ mod translate {
                     continue;
                 }
                 let (nz, nx) = (nz as usize, nx as usize);
+                if solid[at(y, nz, nx)] {
+                    continue;
+                }
                 if levels[at(y, nz, nx)] < level - 1 {
                     levels[at(y, nz, nx)] = level - 1;
                     queue.push_back((y, nz, nx));
                 }
             }
-            if y > 0 && levels[at(y - 1, z, x)] < level - 1 {
+            if y > 0 && !solid[at(y - 1, z, x)] && levels[at(y - 1, z, x)] < level - 1 {
                 levels[at(y - 1, z, x)] = level - 1;
                 queue.push_back((y - 1, z, x));
             }
