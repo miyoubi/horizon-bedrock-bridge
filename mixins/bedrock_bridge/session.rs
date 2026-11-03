@@ -366,6 +366,7 @@ fn run(
         drops: std::collections::HashMap::new(),
         drop_owner: std::collections::HashMap::new(),
         uniques: std::collections::HashMap::new(),
+        drop_children: std::collections::HashMap::new(),
         name: name.to_string(),
         items: Vec::new(),
         biomes,
@@ -559,6 +560,9 @@ mod translate {
         /// entity by its unique id, so the runtime id the game was told about
         /// has to be found from it before the removal can be passed on.
         pub uniques: std::collections::HashMap<u64, u64>,
+        /// The dropped stacks the server folded into another one, by the stack
+        /// they joined. They stay drawn where they fell and go in with it.
+        pub drop_children: std::collections::HashMap<u64, Vec<u64>>,
         /// The player's own name, for its tab entry: the server's `PlayerList`
         /// entry for the local player carries no name.
         pub name: String,
@@ -1185,45 +1189,43 @@ mod translate {
             // server sends no inventory packet for the pickup, so put the stack
             // into the player's first free slot ourselves.
             bp::Packet::TakeItemEntity { item, actor } => {
-                ctx.entities.remove(item);
                 bedrock_core::nethernet::trace(format!(
                     "PICKUP item={item} actor={actor} self={} cached={:?} drops={}",
                     ctx.runtime_id,
                     ctx.drops.get(item).map(|d| (d.runtime_id, d.count)),
                     ctx.drops.len()
                 ));
-                let mut events = vec![Event::Packet(Box::new(
-                    play::Clientbound::TakeItemEntity(play::TakeItemEntity {
-                        item: *item as i32,
-                        player: *actor as i32,
-                        amount: 1,
-                    }),
-                ))];
-                // Bedrock destroys the actor on this packet; Java keeps the
-                // entity until told to remove it. The drawn stack goes only with
-                // the last actor folded into it, and until then it shows what is
-                // left.
-                ctx.entities.remove(item);
-                ctx.drops.remove(item);
-                let owner = ctx.drop_owner.remove(item).unwrap_or(*item);
-                if ctx.drop_owner.values().any(|o| *o == owner) {
-                    if let Some(stack) = drop_stack(ctx, owner) {
-                        events.push(drop_stack_data(owner, stack));
-                    }
-                } else {
-                    ctx.entities.remove(&owner);
+                if *actor != ctx.runtime_id as u64 && ctx.drops.contains_key(item) {
+                    // The server folded this stack into another dropped one. Keep
+                    // it on the ground to be seen on its own, and remember the
+                    // stack it joined so the two are collected together.
+                    ctx.drop_children.entry(*actor).or_default().push(*item);
+                    return Vec::new();
+                }
+                // This player took it: the stack and everything folded into it
+                // fly in together.
+                let mut flying = vec![*item];
+                if let Some(children) = ctx.drop_children.remove(item) {
+                    flying.extend(children);
+                }
+                let mut events = Vec::new();
+                for id in flying {
+                    ctx.drops.remove(&id);
+                    ctx.entities.remove(&id);
+                    events.push(Event::Packet(Box::new(
+                        play::Clientbound::TakeItemEntity(play::TakeItemEntity {
+                            item: id as i32,
+                            player: *actor as i32,
+                            amount: 1,
+                        }),
+                    )));
                     events.push(Event::Packet(Box::new(
                         play::Clientbound::RemoveEntities(play::RemoveEntities {
-                            ids: vec![owner as i32],
+                            ids: vec![id as i32],
                         }),
                     )));
                 }
                 if *actor == ctx.runtime_id as u64 {
-                    // The server grants the pickup on its own side but applies it
-                    // a moment later, and synthesising the stack here crashed the
-                    // game, so just ask for the authoritative contents once the
-                    // server has caught up.
-                    ctx.drops.remove(item);
                     let now = bridge.tick.load(Ordering::Relaxed);
                     bridge.resync_at.store(now + 10, Ordering::Relaxed);
                 }
