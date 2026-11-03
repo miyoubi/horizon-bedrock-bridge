@@ -2750,8 +2750,22 @@ mod translate {
                         hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
                         item: held_item(bridge),
                         position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                        click: [0.0; 3],
                     },
                 ]
+            }
+            // Right-clicking an entity: the same transaction with the
+            // interact action, which is what feeds, milks and saddles.
+            play::Serverbound::Interact(i) => {
+                let pos = *bridge.position.lock().unwrap();
+                vec![bp::Out::ItemUseOnEntity {
+                    runtime_id: i.id as u64,
+                    action: 0, // interact
+                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                    item: held_item(bridge),
+                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    click: [0.0; 3],
+                }]
             }
             play::Serverbound::SetCarriedItem(i) => {
                 bridge.hotbar.store(i64::from(i.slot), Ordering::Relaxed);
@@ -2765,15 +2779,52 @@ mod translate {
             // inventory transaction with a place action.
             play::Serverbound::UseItemOn(u) => {
                 let pos = *bridge.position.lock().unwrap();
-                vec![bp::Out::ItemUseOnBlock {
-                    block: u.pos,
-                    face: u.face,
-                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
-                    action: 0, // place
-                    item: held_item(bridge),
-                    cursor: u.cursor,
-                    position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
-                }]
+                let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
+                let normal = match u.face {
+                    0 => [0, -1, 0],
+                    1 => [0, 1, 0],
+                    2 => [0, 0, -1],
+                    3 => [0, 0, 1],
+                    4 => [-1, 0, 0],
+                    5 => [1, 0, 0],
+                    _ => [0, 0, 0],
+                };
+                // The server wants the block use bracketed by the start and
+                // stop actions; the transaction alone leaves it half-open.
+                let result = if u.inside {
+                    u.pos
+                } else {
+                    [
+                        u.pos[0] + normal[0],
+                        u.pos[1] + normal[1],
+                        u.pos[2] + normal[2],
+                    ]
+                };
+                vec![
+                    bp::Out::PlayerAction {
+                        runtime_id,
+                        action: 28, // start item use on
+                        position: u.pos,
+                        result,
+                        face: u.face,
+                    },
+                    bp::Out::ItemUseOnBlock {
+                        block: u.pos,
+                        face: u.face,
+                        hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                        action: 0, // place
+                        item: held_item(bridge),
+                        cursor: u.cursor,
+                        position: [pos[0], pos[1] + PLAYER_EYE, pos[2]],
+                    },
+                    bp::Out::PlayerAction {
+                        runtime_id,
+                        action: 29, // stop item use on
+                        position: u.pos,
+                        result: [0; 3],
+                        face: 0,
+                    },
+                ]
             }
             // Using the held item in the air (eating, throwing): the same
             // transaction with a use action and no block.

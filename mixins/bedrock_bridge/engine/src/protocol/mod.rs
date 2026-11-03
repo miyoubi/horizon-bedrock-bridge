@@ -251,6 +251,7 @@ pub enum Out {
         hotbar_slot: i32,
         item: Option<ItemDescriptor>,
         position: [f32; 3],
+        click: [f32; 3],
     },
     /// Dropping an item: an `ItemStackRequest` with a drop action, which is how
     /// a current client drops (there is no drop flag on an inventory source).
@@ -763,6 +764,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             hotbar_slot,
             item,
             position,
+            click,
         } => {
             w.varint(ids::INVENTORY_TRANSACTION);
             w.varint(0); // legacy request id
@@ -781,9 +783,9 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.f32(position[0]);
             w.f32(position[1]);
             w.f32(position[2]); // the player's position
-            w.f32(0.0);
-            w.f32(0.0);
-            w.f32(0.0); // the position clicked on the entity
+            w.f32(click[0]);
+            w.f32(click[1]);
+            w.f32(click[2]); // the position clicked on the entity
         }
         Out::ItemUseOnBlock {
             block,
