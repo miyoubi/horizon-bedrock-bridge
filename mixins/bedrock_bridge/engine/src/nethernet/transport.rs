@@ -88,4 +88,10 @@ impl Transport for NetherNetTransport {
     fn close(&mut self) {
         self.session.close();
     }
+
+    fn flush(&mut self) {
+        // `send_reliable` only queues into the peer connection; the pump moves
+        // it onto the wire.
+        let _ = self.session.pump(Duration::from_millis(150));
+    }
 }

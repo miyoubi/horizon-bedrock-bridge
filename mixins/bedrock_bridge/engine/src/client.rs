@@ -22,6 +22,8 @@ use crate::raknet::RakNetClient;
 pub trait Transport: Send {
     fn send(&mut self, body: &[u8]) -> Result<()>;
     fn recv(&mut self) -> Result<Option<Vec<u8>>>;
+    /// Drive the transport briefly so a just-sent batch reaches the peer.
+    fn flush(&mut self) {}
     /// Gracefully close the connection so the peer removes the player at once
     /// instead of waiting out the session timeout.
     fn close(&mut self) {}
@@ -348,11 +350,14 @@ impl BedrockClient {
     /// gracefully, so the player is removed at once rather than after the
     /// session timeout.
     pub fn disconnect(&mut self) {
-        crate::nethernet::trace("DISCONNECT: closing transport");
+        crate::nethernet::trace("DISCONNECT: sending leave and closing transport");
         let _ = self.send(&[Out::Disconnect {
             hide: true,
             message: String::new(),
         }]);
+        // A NetherNet send only queues the message; without driving the peer
+        // connection it is dropped by the close below.
+        self.transport.flush();
         self.transport.close();
     }
 }
