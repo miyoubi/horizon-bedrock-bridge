@@ -227,6 +227,7 @@ mod tests {
         storage.set(BlockStorage::pack(10, 11, 12), 3);
         let section = SubChunk {
             empty: false,
+            y: None,
             storages: vec![BlockStorage {
                 storage,
                 palette: Palette::Runtime(vec![0, 10, 20, 30]),
@@ -260,6 +261,7 @@ mod tests {
         let storage = BitStorage::new(1, 4096).unwrap();
         let section = SubChunk {
             empty: false,
+            y: None,
             storages: vec![BlockStorage {
                 storage,
                 palette: Palette::Persistent(vec![
