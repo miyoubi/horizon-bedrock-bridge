@@ -117,6 +117,20 @@ struct Bridge {
     /// 4, right 8, jump 16, sneak 32, sprint 64. The server simulates movement
     /// from this and the move vector, not from the position we claim.
     input: AtomicI64,
+    /// The input flags sent with the previous `PlayerAuthInput`, so a press or
+    /// a release can be reported once instead of every tick.
+    sent_input: AtomicI64,
+    /// Whether the player is sprinting, from the game's `PlayerCommand`. The
+    /// input bitfield only carries the sprint key, not the sprint state.
+    sprinting: AtomicBool,
+    /// Whether the previous input reported sprinting, for the start/stop edge.
+    sent_sprint: AtomicBool,
+    /// Whether the previous input reported the player on the ground, which is
+    /// what a new jump is measured against.
+    sent_on_ground: AtomicBool,
+    /// Block actions the game asked for since the last input, sent with the
+    /// next one so there is still one input per client tick.
+    actions: Mutex<Vec<bedrock_core::protocol::BlockAction>>,
     /// The position sent with the previous input, so the input's `delta`
     /// (movement this tick) is real rather than zero.
     last_sent: Mutex<[f32; 3]>,
@@ -168,6 +182,11 @@ pub fn try_connect(
         position: Mutex::new([0.0; 3]),
         rotation: Mutex::new([0.0; 2]),
         input: AtomicI64::new(0),
+        sent_input: AtomicI64::new(0),
+        sprinting: AtomicBool::new(false),
+        sent_sprint: AtomicBool::new(false),
+        sent_on_ground: AtomicBool::new(true),
+        actions: Mutex::new(Vec::new()),
         last_sent: Mutex::new([0.0; 3]),
         tick: AtomicI64::new(1),
         on_ground: AtomicBool::new(true),
@@ -391,9 +410,6 @@ fn run(
     let mut queued: std::collections::VecDeque<bedrock_core::protocol::Packet> =
         std::collections::VecDeque::new();
 
-    let mut last_heartbeat = std::time::Instant::now();
-    // How many world packets have arrived since StartGame; the initialized
-    // signal is repeated while the world streams in.
     let mut chunks_seen = 0u32;
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
@@ -462,13 +478,6 @@ fn run(
                     log::warn!("bedrock: respawn failed: {e}");
                 }
             }
-        }
-        if ctx.runtime_id != 0 && last_heartbeat.elapsed() >= std::time::Duration::from_millis(50) {
-            let batch = translate::heartbeat(&bridge);
-            if let Err(e) = client.send(&batch) {
-                log::warn!("bedrock: heartbeat failed: {e}");
-            }
-            last_heartbeat = std::time::Instant::now();
         }
         // Translate more packets when a backlog built up, so received entities,
         // chunks and chat are not seconds behind. The budget still bounds each
@@ -2171,35 +2180,37 @@ mod translate {
         }
     }
 
-    /// A `PlayerAuthInput` from a Java movement packet — the packet the server
-    /// actually simulates from (id 144; `MovePlayer`, 19, is deprecated and
-    /// ignored, which is why the player looked like a statue to it). The flag
-    /// set is empty for now: no sneaking, sprinting or block actions yet.
-    fn auth_input(bridge: &Bridge, position: [f32; 3], yaw: f32, pitch: f32) -> Vec<bp::Out> {
-        auth_input_actions(bridge, position, yaw, pitch, Vec::new())
-    }
-
-    /// The same packet with block actions (start/stop/abort a break). The
-    /// `PERFORM_BLOCK_ACTIONS` flag (bit 35) is set, which is the flag the
-    /// encoder keys the action list off.
-    fn auth_input_actions(
-        bridge: &Bridge,
-        position: [f32; 3],
-        yaw: f32,
-        pitch: f32,
-        actions: Vec<bp::BlockAction>,
-    ) -> Vec<bp::Out> {
+    /// One `PlayerAuthInput`, built from the state the game has reported. It
+    /// goes out once per client tick, and carries the press and release edges
+    /// of jump, sneak and sprint exactly once.
+    fn auth_input(bridge: &Bridge, actions: Vec<bp::BlockAction>) -> Vec<bp::Out> {
         let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
-        let raw_input = bridge.input.load(Ordering::Relaxed) as u8;
-        let (mut flags, mut move_vec) = input_bits(bridge);
-        if !actions.is_empty() {
-            flags |= 1 << 35;
-        }
-        // The delta is a velocity in Bedrock's movement maths, which ViaBedrock
-        // builds from the raw position change: horizontal * 0.98 * friction *
-        // 0.91, and vertical minus gravity then * 0.98. Sending the raw position
-        // change instead makes the server's reconciliation disagree every tick.
+        let position = *bridge.position.lock().unwrap();
+        let [yaw, pitch] = *bridge.rotation.lock().unwrap();
+        let input = bridge.input.load(Ordering::Relaxed) as u8;
+        // The game sends its bitfield only when it changes, so the previous
+        // one is what a press or a release is measured against.
+        let previous = bridge.sent_input.swap(i64::from(input), Ordering::Relaxed) as u8;
+        let sprinting = bridge.sprinting.load(Ordering::Relaxed);
+        let was_sprinting = bridge.sent_sprint.swap(sprinting, Ordering::Relaxed);
         let on_ground = bridge.on_ground.load(Ordering::Relaxed);
+        let was_on_ground = bridge.sent_on_ground.swap(on_ground, Ordering::Relaxed);
+        let collision = bridge.collision.load(Ordering::Relaxed);
+        let (mut flags, move_vec) = input_bits(
+            input,
+            previous,
+            sprinting,
+            was_sprinting,
+            on_ground,
+            was_on_ground,
+            collision,
+        );
+        if !actions.is_empty() {
+            flags |= 1 << 35; // perform_block_actions
+        }
+        // The delta is a velocity in Bedrock's movement maths, which the
+        // reference translator builds from the raw position change: horizontal
+        // * 0.98 * friction * 0.91, and vertical minus gravity then * 0.98.
         let delta = {
             let mut last = bridge.last_sent.lock().unwrap();
             let d = [
@@ -2215,38 +2226,12 @@ mod translate {
                 d[2] * 0.98 * friction * 0.91,
             ]
         };
-        // The move vector comes from the game's input bitfield, which holds the
-        // pressed keys until they change. Deriving it from the position delta as
-        // well read the client's own glide after a key release as still-held
-        // input, and normalized it to full speed, so the server kept walking the
-        // player. The bitfield is the real key state, so trust it alone.
-        // Snap a near-zero component to zero: a leftover cross-component is
-        // enough to set a direction flag, which the server honours.
-        if move_vec[0].abs() < 0.05 {
-            move_vec[0] = 0.0;
-        }
-        if move_vec[1].abs() < 0.05 {
-            move_vec[1] = 0.0;
-        }
-        if move_vec != [0.0, 0.0] {
-            flags &= !((1 << 10) | (1 << 11) | (1 << 12) | (1 << 13));
-            if move_vec[1] > 0.0 {
-                flags |= 1 << 10; // up / forward
-            } else if move_vec[1] < 0.0 {
-                flags |= 1 << 11; // down / backward
-            }
-            if move_vec[0] > 0.0 {
-                flags |= 1 << 12; // left
-            } else if move_vec[0] < 0.0 {
-                flags |= 1 << 13; // right
-            }
-        }
         // Bedrock's mPos is the eye position; the game tracks feet.
         let position = [position[0], position[1] + PLAYER_EYE, position[2]];
         if tick % 20 == 0 || move_vec != [0.0, 0.0] {
             bedrock_core::nethernet::trace(format!(
                 "AUTHIN-MOVE pos={:?} move={:?} flags={:#x} input={:#04x} delta={:?} tick={}",
-                position, move_vec, flags, raw_input, delta, tick
+                position, move_vec, flags, input, delta, tick
             ));
         }
         vec![bp::Out::PlayerAuthInput {
@@ -2339,32 +2324,33 @@ mod translate {
         })
     }
 
-    /// The Bedrock input flags and move vector for the game's current
-    /// `PlayerInput` bitfield. The server simulates movement from these, so with
-    /// an empty vector it holds the player still however the position claims
-    /// otherwise.
-    fn input_bits(bridge: &Bridge) -> (u64, [f32; 2]) {
-        let f = bridge.input.load(Ordering::Relaxed) as u8;
-        // The game sends its bitfield only when it changes, so a held jump would
-        // re-fire every tick. Consume it so one press is one jump.
-        if f & 0x10 != 0 {
-            bridge.input.fetch_and(!0x10, Ordering::Relaxed);
-        }
-        let (forward, backward) = (f & 0x01 != 0, f & 0x02 != 0);
-        let (left, right) = (f & 0x04 != 0, f & 0x08 != 0);
-        let (jump, sneak, sprint) = (f & 0x10 != 0, f & 0x20 != 0, f & 0x40 != 0);
+    /// The Bedrock input flags and move vector for one tick. Held keys come
+    /// from the game's `PlayerInput` bitfield; the ones that are events rather
+    /// than states (jump, sneak, sprint) are reported only on the tick they
+    /// change, which is what the server's movement simulation expects.
+    #[allow(clippy::too_many_arguments)]
+    fn input_bits(
+        input: u8,
+        previous: u8,
+        sprinting: bool,
+        was_sprinting: bool,
+        on_ground: bool,
+        was_on_ground: bool,
+        collision: bool,
+    ) -> (u64, [f32; 2]) {
+        let (forward, backward) = (input & 0x01 != 0, input & 0x02 != 0);
+        let (left, right) = (input & 0x04 != 0, input & 0x08 != 0);
+        let (jump, sneak) = (input & 0x10 != 0, input & 0x20 != 0);
+        let (was_jump, was_sneak) = (previous & 0x10 != 0, previous & 0x20 != 0);
 
         // block_breaking_delay_enabled is on every real client input.
         let mut bits = 1u64 << 48;
-        // ViaBedrock sends these two from the game's own on-ground/collision
-        // state, and the server picks ground friction from VerticalCollision:
-        // without it the player is simulated as airborne and glides after the
-        // keys are released.
-        let on_ground = bridge.on_ground.load(Ordering::Relaxed);
+        // The server picks ground friction from these two; without them the
+        // player is simulated as airborne and glides after the keys are let go.
         if on_ground {
             bits |= 1 << 50; // vertical_collision
         }
-        if bridge.collision.load(Ordering::Relaxed) {
+        if collision {
             bits |= 1 << 49; // horizontal_collision
         }
         if forward {
@@ -2382,17 +2368,32 @@ mod translate {
         if jump {
             // jumping, jump_down, want_up, jump_current_raw
             bits |= (1 << 6) | (1 << 3) | (1 << 16) | (1 << 61);
-            if on_ground {
+            if was_on_ground {
                 bits |= 1 << 31; // start_jumping
             }
+            if !was_jump {
+                bits |= 1 << 60; // jump_pressed_raw
+            }
+        } else if was_jump {
+            bits |= 1 << 59; // jump_released_raw
         }
         if sneak {
             // sneaking, sneak_down, want_down (sneak_current_raw is bit 64,
             // past the 64-bit flag set the encoder carries)
             bits |= (1 << 8) | (1 << 9) | (1 << 17);
+            if !was_sneak {
+                bits |= (1 << 63) | (1 << 27); // sneak_pressed_raw, start_sneaking
+            }
+        } else if was_sneak {
+            bits |= (1 << 62) | (1 << 28); // sneak_released_raw, stop_sneaking
         }
-        if sprint {
-            bits |= (1 << 20) | (1 << 4); // sprinting, sprint_down
+        if sprinting {
+            bits |= (1 << 4) | (1 << 20); // sprint_down, sprinting
+            if !was_sprinting {
+                bits |= 1 << 25; // start_sprinting
+            }
+        } else if was_sprinting {
+            bits |= 1 << 26; // stop_sprinting
         }
         // Bedrock's local move vector: +x is LEFT, +y is FORWARD. A diagonal is
         // scaled by 1/√2 and sneaking by 0.3, as the reference translator does.
@@ -2423,14 +2424,11 @@ mod translate {
         (bits, mv)
     }
 
-    /// One `PlayerAuthInput` for the current tick even when the game sent no
-    /// movement. A real client transmits one every tick, and the server expects
-    /// the stream to keep going (an idle client that stops sending looks frozen
-    /// to the other players).
-    pub fn heartbeat(bridge: &Bridge) -> Vec<bp::Out> {
-        let pos = *bridge.position.lock().unwrap();
-        let [yaw, pitch] = *bridge.rotation.lock().unwrap();
-        let mut out = auth_input(bridge, pos, yaw, pitch);
+    /// The input for the client tick that just ended: one `PlayerAuthInput`,
+    /// and the inventory resync a pickup asked for once its tick is due.
+    pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
+        let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
+        let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
         // for the inventories once it has had time to apply it. Asking straight
         // away returned the state from before the pickup and undid it.
@@ -2445,10 +2443,9 @@ mod translate {
     /// Java serverbound → Bedrock.
     pub fn serverbound(bridge: &Bridge, packet: &play::Serverbound) -> Vec<bp::Out> {
         match packet {
-            // Movement and input only update the bridge state; the loop sends
-            // one `PlayerAuthInput` per tick (50 ms) with all of it. Sending one
-            // per movement packet ran the input tick far faster than the
-            // server's, and it stopped applying our movement.
+            // Movement and input only update the bridge state; one
+            // `PlayerAuthInput` goes out at the end of the client tick with all
+            // of it, so the server's input tick and ours stay the same tick.
             play::Serverbound::MovePlayerPos(p) => {
                 *bridge.position.lock().unwrap() = [p.x as f32, p.y as f32, p.z as f32];
                 set_movement_flags(bridge, p.flags);
@@ -2474,6 +2471,25 @@ mod translate {
             play::Serverbound::PlayerInput(p) => {
                 bridge.input.store(i64::from(p.flags), Ordering::Relaxed);
                 bedrock_core::nethernet::trace(format!("recv PlayerInput flags={:#04x}", p.flags));
+                Vec::new()
+            }
+            // One input per client tick, sent when the tick ends. A synthetic
+            // tick counter advances with them, instead of a wall clock that
+            // drifts against the server's simulation.
+            play::Serverbound::ClientTickEnd(_) => {
+                if bridge.runtime_id.load(Ordering::Relaxed) == 0 {
+                    return Vec::new();
+                }
+                tick_input(bridge)
+            }
+            // The game changes sprint state with a player command; the input
+            // bitfield only carries the sprint key.
+            play::Serverbound::PlayerCommand(c) => {
+                match c.action {
+                    1 => bridge.sprinting.store(true, Ordering::Relaxed),
+                    2 => bridge.sprinting.store(false, Ordering::Relaxed),
+                    _ => {}
+                }
                 Vec::new()
             }
             // The game asks to respawn when the death screen is dismissed.
@@ -2636,19 +2652,12 @@ mod translate {
                     }
                     _ => return Vec::new(),
                 };
-                let pos = *bridge.position.lock().unwrap();
-                let [yaw, pitch] = *bridge.rotation.lock().unwrap();
-                auth_input_actions(
-                    bridge,
-                    pos,
-                    yaw,
-                    pitch,
-                    vec![bp::BlockAction {
-                        action,
-                        position: p.pos,
-                        face: i32::from(p.direction),
-                    }],
-                )
+                bridge.actions.lock().unwrap().push(bp::BlockAction {
+                    action,
+                    position: p.pos,
+                    face: i32::from(p.direction),
+                });
+                Vec::new()
             }
             play::Serverbound::Chat(c) => vec![bp::Out::Text {
                 kind: 1,
