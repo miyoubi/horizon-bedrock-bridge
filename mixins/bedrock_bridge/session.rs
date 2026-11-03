@@ -1086,12 +1086,6 @@ mod translate {
                     },
                 )))]
             }
-            bp::Packet::SetTime(time) => vec![Event::Packet(Box::new(play::Clientbound::SetTime(
-                play::SetTime {
-                    game_time: i64::from(*time),
-                    clocks: Vec::new(),
-                },
-            )))],
             bp::Packet::SetDifficulty(difficulty) => vec![Event::Packet(Box::new(
                 play::Clientbound::ChangeDifficulty(play::ChangeDifficulty {
                     difficulty: *difficulty,
