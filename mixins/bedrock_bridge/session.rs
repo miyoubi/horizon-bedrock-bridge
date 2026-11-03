@@ -365,6 +365,7 @@ fn run(
         entities: std::collections::HashMap::new(),
         drops: std::collections::HashMap::new(),
         drop_owner: std::collections::HashMap::new(),
+        uniques: std::collections::HashMap::new(),
         name: name.to_string(),
         items: Vec::new(),
         biomes,
@@ -554,6 +555,10 @@ mod translate {
         /// stack while the server keeps them as separate actors, so several
         /// actors share one entity here and it goes when the last of them does.
         pub drop_owner: std::collections::HashMap<u64, u64>,
+        /// The runtime id an entity's unique id names. The server removes an
+        /// entity by its unique id, so the runtime id the game was told about
+        /// has to be found from it before the removal can be passed on.
+        pub uniques: std::collections::HashMap<u64, u64>,
         /// The player's own name, for its tab entry: the server's `PlayerList`
         /// entry for the local player carries no name.
         pub name: String,
@@ -1087,6 +1092,8 @@ mod translate {
                     entity.runtime_id,
                     (entity.position, entity.yaw, entity.pitch, entity.head_yaw),
                 );
+                ctx.uniques
+                    .insert(entity.unique_id as u64, entity.runtime_id);
                 vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
                     play::AddEntity {
                         id: entity.runtime_id as i32,
@@ -1122,30 +1129,11 @@ mod translate {
                 let Some(kind) = entity_type_id(ctx, &java_name) else {
                     return Vec::new();
                 };
-                // A Bedrock client draws dropped items of one kind that lie
-                // together as a single stack, while the server keeps them as
-                // separate actors. Fold this one into the entity already
-                // standing where it landed, or the game keeps drawing items
-                // the server has long since collected.
-                let owner = ctx
-                    .drop_owner
-                    .iter()
-                    .filter(|(actor, _)| {
-                        ctx.drops.get(*actor).is_some_and(|d| {
-                            d.runtime_id == item.runtime_id && d.damage == item.damage
-                        })
-                    })
-                    .filter(|(actor, _)| {
-                        ctx.entities.get(*actor).is_some_and(|e| {
-                            let dx = e.0[0] - position[0];
-                            let dy = e.0[1] - position[1];
-                            let dz = e.0[2] - position[2];
-                            dx * dx + dy * dy + dz * dz < 2.25
-                        })
-                    })
-                    .map(|(_, owner)| *owner)
-                    .next();
+                // Every actor is drawn as its own entity, as the reference does;
+                // the removals are what keep the ground clear.
+                let owner: Option<u64> = None;
                 ctx.drops.insert(*runtime_id, item.clone());
+                ctx.uniques.insert(*unique_id as u64, *runtime_id);
                 bedrock_core::nethernet::trace(format!(
                     "ITEM SPAWN id={runtime_id} stack={:?} owner={owner:?}",
                     (item.runtime_id, item.count)
@@ -1550,11 +1538,16 @@ mod translate {
                     pitch: 0.0,
                 }),
             ))],
-            bp::Packet::RemoveEntity(id) => {
-                ctx.entities.remove(id);
-                ctx.drops.remove(id);
-                bedrock_core::nethernet::trace(format!("ITEM/ACTOR REMOVE id={id}"));
-                let owner = ctx.drop_owner.remove(id).unwrap_or(*id);
+            bp::Packet::RemoveEntity(unique) => {
+                // The server names the entity by its unique id here, not by the
+                // runtime id the game was given, so resolve it first: without
+                // that no removal ever matched an entity and collected stacks
+                // stayed drawn.
+                let id = ctx.uniques.remove(unique).unwrap_or(*unique);
+                ctx.entities.remove(&id);
+                ctx.drops.remove(&id);
+                bedrock_core::nethernet::trace(format!("ITEM/ACTOR REMOVE uid={unique} id={id}"));
+                let owner = ctx.drop_owner.remove(&id).unwrap_or(id);
                 if ctx.drop_owner.values().any(|o| *o == owner) {
                     return drop_stack(ctx, owner)
                         .map_or_else(Vec::new, |stack| vec![drop_stack_data(owner, stack)]);
