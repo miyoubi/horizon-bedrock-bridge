@@ -361,6 +361,7 @@ fn run(
         sections: std::collections::HashMap::new(),
         requests: Vec::new(),
         wanted: std::collections::VecDeque::new(),
+        request_limit: 24,
         wanted_center: None,
         entities: std::collections::HashMap::new(),
         drops: std::collections::HashMap::new(),
@@ -543,7 +544,11 @@ mod translate {
         /// them.
         pub requests: Vec<bedrock_core::protocol::Out>,
         /// Columns still to ask for, and the centre they were queued for.
-        pub wanted: std::collections::VecDeque<(i32, i32)>,
+        pub wanted: std::collections::VecDeque<((i32, i32), i8)>,
+        /// How many sub-chunk requests the server will answer for one column,
+        /// from the last `LevelChunk` it sent. Asking for more than this is what
+        /// left columns half built: the surplus sections were never sent.
+        pub request_limit: i8,
         pub wanted_center: Option<(i32, i32)>,
         /// Where each entity was last put: a Bedrock move carries only the
         /// components that changed, and the client takes absolute positions.
@@ -1644,8 +1649,11 @@ mod translate {
                 if ctx.wanted_center != Some(center) {
                     if ctx.wanted_center.is_none() {
                         ctx.wanted.push_back((
-                            (ctx.spawn[0].floor() as i32) >> 4,
-                            (ctx.spawn[2].floor() as i32) >> 4,
+                            (
+                                (ctx.spawn[0].floor() as i32) >> 4,
+                                (ctx.spawn[2].floor() as i32) >> 4,
+                            ),
+                            -4,
                         ));
                     }
                     ctx.wanted_center = Some(center);
@@ -1653,8 +1661,9 @@ mod translate {
                     // dropped on arrival ("not in the view range") and only
                     // delays the columns the player is standing in.
                     let r = i32::try_from((*radius).min(8)).unwrap_or(4);
-                    ctx.wanted
-                        .retain(|(x, z)| (x - center.0).abs() <= r && (z - center.1).abs() <= r);
+                    ctx.wanted.retain(|((x, z), _)| {
+                        (x - center.0).abs() <= r && (z - center.1).abs() <= r
+                    });
                     // Nearest first, so the ground under the player is asked for
                     // before the ring around it.
                     let mut ring: Vec<(i32, i32)> = (-r..=r)
@@ -1664,26 +1673,34 @@ mod translate {
                         (x - center.0).abs().max((z - center.1).abs())
                     });
                     for column in ring {
-                        if !ctx.wanted.contains(&column) {
-                            ctx.wanted.push_back(column);
+                        if !ctx.wanted.iter().any(|(c, _)| *c == column) {
+                            ctx.wanted.push_back((column, -4));
                         }
                     }
                 }
+                let limit = ctx.request_limit.clamp(1, 24) as i8;
                 for _ in 0..super::REQUESTS_PER_TICK {
-                    let Some((cx, cz)) = ctx.wanted.pop_front() else {
+                    let Some((column, from)) = ctx.wanted.pop_front() else {
                         break;
                     };
-                    // Every section of the column: the client meshes what it has.
-                    // The base Y is 0 and the offsets carry the absolute section
-                    // index, which for the overworld (min_y -64) runs -4..=19 —
-                    // the convention a real Bedrock client uses.
-                    let offsets: Vec<[i8; 3]> = (-4..=19).map(|sy| [0i8, sy as i8, 0]).collect();
+                    let (cx, cz) = column;
+                    // Only as many sections as the server said it would send;
+                    // the rest go back on the queue for other columns to have
+                    // their turn. The base Y is 0 and the offsets carry the
+                    // absolute section index, which for the overworld (min_y
+                    // -64) runs -4..=19 — the convention a real Bedrock client
+                    // uses.
+                    let to = (from + limit - 1).min(19);
+                    let offsets: Vec<[i8; 3]> = (from..=to).map(|sy| [0i8, sy, 0]).collect();
                     ctx.requests
                         .push(bedrock_core::protocol::Out::SubChunkRequest {
                             dimension: 0,
                             center: [cx, 0, cz],
                             offsets,
                         });
+                    if to < 19 {
+                        ctx.wanted.push_back((column, to + 1));
+                    }
                 }
                 out
             }
@@ -1738,6 +1755,12 @@ mod translate {
                 ))]
             }
             bp::Packet::LevelChunk(c) => {
+                // The server answers at most this many sub-chunk requests per
+                // column, so asking for the whole column at once loses the
+                // sections past the limit.
+                if let Some(limit) = c.request_limit {
+                    ctx.request_limit = i8::try_from(limit).unwrap_or(24).clamp(1, 24);
+                }
                 // Whatever blocks the payload carries; the rest arrive as
                 // sub-chunk replies.
                 if let Ok(decoded) = bedrock_core::chunk::decode_sections(c) {

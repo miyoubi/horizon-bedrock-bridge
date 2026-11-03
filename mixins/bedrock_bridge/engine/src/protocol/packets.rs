@@ -911,6 +911,8 @@ pub struct LevelChunk {
     pub chunk_z: i32,
     pub dimension: i32,
     pub sub_chunk_count: u32,
+    /// The most sub-chunk requests the server will answer for this column.
+    pub request_limit: Option<u32>,
     pub data: Vec<u8>,
 }
 
@@ -924,9 +926,11 @@ impl LevelChunk {
         let dimension = r.varint()? as i32;
         let sub_chunk_count = r.varint()?;
         // Whether the server set a limit on how many sub-chunks to ask for.
-        if r.bool()? {
-            let _request_limit = r.varint()?;
-        }
+        let request_limit = if r.bool()? {
+            Some(r.varint()?)
+        } else {
+            None
+        };
         let cache_enabled = r.bool()?;
         let blobs = r.varint()?;
         for _ in 0..blobs {
@@ -940,6 +944,7 @@ impl LevelChunk {
             chunk_z,
             dimension,
             sub_chunk_count,
+            request_limit,
             data,
         })
     }
