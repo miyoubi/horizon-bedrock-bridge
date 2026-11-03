@@ -916,13 +916,16 @@ pub struct LevelChunk {
 
 impl LevelChunk {
     pub fn read(r: &mut Reader) -> Result<LevelChunk> {
-        let chunk_x = r.zigzag32()?;
-        let chunk_z = r.zigzag32()?;
-        let dimension = r.zigzag32()?;
+        // Plain varints, not zigzag: reading them signed halves every positive
+        // coordinate and turns negatives into large positives, which put whole
+        // columns in the wrong place.
+        let chunk_x = r.varint()? as i32;
+        let chunk_z = r.varint()? as i32;
+        let dimension = r.varint()? as i32;
         let sub_chunk_count = r.varint()?;
-        // highest_subchunk_count: option zigzag32
+        // Whether the server set a limit on how many sub-chunks to ask for.
         if r.bool()? {
-            let _highest = r.zigzag32()?;
+            let _request_limit = r.varint()?;
         }
         let cache_enabled = r.bool()?;
         let blobs = r.varint()?;

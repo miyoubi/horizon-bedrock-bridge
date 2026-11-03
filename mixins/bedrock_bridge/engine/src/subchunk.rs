@@ -66,6 +66,8 @@ pub struct SubChunk {
     pub storages: Vec<BlockStorage>,
     /// Protocol ≥ 419's "all air, no storages".
     pub empty: bool,
+    /// The section's own Y, carried by version 9 sections only.
+    pub y: Option<i8>,
 }
 
 impl SubChunk {
@@ -74,21 +76,28 @@ impl SubChunk {
         SubChunk {
             storages: Vec::new(),
             empty: true,
+            y: None,
         }
     }
 
-    /// Decode a serialized sub-chunk. `version_byte` is the first byte of the
-    /// payload (the wire places it before the storages).
+    /// Decode a serialized section. `version_byte` is the section's version,
+    /// which the wire places before its layers; a version 8 section follows it
+    /// with the layer count, and a version 9 one with the layer count and then
+    /// the section's Y.
     pub fn read(r: &mut Reader, version_byte: u8) -> Result<Self> {
-        let storage_count = match version_byte {
-            8 => r.u8()? as usize,
+        let (storage_count, y) = match version_byte {
+            1 => (1usize, None),
+            8 => (r.u8()? as usize, None),
             9 => {
-                // 1-byte storage count, then the sub-chunk's Y index.
-                let count = r.u8()? as usize;
-                let _y = r.u8()?;
-                count
+                let layers = r.u8()? as usize;
+                (layers, Some(r.u8()? as i8))
             }
-            n => n as usize,
+            // The legacy array formats are not sent by a current server.
+            n => {
+                return Err(Error::decode(format!(
+                    "unsupported chunk section version {n}"
+                )))
+            }
         };
         // A sub-chunk has at most eight layers; anything else is a corrupt
         // packet rather than a bigger section.
@@ -144,6 +153,7 @@ impl SubChunk {
         Ok(SubChunk {
             empty: storages.is_empty(),
             storages,
+            y,
         })
     }
 

@@ -38,19 +38,20 @@ pub fn bedrock_block(
 
 /// Decode every sub-chunk of `chunk` into Java block states.
 pub fn decode_sections(chunk: &LevelChunk) -> Result<Vec<ChunkSection>> {
-    // The serialized chunk data starts with its own sub-chunk count; the
-    // packet's `sub_chunk_count` field reads 0 from a modern server.
-    let (count, offset) = if chunk.sub_chunk_count == 0 && !chunk.data.is_empty() {
-        (chunk.data[0] as u32, 1)
-    } else {
-        (chunk.sub_chunk_count, 0)
-    };
-    let mut r = Reader::new(&chunk.data[offset..]);
-    let mut out = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let index = r.u8()?;
+    // The payload is the sections themselves, back to back; the count is on the
+    // packet. Each section starts with its version byte, and only a version 9
+    // one carries its own Y, so the rest are placed by their position in the
+    // request, which starts at the world's lowest section (-4).
+    let mut r = Reader::new(&chunk.data);
+    let mut out = Vec::with_capacity(chunk.sub_chunk_count as usize);
+    for slot in 0..chunk.sub_chunk_count {
         let version = r.u8()?;
         let sub = SubChunk::read(&mut r, version)?;
+        // The payload carries the column's sections in order from the bottom,
+        // so the position is the section index and the game's y is that minus
+        // four. Consuming the version 9 section's own Y is what matters: leaving
+        // it in the stream shifted every section after it.
+        let index = slot as i8 - 4;
         let mut blocks = vec![0u32; 4096];
         for y in 0..16 {
             for z in 0..16 {
@@ -62,10 +63,7 @@ pub fn decode_sections(chunk: &LevelChunk) -> Result<Vec<ChunkSection>> {
                 }
             }
         }
-        out.push(ChunkSection {
-            y: index as i8 - 4,
-            blocks,
-        });
+        out.push(ChunkSection { y: index, blocks });
     }
     Ok(out)
 }
