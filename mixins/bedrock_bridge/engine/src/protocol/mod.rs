@@ -226,10 +226,13 @@ pub enum Out {
         mode: u8,
         on_ground: bool,
     },
+    /// A `PlayerAction`; the client acknowledges a completed respawn with
+    /// action 7.
     PlayerAction {
         runtime_id: u64,
         action: i32,
         position: [i32; 3],
+        result: [i32; 3],
         face: i32,
     },
     MobEquipment {
@@ -725,6 +728,7 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             runtime_id,
             action,
             position,
+            result,
             face,
         } => {
             w.varint(ids::PLAYER_ACTION);
@@ -732,8 +736,10 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.zigzag32(position[0])
                 .zigzag32(position[1])
                 .zigzag32(position[2]);
+            w.zigzag32(result[0])
+                .zigzag32(result[1])
+                .zigzag32(result[2]);
             w.zigzag32(*face);
-            // No "result" block position or runtime id (protocol 313+).
         }
         Out::MobEquipment {
             runtime_id,

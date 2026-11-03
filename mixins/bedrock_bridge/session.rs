@@ -2032,6 +2032,17 @@ mod translate {
                         param: 0.0,
                     },
                 ))));
+                // The server's spawn is not finished until the client says it
+                // has respawned: a `PlayerAction` of action 7 clears the dead
+                // state there. Without it the player stays a corpse to everyone
+                // else however the client looks.
+                ctx.requests.push(bp::Out::PlayerAction {
+                    runtime_id: ctx.runtime_id,
+                    action: 7, // respawn
+                    position: [0; 3],
+                    result: [0; 3],
+                    face: -1,
+                });
                 events
             }
             bp::Packet::Disconnect(d) => vec![Event::Disconnected {
