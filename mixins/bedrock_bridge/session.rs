@@ -390,6 +390,7 @@ fn run(
         request_limit: 24,
         wanted_center: None,
         entities: std::collections::HashMap::new(),
+        players: std::collections::HashSet::new(),
         drops: std::collections::HashMap::new(),
         drop_owner: std::collections::HashMap::new(),
         uniques: std::collections::HashMap::new(),
@@ -595,6 +596,9 @@ mod translate {
         /// Where each entity was last put: a Bedrock move carries only the
         /// components that changed, and the client takes absolute positions.
         pub entities: std::collections::HashMap<u64, ([f32; 3], f32, f32, f32)>,
+        /// The runtime ids the server spawned as players, so a hurt sound can
+        /// pick the player's own hurt sound.
+        pub players: std::collections::HashSet<u64>,
         /// The stack each dropped item entity carries, so a pickup can put it
         /// into the inventory: the server sends no inventory packet for one.
         pub drops: std::collections::HashMap<u64, bp::NetworkItem>,
@@ -1103,6 +1107,27 @@ mod translate {
         JTag::compound([("text", JTag::String(JavaString::from(message)))])
     }
 
+    /// A positional hurt sound at a hurt entity, since the game's sound-event
+    /// handler takes a position rather than an entity. Bedrock's own level
+    /// sound event for the same hurt is not decoded.
+    fn hurt_sound(player: bool, position: [f32; 3]) -> Event {
+        let name = if player {
+            "minecraft:entity.player.hurt"
+        } else {
+            "minecraft:entity.generic.hurt"
+        };
+        Event::Packet(Box::new(play::Clientbound::Sound(play::Sound {
+            sound: (-1, Some((name.to_owned(), None))),
+            source: crate::settings::sound_source(name) as i32,
+            x: (f64::from(position[0]) * 8.0) as i32,
+            y: (f64::from(position[1]) * 8.0) as i32,
+            z: (f64::from(position[2]) * 8.0) as i32,
+            volume: 1.0,
+            pitch: 1.0,
+            seed: 0,
+        })))
+    }
+
     /// The column as an event, once it has any blocks.
     fn emit_column(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
         match column(ctx, x, z) {
@@ -1466,6 +1491,7 @@ mod translate {
                 let Some(kind) = entity_type_id(ctx, "minecraft:player") else {
                     return Vec::new();
                 };
+                ctx.players.insert(player.runtime_id);
                 ctx.entities.insert(
                     player.runtime_id,
                     (player.position, player.yaw, player.pitch, player.yaw),
@@ -1819,12 +1845,40 @@ mod translate {
                 let mut events = Vec::new();
                 for entity in gone {
                     ctx.entities.remove(&entity);
+                    ctx.players.remove(&entity);
                     ctx.drops.remove(&entity);
                     events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
                         play::RemoveEntities {
                             ids: vec![entity as i32],
                         },
                     ))));
+                }
+                events
+            }
+            // An entity was hurt. The game's damage event flashes it red, and
+            // for our own player plays the hurt sound; another entity gets a
+            // positional hurt sound, since the game has no sound-on-entity
+            // packet here. Bedrock also announces its own hurt sound as a
+            // level sound event, which this bridge does not decode.
+            bp::Packet::ActorEvent {
+                runtime_id,
+                event,
+                data: _,
+            } if *event == 2 => {
+                let id = *runtime_id;
+                let mut events = vec![Event::Packet(Box::new(play::Clientbound::DamageEvent(
+                    play::DamageEvent {
+                        id: id as i32,
+                        source_type: 0,
+                        cause: None,
+                        direct: None,
+                        position: None,
+                    },
+                )))];
+                if id != ctx.runtime_id as u64
+                    && let Some((position, ..)) = ctx.entities.get(&id)
+                {
+                    events.push(hurt_sound(ctx.players.contains(&id), *position));
                 }
                 events
             }
@@ -1864,6 +1918,7 @@ mod translate {
                 let mut events = Vec::new();
                 for entity in gone {
                     ctx.entities.remove(&entity);
+                    ctx.players.remove(&entity);
                     ctx.drops.remove(&entity);
                     events.push(Event::Packet(Box::new(play::Clientbound::EntityEvent(
                         play::EntityEvent {
