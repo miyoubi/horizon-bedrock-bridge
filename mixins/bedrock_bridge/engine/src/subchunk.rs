@@ -103,15 +103,21 @@ impl SubChunk {
             let header = r.u8()?;
             let runtime = header & 1 == 1;
             let bits = header >> 1;
-            // A zero-bit storage carries no packed words but still carries its
-            // palette. Reading it as a lone id left the palette entry behind,
-            // which drifted every following section of the chunk.
+            // 127 says this storage repeats the one before it. Nothing of it is
+            // on the wire, so reading words and a palette here ate the sections
+            // that followed.
+            if bits == 127 {
+                continue;
+            }
+            // A zero-bit storage holds one value: no packed words, and its
+            // palette is a single entry with no size in front of it. Reading a
+            // size consumed that entry and drifted every following section.
             let storage = if bits == 0 {
                 BitStorage::new(1, 4096)?
             } else {
                 BitStorage::read(r, bits, 4096)?
             };
-            let palette_size = r.zigzag32()?;
+            let palette_size = if bits == 0 { 1 } else { r.zigzag32()? };
             if palette_size < 0 {
                 return Err(Error::decode("negative palette size"));
             }
