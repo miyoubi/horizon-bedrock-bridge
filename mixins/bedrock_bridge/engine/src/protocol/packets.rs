@@ -511,12 +511,86 @@ impl MovePlayer {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// One world clock's state, as `SyncWorldClocks` (id 344) carries it.
+pub struct WorldClock {
+    pub id: u64,
+    /// Only the registry variant names a clock.
+    pub name: Option<String>,
+    pub time: i32,
+    pub paused: bool,
+}
+
+impl WorldClock {
+    /// The packet is a variant: its state, its registry, or a marker change.
+    /// Only the first two carry a time, and the markers are read past.
+    pub fn read_all(r: &mut Reader) -> Result<Vec<WorldClock>> {
+        let mut clocks = Vec::new();
+        match r.varint()? {
+            0 => {
+                for _ in 0..r.varint()? {
+                    clocks.push(WorldClock {
+                        id: r.varlong()?,
+                        name: None,
+                        time: r.zigzag32()?,
+                        paused: r.bool()?,
+                    });
+                }
+            }
+            1 => {
+                for _ in 0..r.varint()? {
+                    let id = r.varlong()?;
+                    let name = Some(r.string()?);
+                    let time = r.zigzag32()?;
+                    let paused = r.bool()?;
+                    for _ in 0..r.varint()? {
+                        let _marker = r.varlong()?;
+                        let _name = r.string()?;
+                        let _time = r.zigzag32()?;
+                        if r.bool()? {
+                            let _period = r.zigzag32()?;
+                        }
+                    }
+                    clocks.push(WorldClock {
+                        id,
+                        name,
+                        time,
+                        paused,
+                    });
+                }
+            }
+            2 => {
+                let _clock = r.varlong()?;
+                for _ in 0..r.varint()? {
+                    let _marker = r.varlong()?;
+                    let _name = r.string()?;
+                    let _time = r.zigzag32()?;
+                    if r.bool()? {
+                        let _period = r.zigzag32()?;
+                    }
+                }
+            }
+            3 => {
+                let _clock = r.varlong()?;
+                for _ in 0..r.varint()? {
+                    let _marker = r.varlong()?;
+                }
+            }
+            _ => {}
+        }
+        Ok(clocks)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 /// One actor's position/rotation deltas (packet id 111). Each component is
 /// optional and preceded by a presence bool.
 pub struct MoveActorDelta {
     pub runtime_id: u64,
     pub position: [Option<f32>; 3],
-    pub rotation: [Option<u8>; 3],
+    /// Rotation bytes, signed: a byte is 360/256 degrees, and an upward look
+    /// is a negative angle, so reading them as unsigned turns it into a large
+    /// positive one.
+    pub rotation: [Option<i8>; 3],
     pub on_ground: bool,
     pub force_move: bool,
     pub force_move_local_entity: bool,

@@ -102,6 +102,8 @@ pub enum Packet {
     },
     Text(Text),
     SetTime(i32),
+    /// 1.26's level time: a list of world clocks, each with a tick count.
+    SyncWorldClocks(Vec<WorldClock>),
     SetPlayerGameType(i32),
     UpdatePlayerGameType {
         gamemode: i32,
@@ -426,6 +428,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::CONTAINER_CLOSE => Packet::ContainerClose { window_id: r.u8()? },
         ids::TEXT => Packet::Text(Text::read(&mut r)?),
         ids::SET_TIME => Packet::SetTime(r.zigzag32()?),
+        ids::SYNC_WORLD_CLOCKS => Packet::SyncWorldClocks(WorldClock::read_all(&mut r)?),
         ids::SET_PLAYER_GAME_TYPE => Packet::SetPlayerGameType(r.zigzag32()?),
         ids::SET_HEALTH => Packet::SetHealth(r.zigzag32()?),
         ids::SET_SPAWN_POSITION => {

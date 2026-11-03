@@ -90,6 +90,8 @@ pub const UPDATE_ABILITIES: u32 = 0xbb;
 pub const REQUEST_NETWORK_SETTINGS: u32 = 0xc1;
 pub const CAMERA_PRESETS: u32 = 0xc6;
 pub const UNLOCKED_RECIPES: u32 = 0xc7;
+/// 1.26's world clock sync, which is where the level's time arrives.
+pub const SYNC_WORLD_CLOCKS: u32 = 344;
 
 /// A batch (a run of packets in one RakNet payload); the id is `0xff`.
 pub const BATCH: u32 = 0xff;

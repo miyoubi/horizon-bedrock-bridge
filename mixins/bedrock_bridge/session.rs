@@ -1377,6 +1377,34 @@ mod translate {
                     },
                 )))]
             }
+            // 1.26 sends the level's time as world clocks rather than
+            // `SetTime`. The overworld clock is the one the sky follows.
+            bp::Packet::SyncWorldClocks(clocks) => {
+                let Some(clock) = clocks
+                    .iter()
+                    .find(|c| c.name.as_deref() == Some("minecraft:overworld"))
+                    .or_else(|| clocks.first())
+                else {
+                    return Vec::new();
+                };
+                let java = ctx
+                    .builtin
+                    .get("minecraft:world_clock")
+                    .and_then(|ids| ids.id(clock.name.as_deref().unwrap_or("minecraft:overworld")))
+                    .unwrap_or(0);
+                let ticks = i64::from(clock.time);
+                vec![Event::Packet(Box::new(play::Clientbound::SetTime(
+                    play::SetTime {
+                        game_time: ticks,
+                        clocks: vec![play::ClockState {
+                            clock: java,
+                            total_ticks: ticks,
+                            partial_tick: 0.0,
+                            rate: if clock.paused { 0.0 } else { 1.0 },
+                        }],
+                    },
+                )))]
+            }
             // Weather. Bedrock announces rain and thunder as level events, and
             // the game wants both the state and the level it rains at -- the
             // state alone does not make it rain.
