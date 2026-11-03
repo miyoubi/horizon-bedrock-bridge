@@ -155,6 +155,28 @@ struct Bridge {
     /// The tick at which to ask the server for the inventories again, because a
     /// pickup changed them; zero when nothing is pending.
     resync_at: AtomicI64,
+    /// The player's health, food and saturation as the server last reported
+    /// them. Bedrock carries hunger in its attributes and health in `SetHealth`,
+    /// while Java sends all three together, so they are kept here.
+    vitals: Mutex<Vitals>,
+}
+
+/// The local player's health bar as Java conveys it.
+#[derive(Clone, Copy)]
+struct Vitals {
+    health: f32,
+    food: i32,
+    saturation: f32,
+}
+
+impl Default for Vitals {
+    fn default() -> Self {
+        Self {
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+        }
+    }
 }
 
 static BRIDGES: OnceLock<Mutex<HashMap<String, Arc<Bridge>>>> = OnceLock::new();
@@ -194,6 +216,7 @@ pub fn try_connect(
         hotbar: AtomicI64::new(0),
         items: Mutex::new(vec![None; 36]),
         resync_at: AtomicI64::new(0),
+        vitals: Mutex::new(Vitals::default()),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -1293,14 +1316,60 @@ mod translate {
                     locked: true,
                 }),
             ))],
-            // Bedrock sends health as a signed varint.
-            bp::Packet::SetHealth(health) => vec![Event::Packet(Box::new(
-                play::Clientbound::SetHealth(play::SetHealth {
-                    health: *health as f32,
-                    food: 20,
-                    saturation: 5.0,
-                }),
-            ))],
+            // Bedrock sends health as a signed varint, the hunger bar through
+            // the player's attributes (below); Java sends all three at once.
+            bp::Packet::SetHealth(health) => {
+                let mut vitals = bridge.vitals.lock().unwrap();
+                vitals.health = *health as f32;
+                let set = play::SetHealth {
+                    health: vitals.health,
+                    food: vitals.food,
+                    saturation: vitals.saturation,
+                };
+                drop(vitals);
+                vec![Event::Packet(Box::new(play::Clientbound::SetHealth(set)))]
+            }
+            // The player's hunger and saturation are Bedrock attributes, so a
+            // change there is what moves the hunger bar. Health rides along in
+            // case the server reports it here instead of in `SetHealth`.
+            bp::Packet::UpdateAttributes(attributes) if attributes.runtime_id == ctx.runtime_id => {
+                let mut vitals = bridge.vitals.lock().unwrap();
+                let mut changed = false;
+                for attribute in &attributes.attributes {
+                    match attribute.name.as_str() {
+                        "minecraft:health" => {
+                            if vitals.health != attribute.current {
+                                vitals.health = attribute.current;
+                                changed = true;
+                            }
+                        }
+                        "minecraft:player.hunger" => {
+                            let food = attribute.current.round() as i32;
+                            if vitals.food != food {
+                                vitals.food = food;
+                                changed = true;
+                            }
+                        }
+                        "minecraft:player.saturation" => {
+                            if vitals.saturation != attribute.current {
+                                vitals.saturation = attribute.current;
+                                changed = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !changed {
+                    return Vec::new();
+                }
+                let set = play::SetHealth {
+                    health: vitals.health,
+                    food: vitals.food,
+                    saturation: vitals.saturation,
+                };
+                drop(vitals);
+                vec![Event::Packet(Box::new(play::Clientbound::SetHealth(set)))]
+            }
             // Time of day. Bedrock sends only the tick count, and the game takes
             // it as the overworld's own clock; without it the sky sits still.
             bp::Packet::SetTime(time) => {
