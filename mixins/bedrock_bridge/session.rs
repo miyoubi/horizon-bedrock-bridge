@@ -1645,14 +1645,22 @@ mod translate {
                     }
                     ctx.wanted_center = Some(center);
                     // Only what the client will accept: anything further out is
-                    // ignored on arrival ("not in the view range") and wasted.
+                    // dropped on arrival ("not in the view range") and only
+                    // delays the columns the player is standing in.
                     let r = i32::try_from((*radius).min(8)).unwrap_or(4);
-                    for dx in -r..=r {
-                        for dz in -r..=r {
-                            let column = (center.0 + dx, center.1 + dz);
-                            if !ctx.wanted.contains(&column) {
-                                ctx.wanted.push_back(column);
-                            }
+                    ctx.wanted
+                        .retain(|(x, z)| (x - center.0).abs() <= r && (z - center.1).abs() <= r);
+                    // Nearest first, so the ground under the player is asked for
+                    // before the ring around it.
+                    let mut ring: Vec<(i32, i32)> = (-r..=r)
+                        .flat_map(|dx| (-r..=r).map(move |dz| (center.0 + dx, center.1 + dz)))
+                        .collect();
+                    ring.sort_by_key(|(x, z)| {
+                        (x - center.0).abs().max((z - center.1).abs())
+                    });
+                    for column in ring {
+                        if !ctx.wanted.contains(&column) {
+                            ctx.wanted.push_back(column);
                         }
                     }
                 }
