@@ -166,6 +166,8 @@ struct Bridge {
     /// Block uses wait for the network thread, which is where the column data
     /// lives and the clicked block's state can be looked up.
     pending_use: Mutex<Vec<play::UseItemOn>>,
+    /// The block of the last use, so a resync can be tied to it.
+    last_use: Mutex<Option<[i32; 3]>>,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -226,6 +228,7 @@ pub fn try_connect(
         respawn_asked: AtomicBool::new(false),
         teleport_ack: AtomicBool::new(false),
         pending_use: Mutex::new(Vec::new()),
+        last_use: Mutex::new(None),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -2402,6 +2405,11 @@ mod translate {
             // Bedrock order, which is not Java's inventory-menu order, so place
             // each item at its Java slot. Other windows still need mapping.
             bp::Packet::InventoryContent(c) if c.window_id == 0 => {
+                if let Some(pos) = bridge.last_use.lock().unwrap().take() {
+                    bedrock_core::nethernet::trace(format!(
+                        "inventory resynced after a use at {pos:?}"
+                    ));
+                }
                 let mut items: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
                 for (i, item) in c.slots.iter().enumerate() {
                     let Some(slot) = java_inventory_slot(i as u32) else {
@@ -2810,6 +2818,7 @@ mod translate {
                 store_block_id(ctx, target, item.block_runtime_id as u32);
             }
         }
+        *bridge.last_use.lock().unwrap() = Some(u.pos);
         serverbound_with(
             bridge,
             &play::Serverbound::UseItemOn(u.clone()),
