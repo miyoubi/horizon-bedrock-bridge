@@ -566,7 +566,27 @@ over and let `light_data_of` fill the chunk. `light_update(chunk, changed)`
 then gives incremental relighting on block changes, which is also still
 missing (a placed torch does not relight until the chunk reloads).
 
-Needs `pub(crate)` on those helpers so the injected bridge can reach them.
+**Resolved: use the render crate's engine instead.** `lan/chunks.rs` is private
+to the client crate, but `horizon-client-render/src/light.rs` is public and is
+the same vanilla-rules engine the renderer itself uses — which is why using it
+removes the banding rather than shifting it:
+
+    pub fn light_chunk(region: &[[Option<&Chunk>; 3]; 3],
+                       tables: &LightTables,
+                       sky_light: bool) -> Vec<Light>;
+    pub fn apply_lighting(chunk: &mut Chunk, lights: Vec<Light>);
+    pub fn apply_relighting(chunk: &mut Chunk, lights: Vec<Light>,
+                            changed: &mut LightChanges);
+
+`LightTables::new(&BlockFacts)` gives `emission` and `dampening` per state.
+`LightChanges::sections()` yields exactly the sections a block update touched,
+which is what the `LightUpdate` packet wants. The 3x3 region also gives
+cross-border light for free.
+
+So: build the 3x3 `Chunk` region around the column the bridge is sending, call
+`light_chunk`, and let `apply_lighting` fill the sections; on block updates use
+`apply_relighting` plus `LightChanges::sections()`. Then delete the bridge's
+own light module.
 
 ## Pitfalls hit in this area
 
