@@ -534,21 +534,15 @@ pub struct ItemDescriptor {
 /// Write a network item stack descriptor: the id, count, damage, an empty
 /// stack id, the block runtime id, and the user-data blob (an empty tag marker
 /// plus two empty string lists), which the server expects even for no item.
-/// An empty stack is just a zero id.
+/// The reader does not stop at a zero id, so an empty stack is a whole
+/// descriptor too.
 fn write_item(w: &mut Writer, item: Option<ItemDescriptor>) {
-    let Some(d) = item else {
-        // An empty stack is one zero id and nothing more.
-        w.varint(0);
-        return;
-    };
-    // The identifier and the block runtime id are signed varints, the count
-    // is a little-endian short, and the damage is unsigned: writing the ids
-    // as fixed shorts made everything but the smallest item ids unreadable.
-    w.zigzag32(i32::from(d.runtime_id))
+    let d = item.unwrap_or_default();
+    w.i16(d.runtime_id)
         .i16(d.count)
         .varint(d.damage)
         .bool(false) // no stack net id
-        .zigzag32(d.block_runtime_id as i32);
+        .varint(d.block_runtime_id);
     w.varint(4); // user-data length: 2 + 1 + 1 bytes
     w.i16(0); // no tag
     w.varint(0); // can place: none
