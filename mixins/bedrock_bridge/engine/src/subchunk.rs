@@ -195,10 +195,10 @@ impl SubChunk {
 
     /// The runtime id of the top-most storage's block at `(x, y, z)`.
     pub fn top_runtime_id(&self, x: usize, y: usize, z: usize) -> Option<i32> {
-        self.storages
-            .iter()
-            .rev()
-            .find_map(|s| s.runtime_id_at(x, y, z))
+        // Layer zero is the block itself. The layers above hold fluids and
+        // foliage, and taking the topmost one unconditionally painted water
+        // over the sand and stone underneath it.
+        self.storages.iter().find_map(|s| s.runtime_id_at(x, y, z))
     }
 }
 
