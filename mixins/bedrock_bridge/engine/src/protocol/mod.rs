@@ -96,6 +96,8 @@ pub enum Packet {
     },
     InventoryContent(InventoryContent),
     InventorySlot(InventorySlot),
+    /// The server's answer to a stack request.
+    ItemStackResponse(ItemStackResponse),
     ContainerOpen(ContainerOpen),
     ContainerClose {
         window_id: u8,
@@ -253,6 +255,17 @@ pub enum Out {
         item: Option<ItemDescriptor>,
         position: [f32; 3],
         click: [f32; 3],
+    },
+    /// One inventory move, as the server wants it: a request naming the slots
+    /// it touches, answered by an `ItemStackResponse` with the same id.
+    ItemStackRequest {
+        request_id: i32,
+        actions: Vec<StackAction>,
+    },
+    /// Closing a container window.
+    ContainerClose {
+        window_id: u8,
+        window_type: u8,
     },
     /// Dropping an item: an `ItemStackRequest` with a drop action, which is how
     /// a current client drops (there is no drop flag on an inventory source).
@@ -427,7 +440,10 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
             }
             Packet::UpdateSubChunkBlocks { sub_chunk, blocks }
         }
-        ids::INVENTORY_CONTENT => Packet::InventoryContent(InventoryContent::read(&mut r)?),
+            ids::INVENTORY_CONTENT => Packet::InventoryContent(InventoryContent::read(&mut r)?),
+            ids::ITEM_STACK_RESPONSE => {
+                Packet::ItemStackResponse(ItemStackResponse::read(&mut r)?)
+            }
         ids::INVENTORY_SLOT => Packet::InventorySlot(InventorySlot::read(&mut r)?),
         ids::CONTAINER_OPEN => Packet::ContainerOpen(ContainerOpen::read(&mut r)?),
         ids::CONTAINER_CLOSE => Packet::ContainerClose { window_id: r.u8()? },
@@ -528,7 +544,60 @@ pub struct ItemDescriptor {
     pub runtime_id: i16,
     pub count: i16,
     pub damage: u32,
+    /// The server's id for this stack. A stack request has to quote it back, so
+    /// it is kept alongside the item everywhere the item is stored.
+    pub net_id: Option<u32>,
     pub block_runtime_id: u32,
+}
+
+/// A slot a stack request acts on: which container, which slot in it, and which
+/// stack the client believes is there.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotRef {
+    pub container: FullContainerName,
+    pub slot: u8,
+    pub stack_id: i32,
+}
+
+impl SlotRef {
+    pub fn new(container: u8, slot: u8, stack_id: i32) -> Self {
+        Self {
+            container: FullContainerName {
+                name: container,
+                dynamic_id: None,
+            },
+            slot,
+            stack_id,
+        }
+    }
+}
+
+/// One move in a stack request.
+#[derive(Clone, Copy, Debug)]
+pub enum StackAction {
+    Take {
+        count: u8,
+        source: SlotRef,
+        destination: SlotRef,
+    },
+    Place {
+        count: u8,
+        source: SlotRef,
+        destination: SlotRef,
+    },
+    Swap {
+        first: SlotRef,
+        second: SlotRef,
+    },
+    Drop {
+        count: u8,
+        source: SlotRef,
+        randomly: bool,
+    },
+    Destroy {
+        count: u8,
+        source: SlotRef,
+    },
 }
 
 /// Write a network item stack descriptor: the id, count, damage, an empty
@@ -538,15 +607,39 @@ pub struct ItemDescriptor {
 /// descriptor too.
 fn write_item(w: &mut Writer, item: Option<ItemDescriptor>) {
     let d = item.unwrap_or_default();
-    w.i16(d.runtime_id)
-        .i16(d.count)
-        .varint(d.damage)
-        .bool(false) // no stack net id
-        .varint(d.block_runtime_id);
+    w.i16(d.runtime_id).i16(d.count).varint(d.damage);
+    // The stack id the server issued for this stack, when the bridge knows it;
+    // a stack request that quotes the wrong id is rejected.
+    match d.net_id {
+        Some(id) => {
+            w.bool(true);
+            w.varint(id);
+        }
+        None => {
+            w.bool(false);
+        }
+    }
+    w.varint(d.block_runtime_id);
     w.varint(4); // user-data length: 2 + 1 + 1 bytes
     w.i16(0); // no tag
     w.varint(0); // can place: none
     w.varint(0); // can break: none
+}
+
+/// Write a slot a stack request acts on.
+fn write_slot(w: &mut Writer, slot: &SlotRef) {
+    w.u8(slot.container.name);
+    match slot.container.dynamic_id {
+        Some(id) => {
+            w.bool(true);
+            w.i32(id);
+        }
+        None => {
+            w.bool(false);
+        }
+    }
+    w.u8(slot.slot);
+    w.zigzag32(slot.stack_id);
 }
 
 /// Encode one outbound packet (id + body).
@@ -862,6 +955,70 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.u8(1); // ItemUsePredictedResult: success
             w.u8(0); // cooldown state: off
         }
+        Out::ItemStackRequest {
+            request_id,
+            actions,
+        } => {
+            w.varint(ids::ITEM_STACK_REQUEST);
+            w.varint(1); // one request per packet
+            w.zigzag32(*request_id);
+            w.varint(actions.len() as u32);
+            for action in actions {
+                match action {
+                    StackAction::Take {
+                        count,
+                        source,
+                        destination,
+                    } => {
+                        w.u8(0); // Take
+                        w.u8(*count);
+                        write_slot(&mut w, source);
+                        write_slot(&mut w, destination);
+                    }
+                    StackAction::Place {
+                        count,
+                        source,
+                        destination,
+                    } => {
+                        w.u8(1); // Place
+                        w.u8(*count);
+                        write_slot(&mut w, source);
+                        write_slot(&mut w, destination);
+                    }
+                    StackAction::Swap { first, second } => {
+                        w.u8(2); // Swap
+                        write_slot(&mut w, first);
+                        write_slot(&mut w, second);
+                    }
+                    StackAction::Drop {
+                        count,
+                        source,
+                        randomly,
+                    } => {
+                        w.u8(3); // Drop
+                        w.u8(*count);
+                        write_slot(&mut w, source);
+                        w.bool(*randomly);
+                    }
+                    StackAction::Destroy { count, source } => {
+                        w.u8(4); // Destroy
+                        w.u8(*count);
+                        write_slot(&mut w, source);
+                    }
+                }
+            }
+            w.varint(0); // no filter strings
+            w.i32(0); // filter string cause
+        }
+        Out::ContainerClose {
+            window_id,
+            window_type,
+        } => {
+            w.varint(ids::CONTAINER_CLOSE);
+            w.u8(*window_id);
+            w.u8(*window_type);
+            w.bool(false); // not server initiated
+        }
         Out::ItemRelease {
             slot,
             count,
@@ -978,4 +1135,131 @@ pub fn is_known(id: u32) -> bool {
             | ids::MOVE_PLAYER
             | ids::TEXT
     )
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    use crate::stream::{Reader, Writer};
+
+    /// A stack request is an id, one request, and the actions it names.
+    #[test]
+    fn stack_request_writes_take_slots_in_order() {
+        let out = encode(&Out::ItemStackRequest {
+            request_id: 1,
+            actions: vec![StackAction::Take {
+                count: 1,
+                source: SlotRef::new(29, 9, 0),
+                destination: SlotRef::new(59, 0, 0),
+            }],
+        });
+        assert_eq!(
+            out,
+            vec![
+                0x93, 0x01, // ITEM_STACK_REQUEST
+                0x01, // one request
+                0x02, // request id 1, zigzag
+                0x01, // one action
+                0x00, // Take
+                0x01, // one item
+                0x1d, 0x00, 0x09, 0x00, // source: inventory 29, slot 9, stack 0
+                0x3b, 0x00, 0x00, 0x00, // destination: cursor 59, slot 0, stack 0
+                0x00, // no filter strings
+                0x00, 0x00, 0x00, 0x00, // filter string cause
+            ]
+        );
+    }
+
+    /// A drop names a count, a slot and whether the items scatter.
+    #[test]
+    fn stack_request_writes_drop_with_random_flag() {
+        let out = encode(&Out::ItemStackRequest {
+            request_id: 4,
+            actions: vec![StackAction::Drop {
+                count: 3,
+                source: SlotRef::new(28, 2, 0),
+                randomly: false,
+            }],
+        });
+        assert_eq!(
+            out,
+            vec![
+                0x93, 0x01, // ITEM_STACK_REQUEST
+                0x01, // one request
+                0x08, // request id 4, zigzag
+                0x01, // one action
+                0x03, 0x03, // Drop, three items
+                0x1c, 0x00, 0x02, 0x00, // source: hotbar 28, slot 2, stack 0
+                0x00, // not scattered
+                0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+    }
+
+    /// The response carries the slots the server decided on, and nothing when it
+    /// refused the request.
+    #[test]
+    fn stack_response_is_read_with_its_slots() {
+        let mut w = Writer::new();
+        w.u8(0) // applied
+            .zigzag32(5) // request id
+            .varint(1) // one container
+            .u8(29) // inventory
+            .bool(false) // no dynamic id
+            .varint(1) // one slot
+            .u8(9) // slot
+            .u8(9) // hotbar slot
+            .u8(3) // count
+            .zigzag32(7) // the server's stack id
+            .varint(0) // custom name
+            .varint(0) // filtered name
+            .zigzag32(0); // durability correction
+        let packet = decode(ids::ITEM_STACK_RESPONSE, &w.into_inner()).unwrap();
+        let Packet::ItemStackResponse(response) = packet else {
+            panic!("expected a stack response");
+        };
+        assert_eq!(response.result, 0);
+        assert_eq!(response.request_id, 5);
+        assert_eq!(response.containers.len(), 1);
+        let container = &response.containers[0];
+        assert_eq!(container.container.name, 29);
+        assert_eq!(container.container.dynamic_id, None);
+        let slot = &container.slots[0];
+        assert_eq!((slot.slot, slot.count, slot.stack_id), (9, 3, 7));
+
+        let mut w = Writer::new();
+        w.u8(1).zigzag32(5); // refused: no container list follows
+        let packet = decode(ids::ITEM_STACK_RESPONSE, &w.into_inner()).unwrap();
+        let Packet::ItemStackResponse(response) = packet else {
+            panic!("expected a stack response");
+        };
+        assert_eq!(response.result, 1);
+        assert_eq!(response.request_id, 5);
+        assert!(response.containers.is_empty());
+    }
+
+    /// The stack id has to survive the descriptor round trip, because a request
+    /// that quotes the wrong one is refused.
+    #[test]
+    fn descriptor_round_trips_the_stack_id() {
+        for net_id in [None, Some(0), Some(12345)] {
+            let item = ItemDescriptor {
+                runtime_id: 42,
+                count: 7,
+                damage: 3,
+                net_id,
+                block_runtime_id: 99,
+            };
+            let mut w = Writer::new();
+            write_item(&mut w, Some(item));
+            let bytes = w.into_inner();
+            let mut r = Reader::new(&bytes);
+            let read = NetworkItem::read(&mut r).unwrap();
+            assert_eq!(read.runtime_id, 42);
+            assert_eq!(read.count, 7);
+            assert_eq!(read.damage, 3);
+            assert_eq!(read.block_runtime_id, 99);
+            assert_eq!(read.net_id, net_id);
+        }
+    }
 }

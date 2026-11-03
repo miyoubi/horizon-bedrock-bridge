@@ -92,6 +92,9 @@ pub struct NetworkItem {
     pub runtime_id: i16,
     pub count: i16,
     pub damage: u32,
+    /// The server's id for this stack, which a stack request must quote back so
+    /// the server knows which stack it is acting on.
+    pub net_id: Option<u32>,
     pub block_runtime_id: u32,
     pub nbt: Option<Tag>,
 }
@@ -101,11 +104,7 @@ impl NetworkItem {
         let runtime_id = r.i16()?;
         let count = r.i16()?;
         let damage = r.varint()?;
-        if r.bool()? {
-            // Both references read this unsigned; it is only reached for stacks
-            // that carry a stack id, and its value is unused.
-            let _net_id = r.varint()?;
-        }
+        let net_id = if r.bool()? { Some(r.varint()?) } else { None };
         let block_runtime_id = r.varint()?;
         let mut nbt = None;
         let user = r.byte_slice()?;
@@ -126,9 +125,26 @@ impl NetworkItem {
             runtime_id,
             count,
             damage,
+            net_id,
             block_runtime_id,
             nbt,
         })
+    }
+}
+
+/// Which container a stack request slot refers to: a name plus, for containers
+/// that exist per item (a bundle), the dynamic id that tells them apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FullContainerName {
+    pub name: u8,
+    pub dynamic_id: Option<i32>,
+}
+
+impl FullContainerName {
+    pub fn read(r: &mut Reader) -> Result<FullContainerName> {
+        let name = r.u8()?;
+        let dynamic_id = if r.bool()? { Some(r.i32()?) } else { None };
+        Ok(FullContainerName { name, dynamic_id })
     }
 }
 
@@ -866,6 +882,11 @@ impl MoveEntityAbsolute {
 pub struct InventoryContent {
     pub window_id: u32,
     pub slots: Vec<NetworkItem>,
+    /// Which container the slots belong to. Only meaningful for containers that
+    /// are not identified by the window id alone, such as a bundle.
+    pub container: Option<FullContainerName>,
+    /// The item that holds this container, for a bundle.
+    pub storage: Option<NetworkItem>,
 }
 
 impl InventoryContent {
@@ -876,7 +897,22 @@ impl InventoryContent {
         for _ in 0..count {
             slots.push(NetworkItem::read(r)?);
         }
-        Ok(InventoryContent { window_id, slots })
+        if r.is_empty() {
+            return Ok(InventoryContent {
+                window_id,
+                slots,
+                container: None,
+                storage: None,
+            });
+        }
+        let container = FullContainerName::read(r)?;
+        let storage = NetworkItem::read(r)?;
+        Ok(InventoryContent {
+            window_id,
+            slots,
+            container: Some(container),
+            storage: Some(storage),
+        })
     }
 }
 
@@ -884,6 +920,7 @@ impl InventoryContent {
 pub struct InventorySlot {
     pub window_id: u32,
     pub slot: u32,
+    pub container: Option<FullContainerName>,
     pub item: NetworkItem,
 }
 
@@ -891,13 +928,11 @@ impl InventorySlot {
     pub fn read(r: &mut Reader) -> Result<InventorySlot> {
         let window_id = r.varint()?;
         let slot = r.varint()?;
-        // optional full container name present
-        if r.bool()? {
-            let _container_id = r.u8()?;
-            if r.bool()? {
-                let _dynamic_id = r.i32()?;
-            }
-        }
+        let container = if r.bool()? {
+            Some(FullContainerName::read(r)?)
+        } else {
+            None
+        };
         // optional storage item present
         if r.bool()? {
             let _storage = NetworkItem::read(r)?;
@@ -906,9 +941,79 @@ impl InventorySlot {
         Ok(InventorySlot {
             window_id,
             slot,
+            container,
             item,
         })
     }
+}
+
+/// The server's answer to one stack request: whether it was applied, and for
+/// each container the slots it decided on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemStackResponse {
+    pub result: u8,
+    pub request_id: i32,
+    pub containers: Vec<ResponseContainer>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResponseContainer {
+    pub container: FullContainerName,
+    pub slots: Vec<ResponseSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResponseSlot {
+    pub slot: u8,
+    pub hotbar_slot: u8,
+    pub count: u8,
+    pub stack_id: i32,
+    pub durability_correction: i32,
+}
+
+impl ItemStackResponse {
+    pub fn read(r: &mut Reader) -> Result<ItemStackResponse> {
+        let result = r.u8()?;
+        let request_id = r.zigzag32()?;
+        let mut containers = Vec::new();
+        if result == 0 {
+            let count = r.varint()?;
+            for _ in 0..count {
+                let container = FullContainerName::read(r)?;
+                let slot_count = r.varint()?;
+                let mut slots = Vec::with_capacity((slot_count as usize).min(256));
+                for _ in 0..slot_count {
+                    let slot = r.u8()?;
+                    let hotbar_slot = r.u8()?;
+                    let count = r.u8()?;
+                    let stack_id = r.zigzag32()?;
+                    let _custom_name = read_string(r)?;
+                    let _filtered = read_string(r)?;
+                    let durability_correction = r.zigzag32()?;
+                    slots.push(ResponseSlot {
+                        slot,
+                        hotbar_slot,
+                        count,
+                        stack_id,
+                        durability_correction,
+                    });
+                }
+                containers.push(ResponseContainer { container, slots });
+            }
+        }
+        Ok(ItemStackResponse {
+            result,
+            request_id,
+            containers,
+        })
+    }
+}
+
+/// A length-prefixed string, as the protocol writes names and tags.
+fn read_string(r: &mut Reader) -> Result<String> {
+    let len = r.varint()?;
+    let bytes = r.bytes(len as usize)?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[derive(Clone, Debug, PartialEq)]

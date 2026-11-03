@@ -79,6 +79,8 @@ pub const NETWORK_SETTINGS: u32 = 0x8f;
 pub const PLAYER_AUTH_INPUT: u32 = 0x90;
 pub const CREATIVE_CONTENT: u32 = 0x91;
 pub const ITEM_STACK_REQUEST: u32 = 0x93;
+/// The server's answer to a stack request.
+pub const ITEM_STACK_RESPONSE: u32 = 0x94;
 pub const ITEM_REGISTRY: u32 = 0xa2;
 pub const VIOLATION_WARNING: u32 = 0x9c;
 pub const SYNC_ENTITY_PROPERTY: u32 = 0xa5;

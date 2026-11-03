@@ -2638,6 +2638,7 @@ mod translate {
                 runtime_id: item.runtime_id,
                 count: item.count,
                 damage: item.damage,
+                net_id: item.net_id,
                 block_runtime_id: item.block_runtime_id,
             },
         )
