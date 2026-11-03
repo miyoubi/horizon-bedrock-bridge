@@ -404,6 +404,7 @@ fn run(
         mappings: &mappings,
         blocks,
         spawn: [0.0; 3],
+        spawn_info: None,
         spawn_yaw: 0.0,
         spawn_pitch: 0.0,
         published: 0,
@@ -598,6 +599,9 @@ mod translate {
         pub blocks: Option<Blocks>,
         /// The position the client should hold, from `StartGame`.
         pub spawn: [f64; 3],
+        /// The dimension and game type as `StartGame` reported them, reused for
+        /// the Java respawn that closes the death screen.
+        pub spawn_info: Option<play::SpawnInfo>,
         pub spawn_yaw: f32,
         pub spawn_pitch: f32,
         /// How many times the position has been repeated since `StartGame`.
@@ -1223,6 +1227,7 @@ mod translate {
                 ];
                 ctx.spawn_yaw = g.yaw;
                 ctx.spawn_pitch = g.pitch;
+                ctx.spawn_info = Some(spawn.clone());
                 // The biome registry in the client's own id order. Without it the
                 // client's biome table is empty and every chunk biome id falls
                 // back to the first biome (badlands — brown grass); with it, the
@@ -2004,6 +2009,40 @@ mod translate {
                 events
             }
             bp::Packet::ActorEvent { .. } => Vec::new(),
+            // The server has placed the player again (after a death, or a
+            // dimension change). Java closes its death screen and rebuilds the
+            // player from a `Respawn`, then the position; the Bedrock packet
+            // alone is not one Java understands, which is why the screen used
+            // to sit there until the client rejoined.
+            bp::Packet::Respawn { position, state } if *state == 1 => {
+                // The server has respawned us; the nudge its death screen asked
+                // for has been answered.
+                bridge.respawn_due.store(0, Ordering::Relaxed);
+                let mut events = Vec::new();
+                if let Some(spawn) = ctx.spawn_info.clone() {
+                    events.push(Event::Packet(Box::new(play::Clientbound::Respawn(
+                        play::Respawn { spawn, keep: 0 },
+                    ))));
+                }
+                // Bedrock reports the position at the eye; Java's is the feet.
+                let feet = [
+                    position[0] as f64,
+                    position[1] as f64 - PLAYER_EYE as f64,
+                    position[2] as f64,
+                ];
+                ctx.spawn = feet;
+                events.push(Event::Packet(Box::new(play::Clientbound::PlayerPosition(
+                    play::PlayerPosition {
+                        teleport: 0,
+                        position: feet,
+                        delta: [0.0; 3],
+                        yaw: ctx.spawn_yaw,
+                        pitch: ctx.spawn_pitch,
+                        relatives: 0,
+                    },
+                ))));
+                events
+            }
             bp::Packet::Disconnect(d) => vec![Event::Disconnected {
                 reason: if d.message.is_empty() {
                     format!("Bedrock disconnect reason {}", d.reason)
