@@ -589,9 +589,17 @@ content and some addon behaviour will be approximations.
 - `Apply the server's movement corrections again` — **the correction that followed was
   also needed and is the thing to remember**: a correction names the *input* tick, and the
   rewind-window check compared it with the local counter, so once the input tick became the
-  server's clock every correction looked future-dated and was dropped. It now compares the
-  input tick and applies the correction (a tiny epsilon only), as the player asked: the
-  server is authoritative, and a correction now means real divergence.
+  server's clock every correction looked future-dated and was dropped, leaving a player
+  stuck against water and block edges.
+- `Rebase a movement correction instead of rewinding to it` — applying the correction's
+  absolute position teleported the player back to a tick they had already left. The bridge
+  now keeps the feet position it reported for each of the last 64 input ticks and applies
+  only the *offset* (server position at that tick minus what we claimed there) to the
+  player's current position, so movement continues and only the drift goes. Over three
+  blocks is treated as a teleport and taken absolutely; a tick outside the history falls
+  back to the server's position. ViaBedrock checks the tick against the client's counter
+  the same way but has no history to rebase with, so it jumps; Pumpkin's server never
+  corrects.
 - `Give the game the server's command tree` — `AvailableCommands` is decoded and turned into
   the game's tree (82 commands, names, aliases, literal subcommands, typed arguments), so
   `/` lists commands and the game's own "did you mean" works. The layout came from a
