@@ -3506,10 +3506,10 @@ mod translate {
     }
 
     /// Where a shift-click sends a stack: a stack of the same item with room
-    /// first, then the first empty slot, and how many items fit. Like the game,
-    /// a stack in the hotbar goes to the main inventory and the other way
-    /// round, and anything worn goes back to the inventory. With a container
-    /// open the two sides are the container and the player.
+    /// first, then the first empty slot, and how many items fit. The hotbar is
+    /// filled before the main inventory, and anything worn goes back the same
+    /// way. With a container open the two sides are the container and the
+    /// player.
     /// The Java slot an item is worn in, by its name: armour by suffix, an
     /// elytra in the chest slot, a shield in the off hand.
     fn worn_slot(bridge: &Bridge, runtime_id: i16) -> Option<i16> {
@@ -3544,20 +3544,15 @@ mod translate {
                 (name, (0..w.kind.slots() as u8).collect())
             }
             None => match from.container.name {
-                // The other half of the inventory comes first, then the half the
-                // stack is in, so a full side spills into the other instead of
-                // the click doing nothing.
-                CONTAINER_COMBINED if from.slot < 9 => (
-                    CONTAINER_COMBINED,
-                    (9..36).chain(0..9).filter(|&s| s != from.slot).collect(),
-                ),
+                // The hotbar first, then the rest of the inventory, so a
+                // shift-click always fills the quick-access row before it
+                // spills into the main slots.
                 CONTAINER_COMBINED => (
                     CONTAINER_COMBINED,
                     (0..9).chain(9..36).filter(|&s| s != from.slot).collect(),
                 ),
-                // Armour and the off hand: the main inventory before the hotbar,
-                // the order the game picks, so both sides name the same slot.
-                _ => (CONTAINER_COMBINED, (9..36).chain(0..9).collect()),
+                // Armour and the off hand go the same way.
+                _ => (CONTAINER_COMBINED, (0..9).chain(9..36).collect()),
             },
         };
         drop(window);
