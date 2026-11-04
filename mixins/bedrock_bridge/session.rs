@@ -3551,14 +3551,16 @@ mod translate {
                 let Some(clicked) = clicked else {
                     return Vec::new();
                 };
-                let Some(here) = item_at(bridge, clicked.container.name, clicked.slot) else {
-                    return Vec::new();
-                };
                 // Pick-all, the way a real client gathers: every stack of the
                 // item the cursor holds (or, with an empty cursor, the clicked
-                // slot's) goes to the cursor until it is a full stack.
+                // slot's) goes to the cursor until it is a full stack. The
+                // clicked slot is often empty already: the item is on the
+                // cursor.
+                let here = item_at(bridge, clicked.container.name, clicked.slot);
                 let held = *bridge.cursor.lock().unwrap();
-                let target = held.unwrap_or(here);
+                let Some(target) = held.or(here) else {
+                    return Vec::new();
+                };
                 let mut room = 64i16 - held.map_or(0, |h| h.count.max(0));
                 if room <= 0 {
                     return Vec::new();
@@ -3583,6 +3585,9 @@ mod translate {
                     }
                 }
                 let mut actions = Vec::new();
+                // Once the first take has landed, the cursor is a stack this
+                // request created, so later takes name it by the request id.
+                let mut cursor_id = cursor.stack_id;
                 for at in slots {
                     if room <= 0 {
                         break;
@@ -3598,8 +3603,13 @@ mod translate {
                     actions.push(bp::StackAction::Take {
                         count: take as u8,
                         source: slot_ref(bridge, at.container.name, at.slot),
-                        destination: cursor,
+                        destination: bp::SlotRef {
+                            container: cursor.container,
+                            slot: cursor.slot,
+                            stack_id: cursor_id,
+                        },
                     });
+                    cursor_id = request_id;
                 }
                 actions
             }
