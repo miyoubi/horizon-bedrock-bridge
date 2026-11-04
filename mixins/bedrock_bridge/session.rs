@@ -3062,14 +3062,14 @@ mod translate {
                 }
                 let big = offset[0].abs() > 3.0 || offset[1].abs() > 3.0 || offset[2].abs() > 3.0;
                 {
-                    let mut debt = bridge.correction.lock().unwrap();
-                    for (pending, add) in debt.iter_mut().zip(offset) {
-                        *pending = (*pending + add).clamp(-6.0, 6.0);
+                    let mut pending = bridge.correction.lock().unwrap();
+                    for (at, add) in pending.iter_mut().zip(offset) {
+                        *at = (*at + add).clamp(-4.0, 4.0);
                     }
                     if big {
-                        // A teleport (respawn, a void fall): take it whole and
-                        // forget what was pending.
-                        *debt = [0.0; 3];
+                        // A teleport (respawn, a void fall) is the one case the
+                        // client has to see.
+                        *pending = [0.0; 3];
                     }
                 }
                 bedrock_core::nethernet::trace(format!(
@@ -4085,7 +4085,7 @@ mod translate {
         // `Pos Delta` is the position change since the previous input, not a
         // velocity: the server compares its own simulation against it, so a
         // friction-scaled value made it disagree on every sprint jump and
-        // climb.
+        // climb. It is the client's own movement, without the correction below.
         let delta = {
             let mut last = bridge.last_sent.lock().unwrap();
             let d = [
@@ -4095,6 +4095,16 @@ mod translate {
             ];
             *last = position;
             d
+        };
+        // The reported position carries whatever correction has not settled
+        // yet; the client is not moved by it.
+        let position = {
+            let offset = *bridge.correction.lock().unwrap();
+            [
+                position[0] + offset[0],
+                position[1] + offset[1],
+                position[2] + offset[2],
+            ]
         };
         {
             // Keep the feet position by tick for the correction handler.
@@ -5277,12 +5287,9 @@ mod translate {
     /// The input for the client tick that just ended: one `PlayerAuthInput`,
     /// and the inventory resync a pickup asked for once its tick is due.
     pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
-        // Pay the movement correction down a little each tick. A correction is
-        // the accumulated difference between the server's simulation and the
-        // client's; applied whole it is a jump, so it is walked off at up to
-        // 0.1 blocks a tick (two blocks a second) while the player keeps
-        // moving.
-        pay_correction(bridge);
+        // Let a correction settle into the reported position; the player's own
+        // view is never moved by one.
+        settle_correction(bridge);
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
@@ -5296,49 +5303,24 @@ mod translate {
         out
     }
 
-    /// Spend the pending movement correction: at most `CORRECTION_STEP` a tick
-    /// on each axis, nudging the game's player by that much. The position the
-    /// next input reports follows, so the server sees the correction it asked
-    /// for.
-    fn pay_correction(bridge: &Bridge) {
-        /// Per tick, in blocks: fast enough to keep up with a drifting
-        /// simulation, slow enough to read as movement rather than a jump.
-        const CORRECTION_STEP: f32 = 0.1;
-        let step = {
-            let mut debt = bridge.correction.lock().unwrap();
-            if *debt == [0.0; 3] {
-                return;
+    /// Let a movement correction settle into the position the server is told,
+    /// a little each client tick. It never moves the player's own view: the
+    /// correction is applied to the *reported* position, so the server's model
+    /// of the player converges on its simulation while the screen shows the
+    /// client's own, uninterrupted movement. That is the only way a resync can
+    /// be invisible — anything that moves the camera is a visible snap, however
+    /// small the step.
+    fn settle_correction(bridge: &Bridge) {
+        let mut offset = bridge.correction.lock().unwrap();
+        if *offset == [0.0; 3] {
+            return;
+        }
+        for at in offset.iter_mut() {
+            *at *= 0.98;
+            if at.abs() < 1e-4 {
+                *at = 0.0;
             }
-            let step = [
-                debt[0].clamp(-CORRECTION_STEP, CORRECTION_STEP),
-                debt[1].clamp(-CORRECTION_STEP, CORRECTION_STEP),
-                debt[2].clamp(-CORRECTION_STEP, CORRECTION_STEP),
-            ];
-            for (pending, taken) in debt.iter_mut().zip(step) {
-                *pending -= taken;
-            }
-            if debt.iter().all(|d| d.abs() < 1e-3) {
-                *debt = [0.0; 3];
-            }
-            step
-        };
-        let position = {
-            let mut position = bridge.position.lock().unwrap();
-            for (at, by) in position.iter_mut().zip(step) {
-                *at += by;
-            }
-            *position
-        };
-        let _ = bridge.events.send(Event::Packet(Box::new(
-            play::Clientbound::PlayerPosition(play::PlayerPosition {
-                teleport: 0,
-                position: [position[0] as f64, position[1] as f64, position[2] as f64],
-                delta: [0.0; 3],
-                yaw: 0.0,
-                pitch: 0.0,
-                relatives: 0x18, // keep the client's own heading
-            }),
-        )));
+        }
     }
 
     /// A block use, translated where the columns are: the state of the clicked
