@@ -532,6 +532,19 @@ content and some addon behaviour will be approximations.
      The move is also now predicted locally (a real client does) because the response names
      the count and stack id of each slot but not the item, and a copy of the touched slots is
      put back if the server refuses. **Pending a hand test** of the full set below.
+   - **The container, and the cursor.** The server answers a bad slot with a precise status,
+     so a gated probe (one move under each candidate container, see below) settled this
+     against the live server: a player slot named under `hotbar_and_inventory` (12) is
+     refused (`FailedToValidateSrcSlot`, 49), under `hotbar` (28) it validates as a source and
+     the cursor destination is refused instead (`FailedToValidateDstSlot`, 50), and `inventory`
+     (29) is like 12. So with no screen open the client names `hotbar`/`inventory` separately
+     and has no cursor; the cursor and the combined container only exist while the inventory
+     **screen** is open. Since every Java click is built on the cursor, the bridge asks the
+     server for that screen with `Interact` (33) action `open_inventory` (6), marks it open,
+     and names all player slots under the combined container; a respawn re-asks. BDS does not
+     send a `ContainerOpen` for it — the screen is the client's, as with the Bedrock↔Java
+     translators. This last part is **not yet confirmed live** (the server went down mid-test;
+     see §13 note below).
    - **Evidence:** `/tmp/horizon-bedrock-nethernet.log` carries the click
      (`INV click container=… slot=… button=… input=…`), the request bytes
      (`STACK REQ id=… <hex>`) and the server's verdict (`inventory move … refused`);
@@ -546,6 +559,14 @@ content and some addon behaviour will be approximations.
      open, so only one of client, relay and BDS can hold it at a time. The control socket
      rejects mouse input while an inventory is open, so inventory clicks have to be made by
      hand — batch changes per build.
+   - **The server went down mid-test.** The listening BDS died while a session was up (`Disconnect`
+     reason 39, then a reconnect loop), so the last change could not be confirmed live and a
+     plain survival inventory with no items cannot be probed. A second `bedrock_server` is
+     still running but not listening on 19132; restart the server before testing. Until then,
+     the chunk and entity symptoms are the dead server, not the bridge.
+   - **A gated probe** was used and then removed: with `HZ_INV_PROBE` set, on the first player
+     `InventoryContent` it sent the same move under containers 12/28/29 and traced the answers.
+     Re-add it (or the `NETHER_DUMP` dump) to settle a slot question against a live server.
 2. **DONE — height offset (§10.1).** The `SubChunkRequest` base Y and reply decode were
    fixed; terrain and entities now share the same Y, live-verified on a BDS join. Also fixed
    in the same build: `StartGame` stopped decoding because `0f50d2f` read an item palette
