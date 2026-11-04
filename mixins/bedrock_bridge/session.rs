@@ -3509,18 +3509,6 @@ mod translate {
         from: bp::SlotRef,
         item: bedrock_core::protocol::ItemDescriptor,
     ) -> Option<(bp::SlotRef, u8)> {
-        // A worn item goes to its armour or off-hand slot when that one is
-        // empty, the way a shift-click equips it.
-        if let Some(java) = worn_slot(bridge, item.runtime_id) {
-            let (container, slot) = if java == 45 {
-                (CONTAINER_OFFHAND, 1u8)
-            } else {
-                (CONTAINER_ARMOR, (java - 5) as u8)
-            };
-            if item_at(bridge, container, slot).is_none() {
-                return Some((slot_ref(bridge, container, slot), item.count.max(1) as u8));
-            }
-        }
         // Which side of the open window the stack is on, and where it goes.
         let (container, from_slot, region): (u8, u8, Vec<u8>) = {
             let window = bridge.window.lock().unwrap();
@@ -3615,6 +3603,8 @@ mod translate {
                 }
             }
             // Shift-click: move the stack towards the other side of the window.
+            // A worn item goes to its armour or off-hand slot instead: onto an
+            // empty one, or swapping with whatever is already worn there.
             1 => {
                 let Some(clicked) = clicked else {
                     return Vec::new();
@@ -3622,14 +3612,39 @@ mod translate {
                 let Some(item) = item_at(bridge, clicked.container.name, clicked.slot) else {
                     return Vec::new();
                 };
-                let Some((to, count)) = quick_move_target(bridge, clicked, item) else {
-                    return Vec::new();
-                };
-                vec![bp::StackAction::Take {
-                    count,
-                    source: clicked,
-                    destination: to,
-                }]
+                let worn = worn_slot(bridge, item.runtime_id).and_then(|java| {
+                    let (container, slot) = if java == 45 {
+                        (CONTAINER_OFFHAND, 1u8)
+                    } else {
+                        (CONTAINER_ARMOR, (java - 5) as u8)
+                    };
+                    // Clicking the worn slot itself hands the item back.
+                    (clicked.container.name != container || clicked.slot != slot)
+                        .then_some((container, slot))
+                });
+                if let Some((container, slot)) = worn {
+                    let to = slot_ref(bridge, container, slot);
+                    if item_at(bridge, container, slot).is_none() {
+                        vec![bp::StackAction::Take {
+                            count: item.count.max(1) as u8,
+                            source: clicked,
+                            destination: to,
+                        }]
+                    } else {
+                        vec![bp::StackAction::Swap {
+                            first: clicked,
+                            second: to,
+                        }]
+                    }
+                } else if let Some((to, count)) = quick_move_target(bridge, clicked, item) {
+                    vec![bp::StackAction::Take {
+                        count,
+                        source: clicked,
+                        destination: to,
+                    }]
+                } else {
+                    Vec::new()
+                }
             }
             // A number key: move the slot to that hotbar slot. The server
             // refuses a swap whose destination holds nothing, so a move onto an
