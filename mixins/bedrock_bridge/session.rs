@@ -2674,6 +2674,34 @@ mod translate {
                     },
                 )))]
             }
+            // Armour (120) and the off hand (119) have containers of their own;
+            // a slot update there is part of the player's inventory menu.
+            bp::Packet::InventorySlot(s) if s.window_id == 120 => {
+                if let Ok(index) = usize::try_from(s.slot) {
+                    if let Some(entry) = bridge.armor.lock().unwrap().get_mut(index) {
+                        *entry = descriptor(&s.item);
+                    }
+                }
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                        container: 0,
+                        state: 0,
+                        slot: 5 + i16::try_from(s.slot).unwrap_or(0),
+                        item: map_item(ctx, &s.item),
+                    }),
+                ))]
+            }
+            bp::Packet::InventorySlot(s) if s.window_id == 119 => {
+                *bridge.offhand.lock().unwrap() = descriptor(&s.item);
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                        container: 0,
+                        state: 0,
+                        slot: 45,
+                        item: map_item(ctx, &s.item),
+                    }),
+                ))]
+            }
             bp::Packet::InventorySlot(s) if s.window_id == 0 => {
                 if let Ok(index) = usize::try_from(s.slot) {
                     let mut held = bridge.items.lock().unwrap();
@@ -2783,6 +2811,47 @@ mod translate {
                 )));
                 *bridge.window.lock().unwrap() = Some(window);
                 vec![event]
+            }
+            // Armour, the off hand and the cursor arrive in their own
+            // containers (120, 119, 124), not in the inventory's content.
+            bp::Packet::InventoryContent(c) if c.window_id == 120 => {
+                let mut armor = bridge.armor.lock().unwrap();
+                let mut events = Vec::new();
+                for (i, item) in c.slots.iter().enumerate().take(4) {
+                    if let Some(slot) = armor.get_mut(i) {
+                        *slot = descriptor(item);
+                    }
+                    events.push(Event::Packet(Box::new(
+                        play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                            container: 0,
+                            state: 0,
+                            slot: 5 + i as i16,
+                            item: map_item(ctx, item),
+                        }),
+                    )));
+                }
+                events
+            }
+            bp::Packet::InventoryContent(c) if c.window_id == 119 => {
+                let item = c.slots.first();
+                *bridge.offhand.lock().unwrap() = item.and_then(|i| descriptor(i));
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                        container: 0,
+                        state: 0,
+                        slot: 45,
+                        item: item.and_then(|i| map_item(ctx, i)),
+                    }),
+                ))]
+            }
+            bp::Packet::InventoryContent(c) if c.window_id == 124 => {
+                let item = c.slots.first();
+                *bridge.cursor.lock().unwrap() = item.and_then(|i| descriptor(i));
+                vec![Event::Packet(Box::new(play::Clientbound::SetCursorItem(
+                    play::SetCursorItem {
+                        item: item.and_then(|i| map_item(ctx, i)),
+                    },
+                )))]
             }
             // The contents of an open container: the game shows the container's
             // slots along with the player's, as one menu.
