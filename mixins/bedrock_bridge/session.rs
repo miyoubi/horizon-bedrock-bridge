@@ -2941,23 +2941,31 @@ mod translate {
     /// container keeps every count consistent, where a single slot update can
     /// be discarded when its menu state does not match.
     fn inventory_content(ctx: &Context, bridge: &Bridge) -> Event {
-        let items = bridge.items.lock().unwrap();
         let mut slots: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
-        for (i, entry) in items.iter().enumerate() {
-            let Some(d) = entry else { continue };
-            let Some(slot) = java_inventory_slot(i as u32) else {
-                continue;
-            };
-            let Ok(index) = usize::try_from(slot) else {
-                continue;
-            };
-            if index >= slots.len() {
-                continue;
-            }
+        let map = |d: &bedrock_core::protocol::ItemDescriptor| {
             let id = item_by_network_id(ctx.mappings, ctx.builtin, &ctx.items, d.runtime_id);
-            if id != 0 {
-                slots[index] = Some(Stack::new(id, i32::from(d.count)));
+            (id != 0).then(|| Stack::new(id, i32::from(d.count)))
+        };
+        for (i, entry) in bridge.items.lock().unwrap().iter().enumerate() {
+            let Some(d) = entry else { continue };
+            let Some(index) = java_inventory_slot(i as u32).and_then(|s| usize::try_from(s).ok()) else {
+                continue;
+            };
+            if index < slots.len() {
+                slots[index] = map(d);
             }
+        }
+        // The armour and the off hand are part of the same menu, so a resync has
+        // to carry them too or they read as emptied.
+        for (i, entry) in bridge.armor.lock().unwrap().iter().enumerate() {
+            if let Some(d) = entry {
+                if 5 + i < slots.len() {
+                    slots[5 + i] = map(d);
+                }
+            }
+        }
+        if let Some(d) = *bridge.offhand.lock().unwrap() {
+            slots[45] = map(&d);
         }
         Event::Packet(Box::new(play::Clientbound::ContainerSetContent(
             play::ContainerSetContent {
