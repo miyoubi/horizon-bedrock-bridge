@@ -189,6 +189,11 @@ struct Bridge {
     /// had answered, keyed by the request id the server echoes. A move is
     /// shown at once (a real client predicts it) and put back if refused.
     pending_moves: Mutex<Vec<(i32, Items)>>,
+    /// The slots a move has changed locally but the server has not answered for
+    /// yet, each mapped to that request's id. A slot changed by an
+    /// unacknowledged request is named by the request id, not by the stack id it
+    /// had before; quoting the old id is what made rapid moves and drags fail.
+    pending_ids: Mutex<std::collections::HashMap<(u8, u8), i32>>,
     /// Whether the server has the player's inventory screen open. A real client
     /// asks for it with `Interact`/`open_inventory`; the cursor and the
     /// `hotbar_and_inventory` container only exist while it is.
@@ -364,6 +369,7 @@ pub fn try_connect(
         last_use: Mutex::new(None),
         removals: Mutex::new(Vec::new()),
         pending_moves: Mutex::new(Vec::new()),
+        pending_ids: Mutex::new(std::collections::HashMap::new()),
         inv_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
@@ -2596,6 +2602,9 @@ mod translate {
                     let mut held = bridge.items.lock().unwrap();
                     *held = c.slots.iter().take(36).map(descriptor).collect();
                 }
+                // The server has sent the whole inventory again; its ids are the
+                // truth now, so nothing is waiting to be answered.
+                bridge.pending_ids.lock().unwrap().clear();
                 // The window also reports the armour and the off hand, past the
                 // inventory's own slots.
                 {
@@ -3254,11 +3263,54 @@ mod translate {
     fn slot_ref(bridge: &Bridge, container: u8, slot: u8) -> bp::SlotRef {
         // A stack request has to quote the stack id the server issued for the
         // slot it names; zero means "empty", so a move that leaves it out is
-        // read as acting on nothing and refused.
-        let stack_id = item_at(bridge, container, slot)
-            .and_then(|d| d.net_id)
-            .map_or(0, |id| id as i32);
+        // read as acting on nothing and refused. A slot a move has already
+        // changed here but the server has not answered for yet is named by that
+        // request's id instead, which is how a real client refers to its own
+        // not-yet-confirmed changes.
+        let pending = bridge
+            .pending_ids
+            .lock()
+            .unwrap()
+            .get(&(container, slot))
+            .copied();
+        let stack_id = match pending {
+            Some(id) => id,
+            None => item_at(bridge, container, slot)
+                .and_then(|d| d.net_id)
+                .map_or(0, |id| id as i32),
+        };
         bp::SlotRef::new(container, slot, stack_id)
+    }
+
+    /// Remember the slots a request has just changed locally, so later requests
+    /// name them by its id until the server answers.
+    fn note_pending(bridge: &Bridge, request_id: i32, actions: &[bp::StackAction]) {
+        let mut pending = bridge.pending_ids.lock().unwrap();
+        for action in actions {
+            match *action {
+                bp::StackAction::Take {
+                    source,
+                    destination,
+                    ..
+                }
+                | bp::StackAction::Place {
+                    source,
+                    destination,
+                    ..
+                } => {
+                    pending.insert((source.container.name, source.slot), request_id);
+                    pending.insert((destination.container.name, destination.slot), request_id);
+                }
+                bp::StackAction::Swap { first, second } => {
+                    pending.insert((first.container.name, first.slot), request_id);
+                    pending.insert((second.container.name, second.slot), request_id);
+                }
+                bp::StackAction::Drop { source, .. }
+                | bp::StackAction::Destroy { source, .. } => {
+                    pending.insert((source.container.name, source.slot), request_id);
+                }
+            }
+        }
     }
 
     /// Which server slot a click on the game's menu refers to, whether that is
@@ -3640,6 +3692,7 @@ mod translate {
                 pending.remove(0);
             }
         }
+        note_pending(bridge, request_id, &actions);
         vec![bp::Out::ItemStackRequest {
             request_id,
             actions,
@@ -3680,6 +3733,12 @@ mod translate {
             if let Some(before) = before {
                 restore(bridge, before);
             }
+            // The refused move changed nothing, so its pending names go too.
+            bridge
+                .pending_ids
+                .lock()
+                .unwrap()
+                .retain(|_, id| *id != response.request_id);
             return vec![inventory_content(ctx, bridge)];
         }
         let mut events = Vec::new();
@@ -3698,6 +3757,15 @@ mod translate {
                     })
                 };
                 set_item_at(bridge, name, slot.slot, settled);
+                {
+                    // This slot's unacknowledged change is answered now, so it
+                    // goes back to naming the server's stack id.
+                    let mut pending = bridge.pending_ids.lock().unwrap();
+                    let key = (name, slot.slot);
+                    if pending.get(&key) == Some(&response.request_id) {
+                        pending.remove(&key);
+                    }
+                }
                 if std::env::var_os("HZ_INV_TRACE").is_some() {
                     bedrock_core::nethernet::trace(format!(
                         "INV OUT id={} container={name} slot={} count={count} settled={}",
