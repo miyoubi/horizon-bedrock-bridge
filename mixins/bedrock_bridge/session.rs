@@ -3971,9 +3971,9 @@ mod translate {
                 )));
             }
         }
-        // A slot the move changed here but the answer did not name was predicted
-        // to a place the server did not use, so the copy drawn there has to go:
-        // put the slot back to the snapshot and show it.
+        // A successful answer names every slot it changed, so any slot still
+        // counted against this request was not settled and its predicted copy
+        // has to be removed.
         if let Some(before) = &before {
             let touched: Vec<(u8, u8)> = {
                 let pending = bridge.pending_ids.lock().unwrap();
@@ -4018,6 +4018,9 @@ mod translate {
                     )));
                 }
             }
+            // Unanswered, stale names must not linger into the next move.
+            let mut pending = bridge.pending_ids.lock().unwrap();
+            pending.retain(|_, id| *id != response.request_id);
         }
         events
     }
