@@ -1430,6 +1430,9 @@ mod translate {
                 .map(|(_, id)| *id as i32)
                 .collect();
             removals.retain(|(due, _)| *due > now);
+            if std::env::var_os("HZ_ENT_TRACE").is_some() {
+                bedrock_core::nethernet::trace(format!("REMOVE ids={ids:?} now={now}"));
+            }
             events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
                 play::RemoveEntities { ids },
             ))));
@@ -2266,6 +2269,12 @@ mod translate {
                     ctx.kinds.remove(&entity);
                     ctx.players.remove(&entity);
                     ctx.drops.remove(&entity);
+                    if std::env::var_os("HZ_ENT_TRACE").is_some() {
+                        bedrock_core::nethernet::trace(format!(
+                            "DEATH id={entity} own={} due={due}",
+                            entity == ctx.runtime_id as u64
+                        ));
+                    }
                     events.push(Event::Packet(Box::new(play::Clientbound::EntityEvent(
                         play::EntityEvent {
                             id: entity as i32,
@@ -3671,6 +3680,17 @@ mod translate {
                     })
                 };
                 set_item_at(bridge, name, slot.slot, settled);
+                if std::env::var_os("HZ_INV_TRACE").is_some() {
+                    bedrock_core::nethernet::trace(format!(
+                        "INV OUT id={} container={name} slot={} count={count} settled={}",
+                        response.request_id,
+                        slot.slot,
+                        settled.map_or_else(
+                            || "none".to_string(),
+                            |d| format!("runtime={} count={} id={:?}", d.runtime_id, d.count, d.net_id)
+                        ),
+                    ));
+                }
                 if name == CONTAINER_CURSOR {
                     events.push(Event::Packet(Box::new(play::Clientbound::SetCursorItem(
                         play::SetCursorItem {
