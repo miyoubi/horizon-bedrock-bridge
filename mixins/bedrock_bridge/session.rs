@@ -194,6 +194,10 @@ struct Bridge {
     /// unacknowledged request is named by the request id, not by the stack id it
     /// had before; quoting the old id is what made rapid moves and drags fail.
     pending_ids: Mutex<std::collections::HashMap<(u8, u8), i32>>,
+    /// The shift-clicks still waiting for an answer. A quick move picks the
+    /// slot to move into on both sides, and the two can choose differently, so
+    /// its answer is followed by a whole-menu update rather than single slots.
+    quick_moves: Mutex<std::collections::HashSet<i32>>,
     /// Each item's Java name by its network id, from the item registry, so a
     /// click can tell armour and a shield from everything else.
     item_names: Mutex<std::collections::HashMap<i16, String>>,
@@ -373,6 +377,7 @@ pub fn try_connect(
         removals: Mutex::new(Vec::new()),
         pending_moves: Mutex::new(Vec::new()),
         pending_ids: Mutex::new(std::collections::HashMap::new()),
+        quick_moves: Mutex::new(std::collections::HashSet::new()),
         item_names: Mutex::new(std::collections::HashMap::new()),
         inv_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
@@ -3865,6 +3870,16 @@ mod translate {
             }
         }
         note_pending(bridge, request_id, &actions);
+        if c.input == 1 {
+            // A quick move chooses its destination on both sides; the answer
+            // reconciles the whole menu so the other guess cannot survive as a
+            // second copy.
+            let mut quick = bridge.quick_moves.lock().unwrap();
+            if quick.len() > 64 {
+                quick.clear();
+            }
+            quick.insert(request_id);
+        }
         vec![bp::Out::ItemStackRequest {
             request_id,
             actions,
@@ -3989,38 +4004,38 @@ mod translate {
                     named.insert((container.container.name, slot.slot));
                 }
             }
+            let mut ghost = false;
             for (container, slot) in touched {
                 if named.contains(&(container, slot)) {
                     continue;
                 }
-                let item = restore_slot(bridge, before, container, slot);
+                // The move settled somewhere other than where it was drawn
+                // here, so the game is showing a copy the server does not have.
+                ghost = true;
+                restore_slot(bridge, before, container, slot);
                 bridge.pending_ids.lock().unwrap().remove(&(container, slot));
-                if container == CONTAINER_CURSOR {
-                    events.push(Event::Packet(Box::new(play::Clientbound::SetCursorItem(
-                        play::SetCursorItem {
-                            item: item.and_then(|d| {
-                                map_item_by_id(ctx, d.runtime_id, i32::from(d.count))
-                            }),
-                        },
-                    ))));
-                    continue;
-                }
-                if let Some(java) = java_slot_of(container, slot) {
-                    events.push(Event::Packet(Box::new(
-                        play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
-                            container: 0,
-                            state: 0,
-                            slot: java,
-                            item: item.and_then(|d| {
-                                map_item_by_id(ctx, d.runtime_id, i32::from(d.count))
-                            }),
-                        }),
-                    )));
-                }
             }
             // Unanswered, stale names must not linger into the next move.
             let mut pending = bridge.pending_ids.lock().unwrap();
             pending.retain(|_, id| *id != response.request_id);
+            drop(pending);
+            if ghost {
+                // The game's own prediction can have put the stack in a slot the
+                // bridge never named, so patching single slots leaves a second
+                // copy behind. One whole-menu update from the bridge's model
+                // rewrites every slot and takes any stray copy with it.
+                events.push(inventory_content(ctx, bridge));
+            }
+        }
+        // A quick move is the one click whose destination both sides guess, so
+        // its answer always rewrites the whole menu.
+        if bridge
+            .quick_moves
+            .lock()
+            .unwrap()
+            .remove(&response.request_id)
+        {
+            events.push(inventory_content(ctx, bridge));
         }
         events
     }
