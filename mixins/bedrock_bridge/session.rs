@@ -104,6 +104,9 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
+    /// The chunk radius this session asks the server for: the game's render
+    /// distance, which the player can change while playing.
+    chunk_radius: AtomicI32,
     /// Last position sent to the server; rotation-only updates reuse it, so a
     /// MovePlayerRot never looks like a teleport to (0,0,0).
     position: Mutex<[f32; 3]>,
@@ -349,6 +352,7 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
+        chunk_radius: AtomicI32::new(i32::from(view_distance).max(2)),
         position: Mutex::new([0.0; 3]),
         rotation: Mutex::new([0.0; 2]),
         input: AtomicI64::new(0),
@@ -692,7 +696,7 @@ fn run(
                 bridge
                     .runtime_id
                     .store(g.entity_runtime_id as i64, Ordering::Relaxed);
-                let _ = client.request_chunks(i32::from(view_distance));
+                let _ = client.request_chunks(bridge.chunk_radius.load(Ordering::Relaxed));
             }
             // The server ignores the player's input until the client reports
             // itself initialized, and a real client only reports it once the
@@ -4217,6 +4221,20 @@ mod translate {
         block_id: u32,
     ) -> Vec<bp::Out> {
         match packet {
+            // The game's render distance is the chunk radius asked of the
+            // server, and the player can change it while playing, so a new
+            // client-information packet re-requests it. Before the world has
+            // started the radius is only remembered: the request goes out with
+            // the rest of the start-up burst.
+            play::Serverbound::ClientInformation(info) => {
+                let radius = i32::from(info.view_distance).max(2);
+                bridge.chunk_radius.store(radius, Ordering::Relaxed);
+                if bridge.runtime_id.load(Ordering::Relaxed) != 0 {
+                    vec![bp::Out::RequestChunkRadius { radius }]
+                } else {
+                    Vec::new()
+                }
+            }
             // Movement and input only update the bridge state; one
             // `PlayerAuthInput` goes out at the end of the client tick with all
             // of it, so the server's input tick and ours stay the same tick.
