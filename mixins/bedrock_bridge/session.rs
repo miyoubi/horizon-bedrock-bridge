@@ -3515,16 +3515,34 @@ mod translate {
                     destination: to,
                 }]
             }
-            // A number key: swap the slot with that hotbar slot.
+            // A number key: move the slot to that hotbar slot. The server
+            // refuses a swap whose destination holds nothing, so a move onto an
+            // empty slot is a take; only two occupied slots swap.
             2 => {
                 let Some(clicked) = clicked else {
                     return Vec::new();
                 };
                 let hotbar = c.button.clamp(0, 8) as u8;
-                vec![bp::StackAction::Swap {
-                    first: clicked,
-                    second: player_slot_ref(bridge, hotbar),
-                }]
+                let to = player_slot_ref(bridge, hotbar);
+                let here = item_at(bridge, clicked.container.name, clicked.slot);
+                let there = item_at(bridge, to.container.name, to.slot);
+                match (here, there) {
+                    (Some(item), None) => vec![bp::StackAction::Take {
+                        count: item.count.max(0) as u8,
+                        source: clicked,
+                        destination: to,
+                    }],
+                    (None, Some(item)) => vec![bp::StackAction::Take {
+                        count: item.count.max(0) as u8,
+                        source: to,
+                        destination: clicked,
+                    }],
+                    (Some(_), Some(_)) => vec![bp::StackAction::Swap {
+                        first: clicked,
+                        second: to,
+                    }],
+                    (None, None) => Vec::new(),
+                }
             }
             // Throwing an item out of a slot, or out of the cursor when the
             // click is outside the window.
