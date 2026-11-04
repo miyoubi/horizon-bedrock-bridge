@@ -304,6 +304,13 @@ pub enum Out {
         hide: bool,
         message: String,
     },
+    /// An `Interact` (33). The client sends `open_inventory` (6) with its own
+    /// runtime id to have the server open the player's inventory screen, which a
+    /// stack request's cursor and `hotbar_and_inventory` container need.
+    Interact {
+        action: u8,
+        target: u64,
+    },
     /// A raw packet id + body, for anything not modelled above.
     Raw(u32, Vec<u8>),
 }
@@ -1109,6 +1116,12 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.u8(0); // swing source
             w.u8(0); // hand: main
         }
+        Out::Interact { action, target } => {
+            w.varint(ids::INTERACT);
+            w.u8(*action);
+            w.varlong(*target);
+            w.bool(false); // no position
+        }
         Out::Raw(id, body) => {
             w.varint(*id).bytes(body);
         }
@@ -1117,6 +1130,9 @@ pub fn encode(packet: &Out) -> Vec<u8> {
     if let Out::ItemStackRequest { request_id, .. } = packet {
         let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
         crate::nethernet::trace(format!("STACK REQ id={request_id} {hex}"));
+    }
+    if let Out::Interact { action, target } = packet {
+        crate::nethernet::trace(format!("INTERACT action={action} target={target}"));
     }
     out
 }

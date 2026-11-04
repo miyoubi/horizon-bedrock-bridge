@@ -189,6 +189,10 @@ struct Bridge {
     /// had answered, keyed by the request id the server echoes. A move is
     /// shown at once (a real client predicts it) and put back if refused.
     pending_moves: Mutex<Vec<(i32, Items)>>,
+    /// Whether the server has the player's inventory screen open. A real client
+    /// asks for it with `Interact`/`open_inventory`; the cursor and the
+    /// `hotbar_and_inventory` container only exist while it is.
+    inv_open: AtomicBool,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -360,6 +364,7 @@ pub fn try_connect(
         last_use: Mutex::new(None),
         removals: Mutex::new(Vec::new()),
         pending_moves: Mutex::new(Vec::new()),
+        inv_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -2328,6 +2333,13 @@ mod translate {
                 // has respawned: a `PlayerAction` of action 7 clears the dead
                 // state there. Without it the player stays a corpse to everyone
                 // else however the client looks.
+                // A respawn closes the inventory screen on the server, so ask
+                // for it again; the game's clicks need it.
+                bridge.inv_open.store(false, Ordering::Relaxed);
+                ctx.requests.push(bp::Out::Interact {
+                    action: OPEN_INVENTORY,
+                    target: ctx.runtime_id,
+                });
                 ctx.requests.push(bp::Out::PlayerAction {
                     runtime_id: ctx.runtime_id,
                     action: 7, // respawn
@@ -2588,6 +2600,17 @@ mod translate {
                 if let Some(item) = c.slots.get(40) {
                     *bridge.offhand.lock().unwrap() = descriptor(item);
                 }
+                // Ask for the server to open the inventory screen if it has not;
+                // its cursor and combined container are what the game's clicks
+                // are made of, and neither exists without it. The screen is the
+                // client's: it is open as soon as the request is out.
+                if !bridge.inv_open.load(Ordering::Relaxed) {
+                    ctx.requests.push(bp::Out::Interact {
+                        action: OPEN_INVENTORY,
+                        target: ctx.runtime_id,
+                    });
+                    bridge.inv_open.store(true, Ordering::Relaxed);
+                }
                 let mut events = vec![Event::Packet(Box::new(
                     play::Clientbound::ContainerSetContent(play::ContainerSetContent {
                         container: 0,
@@ -2693,6 +2716,14 @@ mod translate {
             // the game is given the name of the kind of menu it is. A kind the
             // bridge cannot translate is closed again rather than shown, since
             // its clicks would go nowhere.
+            bp::Packet::ContainerOpen(c) if c.window_type == INVENTORY_WINDOW => {
+                // The player's own inventory screen. It has no Java counterpart
+                // (the game draws it itself), but a stack request's cursor and
+                // combined container only exist while it is open on the server.
+                bridge.inv_open.store(true, Ordering::Relaxed);
+                bedrock_core::nethernet::trace("inventory screen opened".to_string());
+                Vec::new()
+            }
             bp::Packet::ContainerOpen(c) => {
                 let Some(kind) = WindowKind::of(c.window_type) else {
                     bedrock_core::nethernet::trace(format!(
@@ -2954,10 +2985,16 @@ mod translate {
     /// request rather than identified by a number, and the player's own window
     /// is made of several of them.
     const CONTAINER_COMBINED: u8 = 12;
+    const CONTAINER_HOTBAR: u8 = 28;
+    const CONTAINER_INVENTORY: u8 = 29;
     const CONTAINER_ARMOR: u8 = 6;
     const CONTAINER_CRAFTING_INPUT: u8 = 13;
     const CONTAINER_OFFHAND: u8 = 34;
     const CONTAINER_CURSOR: u8 = 59;
+    /// `Interact` action: ask the server to open the player's inventory screen.
+    const OPEN_INVENTORY: u8 = 6;
+    /// The window type the server answers that with (`WindowType::inventory`, -1).
+    const INVENTORY_WINDOW: u8 = 0xFF;
 
     /// Where a slot in the game's own inventory window lives on the server,
     /// as its container name and the slot within it.
@@ -2967,7 +3004,7 @@ mod translate {
             5..=8 => (CONTAINER_ARMOR, (java - 5) as u8),
             9..=35 => (CONTAINER_COMBINED, java as u8),
             36..=44 => (CONTAINER_COMBINED, (java - 36) as u8),
-            45 => (CONTAINER_OFFHAND, 0),
+            45 => (CONTAINER_OFFHAND, 1),
             _ => return None,
         })
     }
@@ -2975,7 +3012,7 @@ mod translate {
     /// The other direction, for something the server reports.
     fn java_slot_of(container: u8, slot: u8) -> Option<i16> {
         Some(match container {
-            CONTAINER_COMBINED => {
+            CONTAINER_COMBINED | CONTAINER_HOTBAR | CONTAINER_INVENTORY => {
                 if slot < 9 {
                     36 + i16::from(slot)
                 } else {
@@ -3003,7 +3040,7 @@ mod translate {
             }
         }
         match container {
-            CONTAINER_COMBINED => bridge
+            CONTAINER_COMBINED | CONTAINER_HOTBAR | CONTAINER_INVENTORY => bridge
                 .items
                 .lock()
                 .unwrap()
@@ -3037,7 +3074,7 @@ mod translate {
             }
         }
         match container {
-            CONTAINER_COMBINED => {
+            CONTAINER_COMBINED | CONTAINER_HOTBAR | CONTAINER_INVENTORY => {
                 if let Some(entry) = bridge
                     .items
                     .lock()
@@ -3168,6 +3205,35 @@ mod translate {
         }
     }
 
+    /// The container name one of the player's own slots is named under. While
+    /// the inventory screen is open that is the screen's combined view; with no
+    /// screen open a real client names the hotbar and the main inventory
+    /// separately (the combined view does not exist then).
+    fn player_container(slot: u8, screen_open: bool) -> u8 {
+        if screen_open {
+            CONTAINER_COMBINED
+        } else if slot < 9 {
+            CONTAINER_HOTBAR
+        } else {
+            CONTAINER_INVENTORY
+        }
+    }
+
+    fn player_slot_ref(bridge: &Bridge, slot: u8) -> bp::SlotRef {
+        let screen_open = bridge.inv_open.load(Ordering::Relaxed);
+        slot_ref(bridge, player_container(slot, screen_open), slot)
+    }
+
+    /// A slot the bridge resolved to the combined player inventory, named the way
+    /// the server wants it.
+    fn inventory_slot_ref(bridge: &Bridge, container: u8, slot: u8) -> bp::SlotRef {
+        if container == CONTAINER_COMBINED {
+            player_slot_ref(bridge, slot)
+        } else {
+            slot_ref(bridge, container, slot)
+        }
+    }
+
     fn slot_ref(bridge: &Bridge, container: u8, slot: u8) -> bp::SlotRef {
         // A stack request has to quote the stack id the server issued for the
         // slot it names; zero means "empty", so a move that leaves it out is
@@ -3195,13 +3261,13 @@ mod translate {
                 });
             }
             let bedrock = window.kind.bedrock_player_slot(slot)?;
-            return Some(slot_ref(bridge, CONTAINER_COMBINED, bedrock));
+            return Some(player_slot_ref(bridge, bedrock));
         }
         if container != 0 {
             return None;
         }
         let (name, at) = bedrock_slot_of(slot)?;
-        Some(slot_ref(bridge, name, at))
+        Some(inventory_slot_ref(bridge, name, at))
     }
 
     /// The whole menu of an open window as the game wants it: the container's
@@ -3297,12 +3363,12 @@ mod translate {
                     let room = 64u8.saturating_sub(existing.count.max(0) as u8);
                     let count = (item.count.max(0) as u8).min(room);
                     if count > 0 {
-                        return Some((slot_ref(bridge, container, slot), count));
+                        return Some((inventory_slot_ref(bridge, container, slot), count));
                     }
                 }
                 None => {
                     return Some((
-                        slot_ref(bridge, container, slot),
+                        inventory_slot_ref(bridge, container, slot),
                         item.count.max(1) as u8,
                     ));
                 }
@@ -3388,7 +3454,7 @@ mod translate {
                 let hotbar = c.button.clamp(0, 8) as u8;
                 vec![bp::StackAction::Swap {
                     first: clicked,
-                    second: slot_ref(bridge, CONTAINER_COMBINED, hotbar),
+                    second: player_slot_ref(bridge, hotbar),
                 }]
             }
             // Throwing an item out of a slot, or out of the cursor when the
