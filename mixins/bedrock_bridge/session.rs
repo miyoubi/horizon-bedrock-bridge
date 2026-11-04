@@ -3004,20 +3004,23 @@ mod translate {
                         ));
                     }
                 }
-                // Follow ViaBedrock: drop a correction whose tick has fallen
-                // outside the server's rewind window, because applying it would
-                // pull the client back to a position it has already left.
+                // The correction names the tick it answers, which is the
+                // input tick — the same counter the inputs are numbered with.
+                // Comparing it with the local tick counter (as this did once the
+                // input tick became the server's clock) made every correction
+                // look like it belonged to the future, so all of them were
+                // dropped and a player could be left stuck against a block.
                 const REWIND_WINDOW: u64 = 40;
-                let now_tick = bridge.tick.load(Ordering::Relaxed) as u64;
-                if *tick == 0 || *tick + REWIND_WINDOW < now_tick || *tick > now_tick {
+                let now_tick = bridge.input_tick.load(Ordering::Relaxed).max(0) as u64;
+                if *tick == 0 || *tick + REWIND_WINDOW < now_tick {
                     return Vec::new();
                 }
-                // Apply only a genuine teleport-sized move. Tracking the
-                // server's simulation at its own threshold pulled the client
-                // back to the server's trailing position on every tick while
-                // running, which reads as teleporting; the server's view of the
-                // player is driven by the input, not by this.
-                if dx * dx + dz * dz < 4.0 * 4.0 && dy.abs() < 3.0 {
+                // Follow the server. It is authoritative, and with the input
+                // tick and delta now matching it, a correction means a real
+                // divergence (water, a block edge, knockback) rather than the
+                // one-tick lag that made applying them all look like
+                // teleporting. Only floating-point noise is ignored.
+                if dx.abs() < 0.001 && dy.abs() < 0.001 && dz.abs() < 0.001 {
                     return Vec::new();
                 }
                 vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
