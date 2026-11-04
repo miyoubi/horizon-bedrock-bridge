@@ -3297,6 +3297,12 @@ mod translate {
     /// name them by its id until the server answers.
     fn note_pending(bridge: &Bridge, request_id: i32, actions: &[bp::StackAction]) {
         let mut pending = bridge.pending_ids.lock().unwrap();
+        // A name whose answer never came would otherwise outlive its request and
+        // wedge every later move on that slot; drop the lot rather than keep
+        // quoting stale request ids.
+        if pending.len() > 128 {
+            pending.clear();
+        }
         for action in actions {
             match *action {
                 bp::StackAction::Take {
@@ -3792,12 +3798,10 @@ mod translate {
             if let Some(before) = before {
                 restore(bridge, before);
             }
-            // The refused move changed nothing, so its pending names go too.
-            bridge
-                .pending_ids
-                .lock()
-                .unwrap()
-                .retain(|_, id| *id != response.request_id);
+            // The refused move changed nothing. The model is back to the
+            // snapshot, whose ids the server knows, so every outstanding name
+            // goes: one that is never answered would wedge its slot for good.
+            bridge.pending_ids.lock().unwrap().clear();
             return vec![inventory_content(ctx, bridge)];
         }
         let mut events = Vec::new();
