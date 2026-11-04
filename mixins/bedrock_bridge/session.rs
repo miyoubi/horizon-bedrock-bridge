@@ -185,6 +185,10 @@ struct Bridge {
     /// is due on. The game plays the fall-over animation for a second, and
     /// removing the entity in the same tick skipped it.
     removals: Mutex<Vec<(i64, u64)>>,
+    /// The slots as they were before each move the bridge has sent but not yet
+    /// had answered, keyed by the request id the server echoes. A move is
+    /// shown at once (a real client predicts it) and put back if refused.
+    pending_moves: Mutex<Vec<(i32, Items)>>,
 }
 
 /// The local player's health bar as Java conveys it.
@@ -226,6 +230,21 @@ impl OpenWindow {
             *entry = item;
         }
     }
+}
+
+/// A copy of every slot a move can reach: the player's own inventory, the armour
+/// and off hand, the cursor and the open container. Taken before a move so a
+/// refused one can be undone exactly.
+#[derive(Clone)]
+struct Items {
+    items: Vec<Option<bedrock_core::protocol::ItemDescriptor>>,
+    armor: Vec<Option<bedrock_core::protocol::ItemDescriptor>>,
+    offhand: Option<bedrock_core::protocol::ItemDescriptor>,
+    cursor: Option<bedrock_core::protocol::ItemDescriptor>,
+    window: Option<(
+        Option<bedrock_core::protocol::FullContainerName>,
+        Vec<Option<bedrock_core::protocol::ItemDescriptor>>,
+    )>,
 }
 
 /// The container menus the bridge can show. Everything else is closed again
@@ -340,6 +359,7 @@ pub fn try_connect(
         pending_use: Mutex::new(Vec::new()),
         last_use: Mutex::new(None),
         removals: Mutex::new(Vec::new()),
+        pending_moves: Mutex::new(Vec::new()),
         shutdown: AtomicBool::new(false),
     });
     bridges()
@@ -688,7 +708,7 @@ fn run(
 // Translation: Bedrock packets → Horizon's Java clientbound packets.
 // -------------------------------------------------------------------------
 mod translate {
-    use super::{Bridge, Event, OpenWindow, WindowKind};
+    use super::{Bridge, Event, Items, OpenWindow, WindowKind};
     use bedrock_core::protocol as bp;
     use crate::chunk::{
         BIOME_STRATEGY, Chunk, Section as ClientSection, Light as ClientLight,
@@ -3043,7 +3063,115 @@ mod translate {
         }
     }
 
+    /// Copy every slot a move can reach, so a refused move can be undone.
+    fn snapshot(bridge: &Bridge) -> Items {
+        Items {
+            items: bridge.items.lock().unwrap().clone(),
+            armor: bridge.armor.lock().unwrap().clone(),
+            offhand: *bridge.offhand.lock().unwrap(),
+            cursor: *bridge.cursor.lock().unwrap(),
+            window: bridge
+                .window
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|w| (w.name, w.slots.clone())),
+        }
+    }
+
+    /// Put a snapshot back, undoing a move the server refused.
+    fn restore(bridge: &Bridge, snapshot: Items) {
+        *bridge.items.lock().unwrap() = snapshot.items;
+        *bridge.armor.lock().unwrap() = snapshot.armor;
+        *bridge.offhand.lock().unwrap() = snapshot.offhand;
+        *bridge.cursor.lock().unwrap() = snapshot.cursor;
+        if let Some(window) = bridge.window.lock().unwrap().as_mut() {
+            if let Some((name, slots)) = snapshot.window {
+                window.name = name;
+                window.slots = slots;
+            }
+        }
+    }
+
+    /// Move `count` of the item at `from` into `to`, merging a matching stack,
+    /// the way the server applies a take or a place.
+    fn move_item(bridge: &Bridge, from: bp::SlotRef, to: bp::SlotRef, count: u8) {
+        let count = i16::from(count);
+        if count <= 0 {
+            return;
+        }
+        let Some(mut item) = item_at(bridge, from.container.name, from.slot) else {
+            return;
+        };
+        if item.count <= 0 {
+            return;
+        }
+        let moved = count.min(item.count);
+        match item_at(bridge, to.container.name, to.slot) {
+            Some(mut dest) if dest.runtime_id == item.runtime_id => {
+                dest.count = dest.count.saturating_add(moved);
+                set_item_at(bridge, to.container.name, to.slot, Some(dest));
+            }
+            Some(_) => return,
+            None => {
+                let mut dest = item;
+                dest.count = moved;
+                set_item_at(bridge, to.container.name, to.slot, Some(dest));
+            }
+        }
+        item.count -= moved;
+        set_item_at(
+            bridge,
+            from.container.name,
+            from.slot,
+            (item.count > 0).then_some(item),
+        );
+    }
+
+    fn swap_items(bridge: &Bridge, a: bp::SlotRef, b: bp::SlotRef) {
+        let first = item_at(bridge, a.container.name, a.slot);
+        let second = item_at(bridge, b.container.name, b.slot);
+        set_item_at(bridge, a.container.name, a.slot, second);
+        set_item_at(bridge, b.container.name, b.slot, first);
+    }
+
+    fn remove_items(bridge: &Bridge, slot: bp::SlotRef, count: u8) {
+        let Some(mut item) = item_at(bridge, slot.container.name, slot.slot) else {
+            return;
+        };
+        item.count -= i16::from(count).min(item.count);
+        set_item_at(
+            bridge,
+            slot.container.name,
+            slot.slot,
+            (item.count > 0).then_some(item),
+        );
+    }
+
+    /// Apply one request action to the local slots, so the game shows the move
+    /// before the server answers.
+    fn apply_action(bridge: &Bridge, action: &bp::StackAction) {
+        match *action {
+            bp::StackAction::Take {
+                count,
+                source,
+                destination,
+            }
+            | bp::StackAction::Place {
+                count,
+                source,
+                destination,
+            } => move_item(bridge, source, destination, count),
+            bp::StackAction::Swap { first, second } => swap_items(bridge, first, second),
+            bp::StackAction::Drop { count, source, .. }
+            | bp::StackAction::Destroy { count, source } => remove_items(bridge, source, count),
+        }
+    }
+
     fn slot_ref(bridge: &Bridge, container: u8, slot: u8) -> bp::SlotRef {
+        // A stack request has to quote the stack id the server issued for the
+        // slot it names; zero means "empty", so a move that leaves it out is
+        // read as acting on nothing and refused.
         let stack_id = item_at(bridge, container, slot)
             .and_then(|d| d.net_id)
             .map_or(0, |id| id as i32);
@@ -3339,6 +3467,20 @@ mod translate {
         if actions.is_empty() {
             return Vec::new();
         }
+        // Show the move at once and keep the state before it: the server's
+        // answer only corrects the counts and the stack ids, and a refusal puts
+        // the snapshot back.
+        let before = snapshot(bridge);
+        for action in &actions {
+            apply_action(bridge, action);
+        }
+        {
+            let mut pending = bridge.pending_moves.lock().unwrap();
+            pending.push((request_id, before));
+            if pending.len() > 64 {
+                pending.remove(0);
+            }
+        }
         vec![bp::Out::ItemStackRequest {
             request_id,
             actions,
@@ -3362,11 +3504,23 @@ mod translate {
         bridge: &Bridge,
         response: &bp::ItemStackResponse,
     ) -> Vec<Event> {
+        // The move was shown when it was sent, so its copy is no longer needed;
+        // a refusal puts it back before the truth is shown again.
+        let before = {
+            let mut pending = bridge.pending_moves.lock().unwrap();
+            pending
+                .iter()
+                .position(|(id, _)| *id == response.request_id)
+                .map(|index| pending.remove(index).1)
+        };
         if response.result != 0 {
             bedrock_core::nethernet::trace(format!(
                 "inventory move {} refused: result {}",
                 response.request_id, response.result
             ));
+            if let Some(before) = before {
+                restore(bridge, before);
+            }
             return vec![inventory_content(ctx, bridge)];
         }
         let mut events = Vec::new();
