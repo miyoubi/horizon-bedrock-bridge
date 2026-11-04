@@ -194,6 +194,9 @@ struct Bridge {
     /// unacknowledged request is named by the request id, not by the stack id it
     /// had before; quoting the old id is what made rapid moves and drags fail.
     pending_ids: Mutex<std::collections::HashMap<(u8, u8), i32>>,
+    /// Each item's Java name by its network id, from the item registry, so a
+    /// click can tell armour and a shield from everything else.
+    item_names: Mutex<std::collections::HashMap<i16, String>>,
     /// Whether the server has the player's inventory screen open. A real client
     /// asks for it with `Interact`/`open_inventory`; the cursor and the
     /// `hotbar_and_inventory` container only exist while it is.
@@ -370,6 +373,7 @@ pub fn try_connect(
         removals: Mutex::new(Vec::new()),
         pending_moves: Mutex::new(Vec::new()),
         pending_ids: Mutex::new(std::collections::HashMap::new()),
+        item_names: Mutex::new(std::collections::HashMap::new()),
         inv_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
@@ -1929,6 +1933,13 @@ mod translate {
             // packet names an item by. It arrives once, after `StartGame`.
             bp::Packet::ItemRegistry(items) => {
                 ctx.items = items.clone();
+                let names: std::collections::HashMap<i16, String> = items
+                    .iter()
+                    .map(|(identifier, network_id)| {
+                        (*network_id, ctx.mappings.java_item(identifier))
+                    })
+                    .collect();
+                *bridge.item_names.lock().unwrap() = names;
                 Vec::new()
             }
             // The item an entity is holding. `SetEquipment` carries the two
@@ -3400,11 +3411,41 @@ mod translate {
     /// a stack in the hotbar goes to the main inventory and the other way
     /// round, and anything worn goes back to the inventory. With a container
     /// open the two sides are the container and the player.
+    /// The Java slot an item is worn in, by its name: armour by suffix, an
+    /// elytra in the chest slot, a shield in the off hand.
+    fn worn_slot(bridge: &Bridge, runtime_id: i16) -> Option<i16> {
+        let names = bridge.item_names.lock().unwrap();
+        let name = names.get(&runtime_id)?;
+        let short = name.strip_prefix("minecraft:").unwrap_or(name);
+        Some(match short {
+            "shield" => 45,
+            "elytra" => 6,
+            "turtle_helmet" | "carved_pumpkin" => 5,
+            _ if short.ends_with("_helmet") => 5,
+            _ if short.ends_with("_chestplate") => 6,
+            _ if short.ends_with("_leggings") => 7,
+            _ if short.ends_with("_boots") => 8,
+            _ => return None,
+        })
+    }
+
     fn quick_move_target(
         bridge: &Bridge,
         from: bp::SlotRef,
         item: bedrock_core::protocol::ItemDescriptor,
     ) -> Option<(bp::SlotRef, u8)> {
+        // A worn item goes to its armour or off-hand slot when that one is
+        // empty, the way a shift-click equips it.
+        if let Some(java) = worn_slot(bridge, item.runtime_id) {
+            let (container, slot) = if java == 45 {
+                (CONTAINER_OFFHAND, 1u8)
+            } else {
+                (CONTAINER_ARMOR, (java - 5) as u8)
+            };
+            if item_at(bridge, container, slot).is_none() {
+                return Some((slot_ref(bridge, container, slot), item.count.max(1) as u8));
+            }
+        }
         // Which side of the open window the stack is on, and where it goes.
         let (container, from_slot, region): (u8, u8, Vec<u8>) = {
             let window = bridge.window.lock().unwrap();
