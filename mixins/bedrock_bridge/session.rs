@@ -241,8 +241,11 @@ struct Bridge {
     /// (movement this tick) is real rather than zero.
     last_sent: Mutex<[f32; 3]>,
     /// The `PlayerAuthInput` tick id: it advances with every input packet, and
-    /// the server pairs corrections with the id they answer.
+    /// the server pairs corrections with the id they answer. It starts on the
+    /// server's own tick from `StartGame`, which is the clock the server
+    /// rewinds to.
     tick: AtomicI64,
+    input_tick: AtomicI64,
     /// Whether the game last reported the player standing on ground, and
     /// whether it reported a horizontal collision. Bedrock carries these as the
     /// `VerticalCollision`/`HorizontalCollision` input flags, and the server
@@ -475,6 +478,7 @@ pub fn try_connect(
         actions: Mutex::new(Vec::new()),
         last_sent: Mutex::new([0.0; 3]),
         tick: AtomicI64::new(1),
+        input_tick: AtomicI64::new(0),
         on_ground: AtomicBool::new(true),
         collision: AtomicBool::new(false),
         hotbar: AtomicI64::new(0),
@@ -842,6 +846,12 @@ fn run(
                 bridge
                     .unique_id
                     .store(g.entity_unique_id, Ordering::Relaxed);
+                // The input tick is the server's clock: corrections quote it,
+                // and a client-side counter starting at one makes every
+                // correction refer to a tick the server rewind cannot place.
+                bridge
+                    .input_tick
+                    .store(g.current_tick.max(1), Ordering::Relaxed);
                 // Ask for what the game's setting wants; the grant decides what
                 // is actually streamed (and `ChunkRadiusUpdated` reports it).
                 let _ = client.request_chunks(
@@ -3799,7 +3809,11 @@ mod translate {
     /// goes out once per client tick, and carries the press and release edges
     /// of jump, sneak and sprint exactly once.
     fn auth_input(bridge: &Bridge, actions: Vec<bp::BlockAction>) -> Vec<bp::Out> {
-        let tick = bridge.tick.fetch_add(1, Ordering::Relaxed) as u64;
+        let tick = {
+            let seeded = bridge.input_tick.load(Ordering::Relaxed);
+            bridge.input_tick.fetch_add(1, Ordering::Relaxed);
+            u64::try_from(seeded.max(1)).unwrap_or(1)
+        };
         let position = *bridge.position.lock().unwrap();
         let [yaw, pitch] = *bridge.rotation.lock().unwrap();
         let input = bridge.input.load(Ordering::Relaxed) as u8;
@@ -3828,9 +3842,10 @@ mod translate {
         if bridge.teleport_ack.swap(false, Ordering::Relaxed) {
             flags |= 1 << 37; // handled_teleport
         }
-        // The delta is a velocity in Bedrock's movement maths, which the
-        // reference translator builds from the raw position change: horizontal
-        // * 0.98 * friction * 0.91, and vertical minus gravity then * 0.98.
+        // `Pos Delta` is the position change since the previous input, not a
+        // velocity: the server compares its own simulation against it, so a
+        // friction-scaled value made it disagree on every sprint jump and
+        // climb.
         let delta = {
             let mut last = bridge.last_sent.lock().unwrap();
             let d = [
@@ -3839,12 +3854,7 @@ mod translate {
                 position[2] - last[2],
             ];
             *last = position;
-            let friction = if on_ground { 0.6 } else { 1.0 };
-            [
-                d[0] * 0.98 * friction * 0.91,
-                (d[1] - 0.08) * 0.98,
-                d[2] * 0.98 * friction * 0.91,
-            ]
+            d
         };
         // Bedrock's mPos is the eye position; the game tracks feet.
         let position = [position[0], position[1] + PLAYER_EYE, position[2]];
