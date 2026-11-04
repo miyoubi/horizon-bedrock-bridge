@@ -1393,14 +1393,53 @@ mod translate {
         })))
     }
 
-    /// The column as an event, once it has any blocks.
+    /// The column as an event, once it has any blocks. A column that only
+    /// just arrived may be missing neighbours, so its light is computed
+    /// without them and the game will not mesh it until its 3x3 is lit.
+    /// Neighbours are re-emitted when this column completes their region,
+    /// so the side that waited gets the light with the new neighbour.
     fn emit_column(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
-        match column(ctx, x, z) {
-            Some(chunk) => vec![Event::Packet(Box::new(
-                play::Clientbound::LevelChunkWithLight(chunk),
-            ))],
-            None => Vec::new(),
+        reach(ctx, x, z)
+    }
+
+    /// The centre column and any neighbour whose 3x3 is now complete.
+    fn reach(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
+        let complete = |ctx: &Context, nx: i32, nz: i32| {
+            (-1..=1).all(|dz| (-1..=1).all(|dx| ctx.chunks.contains_key(&(nx + dx, nz + dz))))
+        };
+        let mut events = Vec::new();
+        if complete(ctx, x, z) && ctx.chunks.contains_key(&(x, z)) {
+            if let Some(chunk) = column(ctx, x, z) {
+                events.push(Event::Packet(Box::new(
+                    play::Clientbound::LevelChunkWithLight(chunk),
+                )));
+            }
+        } else if ctx.chunks.contains_key(&(x, z)) {
+            // Not yet meshable: still send it so the client knows it exists
+            // and can finish the region check; the neighbour pass below will
+            // re-send it lit when the region completes.
+            if let Some(chunk) = column(ctx, x, z) {
+                events.push(Event::Packet(Box::new(
+                    play::Clientbound::LevelChunkWithLight(chunk),
+                )));
+            }
         }
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let (nx, nz) = (x + dx, z + dz);
+                if complete(ctx, nx, nz) && ctx.chunks.contains_key(&(nx, nz)) {
+                    if let Some(chunk) = column(ctx, nx, nz) {
+                        events.push(Event::Packet(Box::new(
+                            play::Clientbound::LevelChunkWithLight(chunk),
+                        )));
+                    }
+                }
+            }
+        }
+        events
     }
 
     /// The stack a drawn item entity shows: every actor folded into it, summed.
@@ -1517,9 +1556,11 @@ mod translate {
                         hardcore: false,
                         levels: vec!["minecraft:overworld".into()],
                         max_players: 100,
-                        // What the session asked the server for: the game sizes
-                        // its chunk cache from this, so a fixed small value
-                        // caps the world however much the server sends.
+                        // The radius the server granted, in chunks
+                        // (32 here): the game drops anything past it and
+                        // sizes its cache from it, so it comes from the
+                        // grant, never the publisher's byte count (512)
+                        // or a guess.
                         chunk_radius: bridge.chunk_radius.load(Ordering::Relaxed),
                         simulation_distance: bridge.chunk_radius.load(Ordering::Relaxed),
                         reduced_debug_info: false,
@@ -2432,17 +2473,22 @@ mod translate {
                         ));
                     }
                     ctx.wanted_center = Some(center);
-                    // Only what the client will accept: anything further out is
-                    // dropped on arrival ("not in the view range") and only
-                    // delays the columns the player is standing in.
-                    let r = i32::try_from((*radius).min(8)).unwrap_or(4);
-                    ctx.wanted.retain(|((x, z), _)| {
-                        (x - center.0).abs() <= r && (z - center.1).abs() <= r
-                    });
-                    // Nearest first, so the ground under the player is asked for
-                    // before the ring around it.
+                    // The granted Bedrock radius is a distance in chunks
+                    // (32 here), not a count. Convert to a radius and retain
+                    // only columns inside the circle; never interpret the
+                    // publisher's sent amount (512) or a hard-coded cap.
+                    let granted = bridge.chunk_radius.load(Ordering::Relaxed);
+                    let r = granted.max(2);
+                    let r2 = (r as i64) * (r as i64);
+                    let in_circle = |x: i32, z: i32| {
+                        let dx = (x - center.0) as i64;
+                        let dz = (z - center.1) as i64;
+                        dx * dx + dz * dz <= r2
+                    };
+                    ctx.wanted.retain(|((x, z), _)| in_circle(*x, *z));
                     let mut ring: Vec<(i32, i32)> = (-r..=r)
                         .flat_map(|dx| (-r..=r).map(move |dz| (center.0 + dx, center.1 + dz)))
+                        .filter(|&(x, z)| in_circle(x, z))
                         .collect();
                     ring.sort_by_key(|(x, z)| {
                         (x - center.0).abs().max((z - center.1).abs())
