@@ -579,6 +579,56 @@ content and some addon behaviour will be approximations.
 
 ### Commands and item use (latest)
 
+**Since that section was written** (five commits):
+
+- `Start the input tick on the server's clock and send the real position delta` — the input
+  tick was seeded from `StartGame::current_tick` and `Pos Delta` is now the raw position
+  change. A six-second walk and a six-second sprint-jump draw **zero**
+  `CorrectPlayerMovePrediction` on the local server; before, the session corrected
+  constantly.
+- `Apply the server's movement corrections again` — **the correction that followed was
+  also needed and is the thing to remember**: a correction names the *input* tick, and the
+  rewind-window check compared it with the local counter, so once the input tick became the
+  server's clock every correction looked future-dated and was dropped. It now compares the
+  input tick and applies the correction (a tiny epsilon only), as the player asked: the
+  server is authoritative, and a correction now means real divergence.
+- `Give the game the server's command tree` — `AvailableCommands` is decoded and turned into
+  the game's tree (82 commands, names, aliases, literal subcommands, typed arguments), so
+  `/` lists commands and the game's own "did you mean" works. The layout came from a
+  396 KB capture: permission is an enum *name* (`gamedirectors`), the parameter symbol is a
+  u32 bitfield (`0x100000` valid type, `0x200000` enum, `0x4000000` soft, `0x1000000`
+  postfix), and the chained-subcommand indexes are fixed u32s, not varints.
+- `Tell the server when the held stack itself changed` — `MobEquipment` now follows the
+  *contents* of the held slot (a settled move, a whole inventory, one slot), not just the
+  selected slot, so moving the held stack away or using the last of it no longer leaves the
+  old item in the hand on the server.
+- `End an item use when the game releases it` — Java's RELEASE_USE_ITEM (action 6) was
+  unhandled; it now sends an `ItemReleaseTransaction`, which is what stops food, a bow, a
+  firework or a shield from staying in use.
+
+**Live findings still open**, reported while playing on this build:
+
+1. **Dropping an item out of the inventory window** makes it vanish on the client but it is
+   still in the inventory server-side and no item entity appears. `ContainerClick` with a
+   slot outside the window is `clicked_slot` → `None` → no request is sent; the drop needs
+   an `ItemStackRequest` drop action (or an `ItemRelease`) and no local removal until the
+   server answers.
+2. **Item moves sometimes stop working until a rejoin** — a stuck request/`pending_ids`/
+   `inv_open` state (or an unanswered request) is the suspect; a periodic
+   `InventoryMismatch` when a request has been open too long would recover it.
+3. **Fireworks, bows and most non-food items do nothing**, the animation sticks, and the
+   shield no longer works. These all need the *use* half: a `Use` item-use action (not
+   `Place`) plus `PlayerAction` StartUsingItem (37), with the release now in place.
+4. **Effects/status** are not implemented: `MobEffect` (28) is not decoded, so no Java
+   `EntityEffect`/`RemoveEntityEffect`.
+5. **Entities that the server has removed sometimes stay on screen** ("fake entities"). The
+   `RemoveEntity` path maps a unique id to a runtime id through `ctx.uniques`; a missing
+   mapping, or an entity leaving the published area without a removal, leaves the ghost.
+   Worth a trace of `RemoveEntity` ids vs the entities the client still holds.
+6. `@s` in a command is unreliable (`commands.generic.noTargetMatch` seen once): the
+   command origin's uuid/player id do not always resolve to the player.
+
+
 **Commands work** (commit `Run Bedrock commands instead of sending them as chat`). A Java
 `ChatCommand` is no longer sent as a Bedrock `Text` with a leading slash (the server
 ignores those); it goes out as a `CommandRequest`, and the server's `CommandOutput` is
