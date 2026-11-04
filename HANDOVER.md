@@ -256,6 +256,26 @@ Reuse these rather than re-deriving them.
   the items arrive in `ItemRegistry` (162), which is sent once, right after `StartGame`.
   (An earlier build read an item palette out of `StartGame`, ran off the end of the
   packet and dropped the whole `StartGame` — 0f50d2f, fixed here.)
+- **`ItemStackRequest` (147):** `requests array(varint)`; each is `request_id zigzag32`,
+  `actions array(varint)`, `custom_names array(varint, string)`, `cause li32`. An action is
+  `type_id` (**varint**, 0 take … 18 results_deprecated), `legacy_type_id` (**u8**, the same
+  value), then take/place `count u8, source, destination`; swap `source, destination`; drop
+  `count u8, source, random bool`; destroy/consume `count u8, source`. A slot is
+  `FullContainerName{container_id u8 (ContainerSlotType), dynamic_id option u32}`, `slot u8`,
+  `stack_id li32` — **not** a varint. `stack_id` is the server's net id for the stack
+  (positive), a client request id (negative odd), a legacy request id (negative even), or 0
+  for air; quoting the wrong one is refused. The player's own slots are `hotbar_and_inventory`
+  (12) 0-35 (0-8 hotbar, 9-35 main), or `hotbar` (28)/`inventory` (29); armour 6,
+  offhand 34, cursor 59.
+- **`ItemStackResponse` (148):** `responses array(varint)` — **the count is part of the
+  packet**; read it or every response shifts. Each response is `status u8` (0 ok, 1 error),
+  `request_id zigzag32`, then, when ok, `containers array(varint)` of
+  `FullContainerName, slots array(varint)` of `slot u8, hotbar_slot u8, count u8,
+  item_stack_id option zigzag32, custom_name string, filtered_custom_name string,
+  durability_correction zigzag32`. The container list is an `option` (a presence `bool`
+  always precedes it, error or not — the 1.26.60 schema and the Rust server agree; the PHP
+  and C++ libraries are the older shape). The response carries counts and stack ids but no
+  item, so the client has to have predicted the move.
 
 **Horizon packets to target:** `BlockUpdate {pos, state}` (play.rs:77),
 `SectionBlocksUpdate` (:803), `PlayerInfoUpdate {actions: u8, entries}` (:675) with
@@ -420,7 +440,7 @@ item stacks), `bedrock-protocol-docs` (movement/deprecation), `mappings-master`
 
 ### Critical path
 1. ~~Height offset (§10.1)~~ — **done**, live-verified.
-2. `PlayerAuthInput` (§10.2) — blocks being a real player.
+2. `PlayerAuthInput` (§10.2) — blocks being a real player. **done**
 3. ~~`MobEquipment → SetEquipment`~~ — **wired** (needs visual confirmation on a held item).
 4. Entity metadata table.
 5. Populate the `Dynamic` registries.
@@ -496,16 +516,46 @@ content and some addon behaviour will be approximations.
 
 ## 13. Immediate next steps
 
-1. **DONE — height offset (§10.1).** The `SubChunkRequest` base Y and reply decode were
+1. **Full inventory support — the active task.** Inventory does not work: picking up,
+   moving or dropping an item, chests and anything else that opens an inventory (including
+   bundles), wearing armor, and using shields and totems. Every interaction snaps back — the
+   item returns to its slot and nothing moves. Acceptance is the full set: stack move,
+   single-item move, shift-click transfer, number-key swap, Q on a slot, Q on the cursor,
+   armor equip/unequip, chest open → item in → shift-click back → close, bundles, shields,
+   totems.
+   - **State:** `ItemStackRequest` (147) is encoded the way 1.26.60 lays it out (each action
+     carries its type as a varint **and** a legacy `u8`; a slot's stack id is an `li32`; the
+     container is a `ContainerSlotType`), and the server's answers are now read as the batch
+     they are. The "refusals with no container list" were the decoder skipping the packet's
+     response **count**, so the count byte was read as the first response's status and every
+     verdict shifted — every move read as refused and the client never applied the result.
+     The move is also now predicted locally (a real client does) because the response names
+     the count and stack id of each slot but not the item, and a copy of the touched slots is
+     put back if the server refuses. **Pending a hand test** of the full set below.
+   - **Evidence:** `/tmp/horizon-bedrock-nethernet.log` carries the click
+     (`INV click container=… slot=… button=… input=…`), the request bytes
+     (`STACK REQ id=… <hex>`) and the server's verdict (`inventory move … refused`);
+     `NETHER_DUMP=<packet id>` with `NETHER_DUMP_FILE=…` dumps raw inbound packets.
+   - **Authority:** verify every field against the version-matched 1.26.60 schema rather than
+     assuming it, and prefer a capture of a real client's request over inference — the relay
+     at `/tmp/hz-capture-relay.js` (listens on 19133, forwards to `127.0.0.1:19132`, logs
+     packet 147 to `/tmp/hz-capture.log`) exists for that, but its upstream connection does
+     not complete yet, so no capture has been taken.
+   - **Environment:** BDS speaks NetherNet — TCP 19132 is its HTTP signaling endpoint and UDP
+     7551 is LAN discovery, which the Wine Bedrock client on this machine holds while it is
+     open, so only one of client, relay and BDS can hold it at a time. The control socket
+     rejects mouse input while an inventory is open, so inventory clicks have to be made by
+     hand — batch changes per build.
+2. **DONE — height offset (§10.1).** The `SubChunkRequest` base Y and reply decode were
    fixed; terrain and entities now share the same Y, live-verified on a BDS join. Also fixed
    in the same build: `StartGame` stopped decoding because `0f50d2f` read an item palette
    that 1.26 does not put there (§7) — the palette moved to `ItemRegistry` (162).
-2. **`MobEquipment → SetEquipment`.** Wired: `ItemRegistry` fills `ctx.items`, and a
+3. **`MobEquipment → SetEquipment`.** Wired: `ItemRegistry` fills `ctx.items`, and a
    `MobEquipment` on the inventory/hotbar container (0/28/29) maps to main hand, off hand
    (34/119) to off hand, with `Stack::new(java_item, count)`; an unknown id clears the
    slot. Compiles and runs; visual confirmation on another player's held item is still
    open.
-3. **Capture one `PlayerAuthInput`** (§10.2) — still the gate on being a real player. Use
+4. **Capture one `PlayerAuthInput`** (§10.2) — still the gate on being a real player. Use
    `references/nethernet`'s `nethernet-tokio` accept path for a localhost listener on 7551,
    or log the JS `bedrock-protocol` client's outgoing packets.
 
