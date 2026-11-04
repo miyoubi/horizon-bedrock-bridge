@@ -242,9 +242,15 @@ struct Bridge {
     last_sent: Mutex<[f32; 3]>,
     /// The feet position reported on each recent input, by tick. A correction
     /// names the tick it answers, so its offset from what we claimed there is
-    /// the error to remove — applied to where the player is *now*, which keeps
-    /// the movement smooth instead of rewinding to a stale position.
+    /// the error to remove.
     history: Mutex<std::collections::VecDeque<(i64, [f32; 3])>>,
+    /// The part of a correction still to be applied, in feet space. It is paid
+    /// off a little each client tick: one jump of half a block is a teleport,
+    /// the same half block spread over five ticks is a step.
+    correction: Mutex<[f32; 3]>,
+    /// The game's event channel, so the tick path can nudge the player without
+    /// waiting for a packet to translate.
+    events: mpsc::Sender<Event>,
     /// The `PlayerAuthInput` tick id: it advances with every input packet, and
     /// the server pairs corrections with the id they answer. It starts on the
     /// server's own tick from `StartGame`, which is the clock the server
@@ -487,6 +493,8 @@ pub fn try_connect(
         actions: Mutex::new(Vec::new()),
         last_sent: Mutex::new([0.0; 3]),
         history: Mutex::new(std::collections::VecDeque::new()),
+        correction: Mutex::new([0.0; 3]),
+        events: send.clone(),
         tick: AtomicI64::new(1),
         input_tick: AtomicI64::new(0),
         on_ground: AtomicBool::new(true),
@@ -3022,16 +3030,16 @@ mod translate {
                     return Vec::new();
                 }
                 // The server is authoritative, but its position is where it
-                // thinks the player was *at the corrected tick*, and the
-                // player has moved since. Applying it as-is rewinds the player
-                // every time, which reads as teleporting. What has to be
-                // removed is only the error: the difference between the
-                // server's position and the one we reported for that same
-                // tick, added to where the player is now. The movement carries
-                // on; only the accumulated drift goes. (ViaBedrock validates
-                // the tick against the client's own counter the same way, but
-                // has no input history to rebase with, so it jumps.)
-                let (offset, corrected_now) = {
+                // thinks the player was *at the corrected tick*, and the player
+                // has moved since. What has to be removed is only the error:
+                // the difference between the server's position and the one we
+                // reported for that same tick. It is added to a debt that the
+                // tick path pays off a little at a time, because applying it
+                // whole is the teleport the player sees. (ViaBedrock validates
+                // the tick the same way but has no history to rebase with, so
+                // it jumps; a Bedrock client replays its predictions, which is
+                // gradual by construction.)
+                let offset = {
                     let history = bridge.history.lock().unwrap();
                     match history
                         .iter()
@@ -3039,53 +3047,51 @@ mod translate {
                         .find(|(reported, _)| *reported == *tick as i64)
                         .map(|(_, at)| *at)
                     {
-                        Some(at_tick) => (
-                            [
-                                position[0] - at_tick[0],
-                                feet - at_tick[1],
-                                position[2] - at_tick[2],
-                            ],
-                            [
-                                held[0] + (position[0] - at_tick[0]),
-                                held[1] + (feet - at_tick[1]),
-                                held[2] + (position[2] - at_tick[2]),
-                            ],
-                        ),
+                        Some(at_tick) => [
+                            position[0] - at_tick[0],
+                            feet - at_tick[1],
+                            position[2] - at_tick[2],
+                        ],
                         // No record for that tick (it predates the history):
                         // take the server's position as the truth.
-                        None => (
-                            [dx, dy, dz],
-                            [position[0], feet, position[2]],
-                        ),
+                        None => [dx, dy, dz],
                     }
                 };
-                // Ignore floating-point noise; a divergence too large to be a
-                // movement error is a teleport and is taken absolutely.
                 if offset[0].abs() < 0.001 && offset[1].abs() < 0.001 && offset[2].abs() < 0.001 {
                     return Vec::new();
                 }
                 let big = offset[0].abs() > 3.0 || offset[1].abs() > 3.0 || offset[2].abs() > 3.0;
-                let target = if big {
-                    [position[0], feet, position[2]]
-                } else {
-                    corrected_now
-                };
+                {
+                    let mut debt = bridge.correction.lock().unwrap();
+                    for (pending, add) in debt.iter_mut().zip(offset) {
+                        *pending = (*pending + add).clamp(-6.0, 6.0);
+                    }
+                    if big {
+                        // A teleport (respawn, a void fall): take it whole and
+                        // forget what was pending.
+                        *debt = [0.0; 3];
+                    }
+                }
                 bedrock_core::nethernet::trace(format!(
-                    "CORR apply offset=[{:.3},{:.3},{:.3}] target=[{:.2},{:.2},{:.2}] big={big}",
-                    offset[0], offset[1], offset[2], target[0], target[1], target[2]
+                    "CORR offset=[{:.3},{:.3},{:.3}] big={big} debt={:?}",
+                    offset[0],
+                    offset[1],
+                    offset[2],
+                    *bridge.correction.lock().unwrap()
                 ));
-                vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
-                    play::PlayerPosition {
-                        teleport: 0,
-                        position: [target[0] as f64, target[1] as f64, target[2] as f64],
-                        delta: [0.0; 3],
-                        // Keep the client's own heading: the correction is a
-                        // position, not a rotation to apply.
-                        yaw: 0.0,
-                        pitch: 0.0,
-                        relatives: 0x18, // yaw + pitch relative
-                    },
-                )))]
+                if big {
+                    return vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
+                        play::PlayerPosition {
+                            teleport: 0,
+                            position: [position[0] as f64, feet as f64, position[2] as f64],
+                            delta: [0.0; 3],
+                            yaw: 0.0,
+                            pitch: 0.0,
+                            relatives: 0x18,
+                        },
+                    )))];
+                }
+                Vec::new()
             }
             bp::Packet::MovePlayer(m) => {
                 // Bedrock reports a player's position at the eye; Java entity
@@ -5271,6 +5277,12 @@ mod translate {
     /// The input for the client tick that just ended: one `PlayerAuthInput`,
     /// and the inventory resync a pickup asked for once its tick is due.
     pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
+        // Pay the movement correction down a little each tick. A correction is
+        // the accumulated difference between the server's simulation and the
+        // client's; applied whole it is a jump, so it is walked off at up to
+        // 0.1 blocks a tick (two blocks a second) while the player keeps
+        // moving.
+        pay_correction(bridge);
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
@@ -5282,6 +5294,51 @@ mod translate {
             out.push(bedrock_core::protocol::Out::InventoryMismatch);
         }
         out
+    }
+
+    /// Spend the pending movement correction: at most `CORRECTION_STEP` a tick
+    /// on each axis, nudging the game's player by that much. The position the
+    /// next input reports follows, so the server sees the correction it asked
+    /// for.
+    fn pay_correction(bridge: &Bridge) {
+        /// Per tick, in blocks: fast enough to keep up with a drifting
+        /// simulation, slow enough to read as movement rather than a jump.
+        const CORRECTION_STEP: f32 = 0.1;
+        let step = {
+            let mut debt = bridge.correction.lock().unwrap();
+            if *debt == [0.0; 3] {
+                return;
+            }
+            let step = [
+                debt[0].clamp(-CORRECTION_STEP, CORRECTION_STEP),
+                debt[1].clamp(-CORRECTION_STEP, CORRECTION_STEP),
+                debt[2].clamp(-CORRECTION_STEP, CORRECTION_STEP),
+            ];
+            for (pending, taken) in debt.iter_mut().zip(step) {
+                *pending -= taken;
+            }
+            if debt.iter().all(|d| d.abs() < 1e-3) {
+                *debt = [0.0; 3];
+            }
+            step
+        };
+        let position = {
+            let mut position = bridge.position.lock().unwrap();
+            for (at, by) in position.iter_mut().zip(step) {
+                *at += by;
+            }
+            *position
+        };
+        let _ = bridge.events.send(Event::Packet(Box::new(
+            play::Clientbound::PlayerPosition(play::PlayerPosition {
+                teleport: 0,
+                position: [position[0] as f64, position[1] as f64, position[2] as f64],
+                delta: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                relatives: 0x18, // keep the client's own heading
+            }),
+        )));
     }
 
     /// A block use, translated where the columns are: the state of the clicked
