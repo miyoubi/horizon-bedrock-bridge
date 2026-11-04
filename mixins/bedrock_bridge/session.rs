@@ -3481,8 +3481,14 @@ mod translate {
                     let Some(holding) = *bridge.cursor.lock().unwrap() else {
                         return Vec::new();
                     };
+                    // Outside the window the button is the mouse's: a left click
+                    // drops the whole carried stack, a right click one.
                     vec![bp::StackAction::Drop {
-                        count: holding.count.max(0) as u8,
+                        count: if c.button == 1 {
+                            1
+                        } else {
+                            holding.count.max(0) as u8
+                        },
                         source: cursor,
                         randomly: false,
                     }]
@@ -3493,11 +3499,13 @@ mod translate {
                     let Some(item) = item_at(bridge, clicked.container.name, clicked.slot) else {
                         return Vec::new();
                     };
+                    // On a slot the button says whether a modifier is held: plain
+                    // Q (0) drops one, Ctrl+Q (1) the whole stack.
                     vec![bp::StackAction::Drop {
                         count: if c.button == 1 {
-                            1
-                        } else {
                             item.count.max(0) as u8
+                        } else {
+                            1
                         },
                         source: clicked,
                         randomly: false,
