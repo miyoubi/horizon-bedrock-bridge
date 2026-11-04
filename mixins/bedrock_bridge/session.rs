@@ -3533,51 +3533,54 @@ mod translate {
         from: bp::SlotRef,
         item: bedrock_core::protocol::ItemDescriptor,
     ) -> Option<(bp::SlotRef, u8)> {
-        // Which side of the open window the stack is on, and where it goes.
-        let (container, from_slot, region): (u8, u8, Vec<u8>) = {
-            let window = bridge.window.lock().unwrap();
-            match window.as_ref() {
-                Some(w) if w.name.map(|n| n.name) == Some(from.container.name) => {
-                    // Out of the container and into the player's inventory.
-                    (CONTAINER_COMBINED, 0, (0..36).collect())
-                }
-                Some(w) => {
-                    let name = w.name.unwrap_or_default().name;
-                    (name, from.slot, (0..w.kind.slots() as u8).collect())
-                }
-                None => match from.container.name {
-                    CONTAINER_COMBINED if from.slot < 9 => {
-                        (CONTAINER_COMBINED, from.slot, (9..36).collect())
-                    }
-                    CONTAINER_COMBINED => (CONTAINER_COMBINED, from.slot, (0..9).collect()),
-                    // Armour and the off hand hand their items back, into the
-                    // main inventory before the hotbar -- the order the game
-                    // picks, so both sides name the same slot.
-                    _ => (
-                        CONTAINER_COMBINED,
-                        from.slot,
-                        (9..36).chain(0..9).collect(),
-                    ),
-                },
+        let window = bridge.window.lock().unwrap();
+        let (container, region): (u8, Vec<u8>) = match window.as_ref() {
+            // Out of the open container and into the player's inventory.
+            Some(w) if w.name.map(|n| n.name) == Some(from.container.name) => {
+                (CONTAINER_COMBINED, (0..36).collect())
             }
+            Some(w) => {
+                let name = w.name.unwrap_or_default().name;
+                (name, (0..w.kind.slots() as u8).collect())
+            }
+            None => match from.container.name {
+                // The other half of the inventory comes first, then the half the
+                // stack is in, so a full side spills into the other instead of
+                // the click doing nothing.
+                CONTAINER_COMBINED if from.slot < 9 => (
+                    CONTAINER_COMBINED,
+                    (9..36).chain(0..9).filter(|&s| s != from.slot).collect(),
+                ),
+                CONTAINER_COMBINED => (
+                    CONTAINER_COMBINED,
+                    (0..9).chain(9..36).filter(|&s| s != from.slot).collect(),
+                ),
+                // Armour and the off hand: the main inventory before the hotbar,
+                // the order the game picks, so both sides name the same slot.
+                _ => (CONTAINER_COMBINED, (9..36).chain(0..9).collect()),
+            },
         };
-        let _ = from_slot;
+        drop(window);
+        // A stack with room first, then the first empty slot, like the game.
+        for &slot in &region {
+            let Some(existing) = item_at(bridge, container, slot) else {
+                continue;
+            };
+            if existing.runtime_id != item.runtime_id {
+                continue;
+            }
+            let room = 64u8.saturating_sub(existing.count.max(0) as u8);
+            let count = (item.count.max(0) as u8).min(room);
+            if count > 0 {
+                return Some((inventory_slot_ref(bridge, container, slot), count));
+            }
+        }
         for slot in region {
-            match item_at(bridge, container, slot) {
-                Some(existing) if existing.runtime_id == item.runtime_id => {
-                    let room = 64u8.saturating_sub(existing.count.max(0) as u8);
-                    let count = (item.count.max(0) as u8).min(room);
-                    if count > 0 {
-                        return Some((inventory_slot_ref(bridge, container, slot), count));
-                    }
-                }
-                None => {
-                    return Some((
-                        inventory_slot_ref(bridge, container, slot),
-                        item.count.max(1) as u8,
-                    ));
-                }
-                _ => {}
+            if item_at(bridge, container, slot).is_none() {
+                return Some((
+                    inventory_slot_ref(bridge, container, slot),
+                    item.count.max(1) as u8,
+                ));
             }
         }
         None
