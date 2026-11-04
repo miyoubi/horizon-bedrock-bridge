@@ -780,6 +780,36 @@ Known remaining gaps:
   `chunk emit`/`subchunk`/`chunks columns=…` with `inflight`, `ready` and the granted
   radius).
 
+### Movement corrections (latest)
+
+The chain that got here, because each step looked right and was still visible:
+
+1. the input tick started at 1 instead of `StartGame::current_tick`, and `Pos Delta` was the
+   friction-scaled velocity a Java→Bedrock translator uses — so the server disagreed with
+   the client's movement constantly (fixed in `3a67c6c`; a walk and a sprint-jump then draw
+   zero corrections);
+2. the correction's tick was checked against the *local* tick counter, so once the input
+   tick became the server's clock every correction was dropped and a player could stick
+   against water and block edges (`9161cde`);
+3. applying the correction's absolute position rewound the player to a tick they had left,
+   and applying the rebased offset in one go moved them half a block in a frame — both are
+   visible (`4c9eeab`, `612b1c5`).
+
+**What it does now** (`Make a movement resync invisible`): a correction never touches the
+client. Its offset (server position at the corrected tick minus what we reported there) is
+accumulated into `Bridge::correction` and added to the position each `PlayerAuthInput`
+carries; the offset decays 2% a tick, so the server's model converges while the screen shows
+the client's own movement. `Pos Delta` stays the client's real movement. Only a divergence
+over three blocks moves the client, because that is a teleport (respawn, void fall).
+`HZ_CHUNK_TRACE=1` prints `CORR offset=[…] big=… debt=[…]`.
+
+The cost to be aware of: while the offset is non-zero, the server's idea of the player's
+position differs from the screen by that amount (bounded at 4 blocks and normally a few
+tenths), which is what "resync invisible" means. Reach checks and other players' view use
+the server's position, so a long drift in water would be visible *to others* as a small
+offset; if that ever matters, the offset should be capped tighter rather than applied to the
+camera.
+
 ## 14. Debts and risks
 
 - The GitHub token used for pushes was pasted in plaintext and is still valid — **rotate
