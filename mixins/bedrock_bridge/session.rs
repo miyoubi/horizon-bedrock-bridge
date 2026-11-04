@@ -256,6 +256,10 @@ struct Bridge {
     /// The hotbar slot the game last selected, carried by item-use
     /// transactions.
     hotbar: AtomicI64,
+    /// The held stack as the server was last told. A move or a use can change
+    /// what is in the hand without changing the slot, and then the server (and
+    /// every other player) keeps showing the old item.
+    sent_held: Mutex<Option<bedrock_core::protocol::ItemDescriptor>>,
     /// The player's inventory slots as reported by the server, so transactions
     /// (place, use, attack) can carry the real held item.
     items: Mutex<Vec<Option<bedrock_core::protocol::ItemDescriptor>>>,
@@ -482,6 +486,7 @@ pub fn try_connect(
         on_ground: AtomicBool::new(true),
         collision: AtomicBool::new(false),
         hotbar: AtomicI64::new(0),
+        sent_held: Mutex::new(None),
         items: Mutex::new(vec![None; 36]),
         armor: Mutex::new(vec![None; 4]),
         offhand: Mutex::new(None),

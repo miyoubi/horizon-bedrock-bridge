@@ -589,7 +589,7 @@ pub fn parse_batch(data: &[u8]) -> Result<Vec<Packet>> {
 }
 
 /// The fields of a network item stack descriptor the bridge can reproduce.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ItemDescriptor {
     pub runtime_id: i16,
     pub count: i16,
