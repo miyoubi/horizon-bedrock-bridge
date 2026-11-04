@@ -96,8 +96,8 @@ pub enum Packet {
     },
     InventoryContent(InventoryContent),
     InventorySlot(InventorySlot),
-    /// The server's answer to a stack request.
-    ItemStackResponse(ItemStackResponse),
+    /// The server's answers to the stack requests it has seen, as a batch.
+    ItemStackResponses(Vec<ItemStackResponse>),
     ContainerOpen(ContainerOpen),
     ContainerClose {
         window_id: u8,
@@ -442,7 +442,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         }
             ids::INVENTORY_CONTENT => Packet::InventoryContent(InventoryContent::read(&mut r)?),
             ids::ITEM_STACK_RESPONSE => {
-                Packet::ItemStackResponse(ItemStackResponse::read(&mut r)?)
+                Packet::ItemStackResponses(read_stack_responses(&mut r)?)
             }
         ids::INVENTORY_SLOT => Packet::InventorySlot(InventorySlot::read(&mut r)?),
         ids::CONTAINER_OPEN => Packet::ContainerOpen(ContainerOpen::read(&mut r)?),
@@ -1213,7 +1213,8 @@ mod inventory_tests {
     #[test]
     fn stack_response_is_read_with_its_slots() {
         let mut w = Writer::new();
-        w.u8(0) // applied
+        w.varint(1) // one response in the packet
+            .u8(0) // applied
             .zigzag32(5) // request id
             .bool(true) // a container list follows
             .varint(1) // one container
@@ -1229,9 +1230,11 @@ mod inventory_tests {
             .varint(0) // filtered name
             .zigzag32(0); // durability correction
         let packet = decode(ids::ITEM_STACK_RESPONSE, &w.into_inner()).unwrap();
-        let Packet::ItemStackResponse(response) = packet else {
+        let Packet::ItemStackResponses(responses) = packet else {
             panic!("expected a stack response");
         };
+        assert_eq!(responses.len(), 1);
+        let response = &responses[0];
         assert_eq!(response.result, 0);
         assert_eq!(response.request_id, 5);
         assert_eq!(response.containers.len(), 1);
@@ -1242,14 +1245,37 @@ mod inventory_tests {
         assert_eq!((slot.slot, slot.count, slot.stack_id), (9, 3, 7));
 
         let mut w = Writer::new();
-        w.u8(1).zigzag32(5).bool(false); // refused: no container list follows
+        w.varint(1).u8(1).zigzag32(5).bool(false); // refused: no container list follows
         let packet = decode(ids::ITEM_STACK_RESPONSE, &w.into_inner()).unwrap();
-        let Packet::ItemStackResponse(response) = packet else {
+        let Packet::ItemStackResponses(responses) = packet else {
             panic!("expected a stack response");
         };
+        assert_eq!(responses.len(), 1);
+        let response = &responses[0];
         assert_eq!(response.result, 1);
         assert_eq!(response.request_id, 5);
         assert!(response.containers.is_empty());
+    }
+
+    /// A packet can carry more than one verdict, and the count is what tells
+    /// them apart; reading it as the first response shifted everything.
+    #[test]
+    fn stack_response_reads_every_response_in_the_batch() {
+        let mut w = Writer::new();
+        w.varint(2)
+            .u8(0)
+            .zigzag32(1)
+            .bool(false)
+            .u8(1)
+            .zigzag32(3)
+            .bool(false);
+        let packet = decode(ids::ITEM_STACK_RESPONSE, &w.into_inner()).unwrap();
+        let Packet::ItemStackResponses(responses) = packet else {
+            panic!("expected stack responses");
+        };
+        assert_eq!(responses.len(), 2);
+        assert_eq!((responses[0].result, responses[0].request_id), (0, 1));
+        assert_eq!((responses[1].result, responses[1].request_id), (1, 3));
     }
 
     /// The stack id has to survive the descriptor round trip, because a request

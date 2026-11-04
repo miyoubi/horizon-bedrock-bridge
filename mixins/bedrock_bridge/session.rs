@@ -2583,10 +2583,14 @@ mod translate {
                 }
                 events
             }
-            // The server's answer to an inventory move: it settles the counts
+            // The server's answers to inventory moves: each settles the counts
             // and says which stacks it acted on.
-            bp::Packet::ItemStackResponse(response) => {
-                stack_response(ctx, bridge, response)
+            bp::Packet::ItemStackResponses(responses) => {
+                let mut events = Vec::new();
+                for response in responses {
+                    events.extend(stack_response(ctx, bridge, response));
+                }
+                events
             }
             // The item on the cursor lives in its own container, and the game
             // shows it as the carried stack.

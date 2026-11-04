@@ -1012,6 +1012,18 @@ impl ItemStackResponse {
     }
 }
 
+/// The body of an `ItemStackResponse` packet: a varint count followed by that
+/// many responses. The count is part of the packet, so skipping it shifts every
+/// response and every verdict reads as a refusal.
+pub fn read_stack_responses(r: &mut Reader) -> Result<Vec<ItemStackResponse>> {
+    let count = r.varint()?;
+    let mut responses = Vec::with_capacity((count as usize).min(64));
+    for _ in 0..count {
+        responses.push(ItemStackResponse::read(r)?);
+    }
+    Ok(responses)
+}
+
 /// A length-prefixed string, as the protocol writes names and tags.
 fn read_string(r: &mut Reader) -> Result<String> {
     let len = r.varint()?;
