@@ -1801,15 +1801,15 @@ mod translate {
             // server sends no inventory packet for the pickup, so put the stack
             // into the player's first free slot ourselves.
             bp::Packet::TakeItemEntity { item, actor } => {
-                if *actor != ctx.runtime_id as u64 && ctx.drops.contains_key(item) {
-                    // The server folded this stack into another dropped one. Keep
-                    // it on the ground to be seen on its own, and remember the
-                    // stack it joined so the two are collected together.
+                // An item actor taking another is the server folding dropped
+                // stacks: keep it on the ground and collect it with the stack it
+                // joined. Anything else (our own player or another one, a mob) is
+                // a real pickup, and the stack has to fly there and go.
+                if ctx.drops.contains_key(actor) {
                     ctx.drop_children.entry(*actor).or_default().push(*item);
                     return Vec::new();
                 }
-                // This player took it: the stack and everything folded into it
-                // fly in together.
+                // The stack and everything folded into it fly in together.
                 let mut flying = vec![*item];
                 if let Some(children) = ctx.drop_children.remove(item) {
                     flying.extend(children);
