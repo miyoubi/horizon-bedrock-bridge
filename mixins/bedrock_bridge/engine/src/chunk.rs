@@ -11,6 +11,10 @@ use crate::protocol::packets::LevelChunk;
 use crate::stream::Reader;
 use crate::subchunk::SubChunk;
 
+/// The tallest world Bedrock serves is 1024 blocks, so 64 sections is the most
+/// a legitimately serialized column can hold.
+const MAX_SECTIONS: u32 = 64;
+
 /// One 16³ section, in Java's block-state-id space.
 pub struct ChunkSection {
     /// Section Y in Java's coordinates (Bedrock index − 4).
@@ -43,8 +47,12 @@ pub fn decode_sections(chunk: &LevelChunk, air: i32) -> Result<Vec<ChunkSection>
     // one carries its own Y, so the rest are placed by their position in the
     // request, which starts at the world's lowest section (-4).
     let mut r = Reader::new(&chunk.data);
-    let mut out = Vec::with_capacity(chunk.sub_chunk_count as usize);
-    for slot in 0..chunk.sub_chunk_count {
+    // A packet asking the client to fetch the column instead of carrying it
+    // reads as a huge count; a world is at most 64 sections tall, and the
+    // payload is shorter than that anyway, so never reserve or loop past it.
+    let count = chunk.sub_chunk_count.min(MAX_SECTIONS);
+    let mut out = Vec::with_capacity(count as usize);
+    for slot in 0..count {
         let version = r.u8()?;
         let sub = SubChunk::read(&mut r, version)?;
         // The payload carries the column's sections in order from the bottom,

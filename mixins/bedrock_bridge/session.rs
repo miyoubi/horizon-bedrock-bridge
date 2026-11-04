@@ -25,13 +25,96 @@ const PREFIX: &str = "bedrock:";
 const RAKNET_PREFIX: &str = "bedrock+raknet:";
 const DEFAULT_PORT: u16 = 19132;
 
-/// How many columns one publisher update asks for. Each is a Bedrock round trip
-/// and the loop also pumps the WebRTC session, so it is spread out.
-const REQUESTS_PER_TICK: usize = 6;
+/// How many column requests the pump sends at once. Each is a round trip and
+/// the loop also pumps the WebRTC session, so it is paced, and only into the
+/// free part of `REQUEST_WINDOW`.
+const REQUESTS_PER_TICK: usize = 12;
+
+/// The shortest gap between two request batches: a little under one Bedrock
+/// tick, so the requests go out at a steady rate instead of a burst.
+const REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// How many column requests may be outstanding at once. The server does the
+/// work for every request it is given, so asking for far more than the loop can
+/// translate keeps it busy — and a busy server answers the player's own chat
+/// and movement late. A window the size of the translation queue keeps the
+/// pipeline full without flooding it.
+const REQUEST_WINDOW: usize = 16;
+
+/// A hard stop for the received-packet queue, in case translation stalls for a
+/// reason of its own. Far above the request window, so it never shapes the
+/// stream in normal play.
+const RECEIVE_QUEUE_LIMIT: usize = 1024;
+
+/// How long a column waits for a neighbour before it is sent and lit without
+/// it (a light update fixes it once the neighbour is there). Without this a
+/// reply the server dropped leaves the column and its neighbours as holes.
+const REGION_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How long a section the server never answered may hold a column back before
+/// it is sent with what did arrive (and the missing sections are logged).
+const COLUMN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How often columns are swept for one that became sendable without a packet
+/// arriving for it (a neighbour finished, or a reply has waited long enough).
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How far (in chunks) the bridge keeps every section's Bedrock runtime ids for
+/// block uses. A runtime id is the exact state the server has, and it cannot
+/// always be recovered from the game's state, so the sections around the player
+/// keep theirs; the rest of the streamed circle would otherwise hold 16 KB per
+/// section — over a gigabyte at a 32-chunk radius — for blocks nobody is near
+/// enough to click (reach is five blocks).
+const RUNTIME_ID_RADIUS: i32 = 8;
+
+/// How many finished columns are sent to the game per second. The game's chunk
+/// packets get a millisecond a frame; past that a backlog builds and, once it
+/// is 50 ms old, the game handles the whole backlog in one frame — a stall the
+/// player feels as a frozen chat box. This pace is above what the server's
+/// replies sustain in normal play, so it only bites when the columns are
+/// already in hand (a radius change, a respawn) and must not be dumped at once.
+const EMIT_PER_SECOND: f32 = 150.0;
+
+/// The most columns that may be sent at once, so the first view is there
+/// quickly (the loading screen is over; the game paces its own inserting).
+const EMIT_BURST: f32 = 96.0;
+
+/// The largest chunk radius a vanilla Bedrock server grants (its
+/// `view-distance` cap). Used only until `ChunkRadiusUpdated` says otherwise,
+/// so the game is never told to hold more columns than one would send.
+const BEDROCK_MAX_RADIUS: i32 = 32;
 
 /// How many received packets one loop iteration translates. The loop also
-/// pumps the WebRTC session, so it must not spend long in translation.
+/// pumps the WebRTC session, so it must not spend long in translation; a
+/// column can take tens of milliseconds, so the count is also capped by
+/// `TRANSLATE_BUDGET`.
 const TRANSLATE_PER_TICK: usize = 4;
+
+/// How long one iteration may spend translating before the loop goes back to
+/// the outbound direction and the WebRTC pump. This is what keeps the player's
+/// own chat and movement prompt while the world streams in: without it a burst
+/// of column translations held the loop for up to a second.
+const TRANSLATE_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The radius the bridge streams: what the game asked for, capped by what the
+/// server granted. Before the grant arrives the vanilla cap stands in.
+fn effective_radius(bridge: &Bridge) -> i32 {
+    let requested = bridge.requested_radius.load(Ordering::Relaxed).max(2);
+    let granted = bridge.granted_radius.load(Ordering::Relaxed);
+    if granted <= 0 {
+        requested.min(BEDROCK_MAX_RADIUS)
+    } else {
+        requested.min(granted).max(2)
+    }
+}
+
+/// Recompute [`effective_radius`] into the shared value the network thread and
+/// the login packets read, and return it.
+fn store_effective_radius(bridge: &Bridge) -> i32 {
+    let radius = effective_radius(bridge);
+    bridge.chunk_radius.store(radius, Ordering::Relaxed);
+    radius
+}
 
 /// Whether `address` names a Bedrock server rather than a Java one.
 pub fn is_bedrock(address: &str) -> bool {
@@ -104,9 +187,20 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
-    /// The chunk radius this session asks the server for: the game's render
-    /// distance, which the player can change while playing.
+    /// The chunk radius this session streams: the smaller of the game's
+    /// render-distance setting and the server's grant. Login and
+    /// `SetChunkCacheRadius` both carry it, and it bounds the columns the
+    /// bridge asks for.
     chunk_radius: AtomicI32,
+    /// The radius the game's render-distance setting asks for, which is what a
+    /// `RequestChunkRadius` carries. The player can change it while playing.
+    requested_radius: AtomicI32,
+    /// The radius the server granted in `ChunkRadiusUpdated`, or `0` until it
+    /// answers.
+    granted_radius: AtomicI32,
+    /// Set when the effective radius changed, so the network thread tells the
+    /// game and rebuilds the columns it streams.
+    radius_dirty: AtomicBool,
     /// Last position sent to the server; rotation-only updates reuse it, so a
     /// MovePlayerRot never looks like a teleport to (0,0,0).
     position: Mutex<[f32; 3]>,
@@ -352,7 +446,12 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
-        chunk_radius: AtomicI32::new(i32::from(view_distance).max(2)),
+        chunk_radius: AtomicI32::new(
+            i32::from(view_distance).max(2).min(BEDROCK_MAX_RADIUS),
+        ),
+        requested_radius: AtomicI32::new(i32::from(view_distance).max(2)),
+        granted_radius: AtomicI32::new(0),
+        radius_dirty: AtomicBool::new(false),
         position: Mutex::new([0.0; 3]),
         rotation: Mutex::new([0.0; 2]),
         input: AtomicI64::new(0),
@@ -397,15 +496,7 @@ pub fn try_connect(
     let thread = std::thread::Builder::new()
         .name("horizon-bedrock".into())
         .spawn(move || {
-            run(
-                &addr,
-                &thread_name,
-                view_distance,
-                &resources,
-                &send,
-                out_rx,
-                &bridge,
-            );
+            run(&addr, &thread_name, &resources, &send, out_rx, &bridge);
         })
         .ok();
 
@@ -485,7 +576,6 @@ fn connect(
 fn run(
     address: &str,
     name: &str,
-    view_distance: i8,
     resources: &std::path::Path,
     events: &mpsc::Sender<Event>,
     outbound: mpsc::Receiver<Vec<bedrock_core::protocol::Out>>,
@@ -586,8 +676,18 @@ fn run(
         kinds: std::collections::HashMap::new(),
         requests: Vec::new(),
         wanted: std::collections::VecDeque::new(),
-        request_limit: 24,
+        queued: std::collections::HashSet::new(),
+        pending_requests: 0,
+        columns: std::collections::HashMap::new(),
         wanted_center: None,
+        sent_center: None,
+        radius: bridge.chunk_radius.load(Ordering::Relaxed).max(2),
+        sent_radius: None,
+        last_request: None,
+        last_sweep: None,
+        ready: std::collections::BinaryHeap::new(),
+        emit_budget: EMIT_BURST,
+        last_emit: None,
         entities: std::collections::HashMap::new(),
         players: std::collections::HashSet::new(),
         drops: std::collections::HashMap::new(),
@@ -637,6 +737,30 @@ fn run(
             client.disconnect();
             break;
         }
+        // A new chunk radius (the player changed the render distance, or the
+        // server granted a different one) is passed on before anything is
+        // streamed with it, so the game's cache and ours agree.
+        if bridge.radius_dirty.swap(false, Ordering::Relaxed) {
+            let radius = bridge.chunk_radius.load(Ordering::Relaxed).max(2);
+            if ctx.sent_radius != Some(radius) {
+                ctx.sent_radius = Some(radius);
+                ctx.radius = radius;
+                let _ = events.send(Event::Packet(Box::new(
+                    play::Clientbound::SetChunkCacheRadius(play::Distance {
+                        distance: radius,
+                    }),
+                )));
+                translate::radius_changed(&mut ctx);
+            }
+        }
+        // Ask for more columns, and send whichever ones are now complete.
+        // Both run every iteration, so the whole granted circle arrives while
+        // the player stands still; only the pump's pace bounds them.
+        translate::pump_requests(&mut ctx, queued.len());
+        for event in translate::emit_ready(&mut ctx) {
+            let _ = events.send(event);
+        }
+        translate::sweep_columns(&mut ctx);
         // Sub-chunk requests queued while translating.
         if !ctx.requests.is_empty() {
             let batch: Vec<bedrock_core::protocol::Out> = ctx.requests.drain(..).collect();
@@ -663,7 +787,13 @@ fn run(
         } else {
             TRANSLATE_PER_TICK
         };
+        let translating = std::time::Instant::now();
         for _ in 0..budget {
+            // One column can take tens of milliseconds; come back to the
+            // outbound direction and the pump rather than piling more on.
+            if translating.elapsed() >= TRANSLATE_BUDGET {
+                break;
+            }
             let Some(packet) = queued.pop_front() else {
                 break;
             };
@@ -696,7 +826,11 @@ fn run(
                 bridge
                     .runtime_id
                     .store(g.entity_runtime_id as i64, Ordering::Relaxed);
-                let _ = client.request_chunks(bridge.chunk_radius.load(Ordering::Relaxed));
+                // Ask for what the game's setting wants; the grant decides what
+                // is actually streamed (and `ChunkRadiusUpdated` reports it).
+                let _ = client.request_chunks(
+                    bridge.requested_radius.load(Ordering::Relaxed).max(2),
+                );
             }
             // The server ignores the player's input until the client reports
             // itself initialized, and a real client only reports it once the
@@ -732,7 +866,11 @@ fn run(
 // Translation: Bedrock packets → Horizon's Java clientbound packets.
 // -------------------------------------------------------------------------
 mod translate {
-    use super::{Bridge, Event, Items, OpenWindow, WindowKind};
+    use super::{
+        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, OpenWindow,
+        RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW,
+        RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
+    };
     use bedrock_core::protocol as bp;
     use crate::chunk::{
         BIOME_STRATEGY, Chunk, Section as ClientSection, Light as ClientLight,
@@ -778,13 +916,40 @@ mod translate {
         /// Sub-chunk requests queued while translating; the session loop sends
         /// them.
         pub requests: Vec<bedrock_core::protocol::Out>,
-        /// Columns still to ask for, and the centre they were queued for.
+        /// Columns still to ask for (the next section index to request), in the
+        /// order the server published them.
         pub wanted: std::collections::VecDeque<((i32, i32), i8)>,
-        /// How many sub-chunk requests the server will answer for one column,
-        /// from the last `LevelChunk` it sent. Asking for more than this is what
-        /// left columns half built: the surplus sections were never sent.
-        pub request_limit: i8,
+        /// The columns named by an entry of `wanted`, so one is never queued
+        /// twice, and how many requests are waiting for a reply.
+        pub queued: std::collections::HashSet<(i32, i32)>,
+        pub pending_requests: usize,
+        /// Each column's section bookkeeping while it streams in. A column is
+        /// sent to the game once, after every section it was asked for has been
+        /// answered and its neighbourhood is finished, so the game never
+        /// re-unpacks or re-lights a column that is still filling.
+        pub columns: std::collections::HashMap<(i32, i32), ColumnState>,
+        /// The column centre the server last published.
         pub wanted_center: Option<(i32, i32)>,
+        /// The centre last sent to the game in `SetChunkCacheCenter`. The game
+        /// drops a column outside the storage around it, so it has to follow a
+        /// move (and a teleport) before the destination columns arrive.
+        pub sent_center: Option<(i32, i32)>,
+        /// The radius the bridge streams, in chunks: `min(game setting, grant)`.
+        pub radius: i32,
+        /// The radius the game was last told (in `Login` or
+        /// `SetChunkCacheRadius`), so a change is sent exactly once. Without
+        /// this the game keeps an old storage size and drops the columns the
+        /// bridge streams past it.
+        pub sent_radius: Option<i32>,
+        /// When the last batch of sub-chunk requests went out, and when the
+        /// columns were last swept for a reply the server dropped.
+        pub last_request: Option<std::time::Instant>,
+        pub last_sweep: Option<std::time::Instant>,
+        /// Columns that may be ready to send, nearest first, and the pacing
+        /// budget of how many may go out now.
+        pub ready: std::collections::BinaryHeap<std::cmp::Reverse<(i64, i32, i32)>>,
+        pub emit_budget: f32,
+        pub last_emit: Option<std::time::Instant>,
         /// Where each entity was last put: a Bedrock move carries only the
         /// components that changed, and the client takes absolute positions.
         pub entities: std::collections::HashMap<u64, ([f32; 3], f32, f32, f32)>,
@@ -862,10 +1027,17 @@ mod translate {
     /// the game's own block registry, read from the same prepared resources the
     /// session started with. Results are cached, since chunks repeat blocks
     /// heavily and a full column is 24 × 4096 lookups.
+    /// A cache entry that has not been resolved yet (no block state uses it).
+    const UNRESOLVED: u32 = u32::MAX;
+
     pub struct Blocks {
         registry: horizon_world::registry::BlockRegistry,
         table: bedrock_core::blockstates::BlockStates,
-        cache: std::collections::HashMap<i32, u32>,
+        /// `java()` for every runtime id, resolved on first use. A flat table
+        /// rather than a map: a column resolves 4096 blocks a section, so the
+        /// hashing was visible in the streaming rate. `UNRESOLVED` means "not
+        /// looked up yet".
+        cache: Vec<u32>,
         /// The other direction, built when a block use needs the runtime id of
         /// the block that was clicked.
         reverse: Option<std::collections::HashMap<u32, i32>>,
@@ -903,24 +1075,49 @@ mod translate {
             if light.is_none() {
                 log::warn!("bedrock: no block facts; chunks will be unlit");
             }
-            Some(Self {
+            let mut blocks = Self {
                 registry,
                 table,
-                cache: std::collections::HashMap::new(),
+                cache: vec![UNRESOLVED],
                 reverse: None,
                 air,
                 air_runtime,
                 light,
-            })
+            };
+            // Resolve the whole palette once, here, before the connection:
+            // mapping a runtime id to the game's block state is far more
+            // expensive the first time (it builds the Bedrock state tag and
+            // walks the registry), and doing it lazily spreads those misses
+            // through the chunk stream where they bound the streaming rate.
+            let started = std::time::Instant::now();
+            let cache: Vec<u32> = (0..blocks.table.len() as i32)
+                .map(|id| blocks.resolve(id))
+                .collect();
+            blocks.cache = cache;
+            if chunk_trace() {
+                bedrock_core::nethernet::trace(format!(
+                    "block palette resolved: {} states in {}ms",
+                    blocks.cache.len(),
+                    started.elapsed().as_millis()
+                ));
+            }
+            Some(blocks)
         }
 
         /// The game's state id for a Bedrock runtime id.
         pub fn java(&mut self, runtime_id: i32) -> u32 {
-            if let Some(&id) = self.cache.get(&runtime_id) {
-                return id;
+            let Some(slot) = usize::try_from(runtime_id)
+                .ok()
+                .filter(|slot| *slot < self.cache.len())
+            else {
+                return self.air;
+            };
+            let cached = self.cache[slot];
+            if cached != UNRESOLVED {
+                return cached;
             }
             let id = self.resolve(runtime_id);
-            self.cache.insert(runtime_id, id);
+            self.cache[slot] = id;
             id
         }
 
@@ -992,6 +1189,16 @@ mod translate {
         chunk
     }
 
+    /// Hold an empty column, so a column whose sections are all air still has
+    /// blocks (air) for its neighbours to light against and still reaches the
+    /// game.
+    fn ensure_chunk(ctx: &mut Context, x: i32, z: i32) {
+        let biome = ctx.biome;
+        ctx.chunks
+            .entry((x, z))
+            .or_insert_with(|| new_chunk(x, z, biome));
+    }
+
     /// Store one Bedrock sub-chunk into the client's column, translating each
     /// block to the game's own state id. `ids` is in `java_index` order.
     fn put_section(ctx: &mut Context, x: i32, z: i32, y: i32, ids: &[u32]) -> bool {
@@ -1010,7 +1217,7 @@ mod translate {
         for (value, runtime_id) in values.iter_mut().zip(ids) {
             *value = blocks.java(*runtime_id as i32);
         }
-        if ids.len() == 4096 {
+        if ids.len() == 4096 && keeps_runtime_ids(ctx, x, z) {
             let mut raw = Box::new([0u32; 4096]);
             raw.copy_from_slice(ids);
             let entry = ctx.block_ids.entry((x, z)).or_default();
@@ -1019,12 +1226,15 @@ mod translate {
             }
             entry[slot] = Some(raw);
         }
-        let mut section = ClientSection {
+        // Already in its smallest configuration: `from_blocks` builds the
+        // palette from the values, the biomes are one value and the light is
+        // uniform, so `compact()` here would only walk 4096 entries to conclude
+        // the same thing.
+        let section = ClientSection {
             blocks: ClientSection::from_blocks(&values),
             biomes: PalettedContainer::new(BIOME_STRATEGY, biome as u32),
             light: ClientLight::Uniform(0),
         };
-        section.compact();
         let chunk = ctx
             .chunks
             .entry((x, z))
@@ -1164,40 +1374,75 @@ mod translate {
     }
 
     /// The Java column packet for a lit client chunk.
+    ///
+    /// The sections go out as the paletted containers the column already holds
+    /// (`to_wire`), not as values run back through `Paletted::from_values`: a
+    /// column is 98,304 block states, and re-paletting all of them a second
+    /// time was most of the cost of streaming one. The heightmap is taken top
+    /// down, so the air above the ground is never walked and the scan stops as
+    /// soon as every column has its surface.
     fn chunk_packet(chunk: &Chunk, biome: i32, air: u32) -> play::LevelChunkWithLight {
         let dimension = DimensionType::vanilla("minecraft:overworld");
-        let mut sections = Vec::with_capacity(chunk.sections.len());
+        // WORLD_SURFACE (1) and MOTION_BLOCKING (4); this decoder does not
+        // distinguish them, since it sees no fluids or leaf shapes.
         let mut heights = [0i32; 256];
-        for (slot, section) in chunk.sections.iter().enumerate() {
-            let mut values = [0u32; 4096];
-            section.unpack(&mut values);
-            let mut states = [0i32; 4096];
-            let mut non_empty = 0i16;
-            for (index, value) in values.iter().enumerate() {
-                states[index] = *value as i32;
-                if *value == air {
+        let mut unset = 256usize;
+        for (slot, section) in chunk.sections.iter().enumerate().rev() {
+            if unset == 0 {
+                break;
+            }
+            if let Some(value) = section.blocks.uniform() {
+                if value == air {
                     continue;
                 }
-                non_empty = non_empty.saturating_add(1);
-                // `java_index`: y major, then z, then x.
-                let x = index & 15;
-                let z = (index >> 4) & 15;
-                let y = index >> 8;
-                let column = z * 16 + x;
-                let height = (slot * 16 + y + 1) as i32;
-                if height > heights[column] {
-                    heights[column] = height;
+                let surface = (slot * 16 + 16) as i32;
+                for height in &mut heights {
+                    if *height == 0 {
+                        *height = surface;
+                        unset -= 1;
+                    }
+                }
+                continue;
+            }
+            let mut values = [0u32; 4096];
+            section.blocks.unpack(&mut values);
+            for y in (0..16).rev() {
+                if unset == 0 {
+                    break;
+                }
+                let base = y << 8;
+                for column in 0..256 {
+                    if heights[column] != 0 || values[base | column] == air {
+                        continue;
+                    }
+                    heights[column] = (slot * 16 + y + 1) as i32;
+                    unset -= 1;
                 }
             }
+        }
+        let mut sections = Vec::with_capacity(chunk.sections.len());
+        for section in &chunk.sections {
+            let non_empty = match section.blocks.uniform() {
+                Some(value) if value == air => 0,
+                Some(_) => 4096,
+                None => {
+                    let mut values = [0u32; 4096];
+                    section.blocks.unpack(&mut values);
+                    values.iter().filter(|value| **value != air).count() as i16
+                }
+            };
+            let (bits, palette, words) = section.blocks.to_wire();
             sections.push(Section {
                 non_empty,
                 fluids: 0,
-                states: Paletted::from_values(&states, Strategy::Blocks, 16),
+                states: Paletted {
+                    bits,
+                    palette: palette.into_iter().map(|value| value as i32).collect(),
+                    data: words.iter().map(|&word| word as i64).collect(),
+                },
                 biomes: Paletted::from_values(&[biome; 64], Strategy::Biomes, 7),
             });
         }
-        // WORLD_SURFACE (1) and MOTION_BLOCKING (4); this decoder does not
-        // distinguish them, since it sees no fluids or leaf shapes.
         let bits = (dimension.height as u32 + 1).ilog2() as u8 + 1;
         let packed = |heights: &[i32; 256]| -> Vec<i64> {
             let per = 64 / bits as usize;
@@ -1393,53 +1638,484 @@ mod translate {
         })))
     }
 
-    /// The column as an event, once it has any blocks. A column that only
-    /// just arrived may be missing neighbours, so its light is computed
-    /// without them and the game will not mesh it until its 3x3 is lit.
-    /// Neighbours are re-emitted when this column completes their region,
-    /// so the side that waited gets the light with the new neighbour.
-    fn emit_column(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
-        reach(ctx, x, z)
+    /// One column's sections while it streams in. The game is sent the column
+    /// once, after every section asked for has been answered, so it never has
+    /// to unpack and light a column that is still filling.
+    #[derive(Clone)]
+    pub struct ColumnState {
+        /// The absolute Bedrock section indices asked for.
+        pub requested: std::collections::BTreeSet<i32>,
+        /// The absolute indices the server answered, with blocks or all air.
+        pub answered: std::collections::BTreeSet<i32>,
+        /// The next section index to ask for, and the last one the server
+        /// named for this column.
+        pub next_section: i32,
+        pub section_end: i32,
+        /// Whether the whole column's request range has been queued.
+        pub complete_request: bool,
+        /// Whether the column has been sent to the game.
+        pub sent: bool,
+        /// Whether its light was computed before a neighbour arrived, so it
+        /// still needs a light update when that neighbour is emitted.
+        pub relight: bool,
+        /// Whether a section request for it is waiting for its reply.
+        pub pending: bool,
+        /// When the column was last asked for, so a reply the server drops
+        /// cannot hold the column (and its neighbours) back forever.
+        pub asked: Option<std::time::Instant>,
     }
 
-    /// The centre column and any neighbour whose 3x3 is now complete.
-    fn reach(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
-        let complete = |ctx: &Context, nx: i32, nz: i32| {
-            (-1..=1).all(|dz| (-1..=1).all(|dx| ctx.chunks.contains_key(&(nx + dx, nz + dz))))
-        };
-        let mut events = Vec::new();
-        if complete(ctx, x, z) && ctx.chunks.contains_key(&(x, z)) {
-            if let Some(chunk) = column(ctx, x, z) {
-                events.push(Event::Packet(Box::new(
-                    play::Clientbound::LevelChunkWithLight(chunk),
-                )));
-            }
-        } else if ctx.chunks.contains_key(&(x, z)) {
-            // Not yet meshable: still send it so the client knows it exists
-            // and can finish the region check; the neighbour pass below will
-            // re-send it lit when the region completes.
-            if let Some(chunk) = column(ctx, x, z) {
-                events.push(Event::Packet(Box::new(
-                    play::Clientbound::LevelChunkWithLight(chunk),
-                )));
+    impl ColumnState {
+        fn new(first_section: i32, last_section: i32) -> Self {
+            Self {
+                requested: std::collections::BTreeSet::new(),
+                answered: std::collections::BTreeSet::new(),
+                next_section: first_section,
+                section_end: last_section,
+                complete_request: false,
+                sent: false,
+                relight: false,
+                pending: false,
+                asked: None,
             }
         }
+    }
+
+    /// Whether per-column tracing is on (`HZ_CHUNK_TRACE=1`). Cached, since it
+    /// is read once per column.
+    fn chunk_trace() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("HZ_CHUNK_TRACE").is_some())
+    }
+
+    /// The overworld's absolute sub-chunk indices: `min_y / 16` through one
+    /// less than the section count (`-4..=19`).
+    fn section_range() -> (i32, i32) {
+        let dimension = DimensionType::vanilla("minecraft:overworld");
+        let first = dimension.min_y.div_euclid(16);
+        (first, first + dimension.sections() as i32 - 1)
+    }
+
+    /// Whether a column is inside the circle the server publishes around the
+    /// player. Bedrock's chunk radius is a distance, not a count:
+    /// `dx² + dz² <= r²`.
+    fn in_circle(ctx: &Context, x: i32, z: i32) -> bool {
+        Circle::of(ctx).is_none_or(|circle| circle.contains(x, z))
+    }
+
+    /// The area the bridge streams around the player. Its radius is one bigger
+    /// than the game's render distance, because a column can only be lit and
+    /// meshed once its neighbours are here: the extra ring is what makes the
+    /// outermost rendered ring complete, and the game's own LAN host streams
+    /// `view_distance + 1` for the same reason.
+    #[derive(Clone, Copy)]
+    struct Circle {
+        cx: i32,
+        cz: i32,
+        r2: i64,
+    }
+
+    impl Circle {
+        fn of(ctx: &Context) -> Option<Circle> {
+            let (cx, cz) = ctx.wanted_center?;
+            let r = i64::from(ctx.radius.max(2) + 1);
+            Some(Circle {
+                cx,
+                cz,
+                r2: r * r,
+            })
+        }
+
+        fn contains(self, x: i32, z: i32) -> bool {
+            let dx = i64::from(x - self.cx);
+            let dz = i64::from(z - self.cz);
+            dx * dx + dz * dz <= self.r2
+        }
+    }
+
+    /// Whether a column is close enough to the player to keep its section
+    /// runtime ids (see `RUNTIME_ID_RADIUS`).
+    fn keeps_runtime_ids(ctx: &Context, x: i32, z: i32) -> bool {
+        ctx.wanted_center.is_none_or(|(cx, cz)| {
+            (x - cx).abs() <= RUNTIME_ID_RADIUS && (z - cz).abs() <= RUNTIME_ID_RADIUS
+        })
+    }
+
+    /// Whether a column has everything it was asked for (or has waited long
+    /// enough that waiting more would only delay the rest of the world).
+    fn column_finished(ctx: &Context, x: i32, z: i32) -> bool {
+        let Some(state) = ctx.columns.get(&(x, z)) else {
+            return false;
+        };
+        if state.sent {
+            return true;
+        }
+        if !state.complete_request {
+            return false;
+        }
+        state.requested.iter().all(|y| state.answered.contains(y))
+            || state
+                .asked
+                .is_some_and(|at| at.elapsed() >= COLUMN_PATIENCE)
+    }
+
+    /// Drop everything held for a column (its blocks, its section state and any
+    /// queued request), so a stale column is neither drawn nor asked for.
+    pub fn forget_column(ctx: &mut Context, x: i32, z: i32) {
+        if ctx.columns.remove(&(x, z)).is_some_and(|state| state.pending) {
+            ctx.pending_requests = ctx.pending_requests.saturating_sub(1);
+        }
+        ctx.queued.remove(&(x, z));
+        ctx.wanted.retain(|((cx, cz), _)| (*cx, *cz) != (x, z));
+        ctx.chunks.remove(&(x, z));
+        ctx.block_ids.remove(&(x, z));
+    }
+
+    /// Queue a column's next section batch, if it still needs one. The queue is
+    /// filled as the server publishes columns, not with a precomputed ring: a
+    /// column the server never sent cannot be requested, and a teleport's
+    /// destination is queued the moment its `LevelChunk` arrives.
+    pub fn queue_column(ctx: &mut Context, x: i32, z: i32) {
+        let Some(state) = ctx.columns.get(&(x, z)) else {
+            return;
+        };
+        if state.sent || state.complete_request || ctx.queued.contains(&(x, z)) {
+            return;
+        }
+        let from = state.next_section;
+        if from > state.section_end {
+            if let Some(state) = ctx.columns.get_mut(&(x, z)) {
+                state.complete_request = true;
+            }
+            return;
+        }
+        ctx.wanted.push_back(((x, z), from as i8));
+        ctx.queued.insert((x, z));
+    }
+
+    /// Send the queued sub-chunk requests, paced so the WebRTC pump and the
+    /// translation queue keep up. It runs every loop iteration, not only when
+    /// the publisher moves: at a 32-chunk radius most of the circle is fetched
+    /// while the player stands still.
+    pub fn pump_requests(ctx: &mut Context, backlog: usize) {
+        if ctx.wanted.is_empty() || backlog > RECEIVE_QUEUE_LIMIT {
+            return;
+        }
+        if ctx.pending_requests >= REQUEST_WINDOW {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if ctx
+            .last_request
+            .is_some_and(|last| now.duration_since(last) < REQUEST_INTERVAL)
+        {
+            return;
+        }
+        ctx.last_request = Some(now);
+        // Send only into the free part of the window: the requests already in
+        // flight are the work the server is doing for us.
+        let room = REQUEST_WINDOW.saturating_sub(ctx.pending_requests);
+        for _ in 0..REQUESTS_PER_TICK.min(room) {
+            let Some((column, from)) = ctx.wanted.pop_front() else {
+                break;
+            };
+            ctx.queued.remove(&column);
+            let (x, z) = column;
+            let done = column_finished(ctx, x, z);
+            let Some(state) = ctx.columns.get_mut(&(x, z)) else {
+                continue;
+            };
+            if state.sent || done {
+                continue;
+            }
+            // One request per column: the sections from the bottom up to the
+            // highest one the server named. Requesting them one at a time made
+            // a 32-chunk circle take minutes.
+            let from = i32::from(from);
+            let to = state.section_end;
+            if from > to {
+                state.complete_request = true;
+                continue;
+            }
+            for y in from..=to {
+                state.requested.insert(y);
+            }
+            state.next_section = to + 1;
+            state.asked = Some(now);
+            state.complete_request = true;
+            if !state.pending {
+                state.pending = true;
+                ctx.pending_requests += 1;
+            }
+            let offsets: Vec<[i8; 3]> = (from..=to).map(|y| [0i8, y as i8, 0]).collect();
+            if chunk_trace() {
+                bedrock_core::nethernet::trace(format!(
+                    "chunk req ({x},{z}) sections {from}..={to}"
+                ));
+            }
+            ctx.requests.push(bp::Out::SubChunkRequest {
+                dimension: 0,
+                center: [x, 0, z],
+                offsets,
+            });
+        }
+    }
+
+    /// Rebuild the streamed set after the radius changed: forget what is now
+    /// out of range and ask for the columns already received that now fit.
+    pub fn radius_changed(ctx: &mut Context) {
+        let Some(circle) = Circle::of(ctx) else {
+            return;
+        };
+        ctx.wanted
+            .retain(|((x, z), _)| circle.contains(*x, *z));
+        ctx.queued.retain(|&(x, z)| circle.contains(x, z));
+        retain_near(ctx, circle.cx, circle.cz);
+        queue_published(ctx);
+    }
+
+    /// Keep only the columns near `(cx, cz)`. A long walk (or a teleport) must
+    /// not grow the cache without bound, and a column dropped this way is
+    /// requested again if the server publishes it again.
+    fn retain_near(ctx: &mut Context, cx: i32, cz: i32) {
+        let keep = ctx.radius.max(2) + 2;
+        let near = |x: i32, z: i32| (x - cx).abs() <= keep && (z - cz).abs() <= keep;
+        let mut released = 0usize;
+        ctx.columns.retain(|&(x, z), state| {
+            let keep_it = near(x, z);
+            if !keep_it && state.pending {
+                released += 1;
+            }
+            keep_it
+        });
+        ctx.pending_requests = ctx.pending_requests.saturating_sub(released);
+        ctx.chunks.retain(|&(x, z), _| near(x, z));
+        // A column that drifts out of reach no longer needs its runtime ids,
+        // and a column that comes into reach keeps its own as it is published.
+        let centre = ctx.wanted_center;
+        ctx.block_ids.retain(|&(x, z), _| {
+            centre.is_none_or(|(cx, cz)| {
+                (x - cx).abs() <= RUNTIME_ID_RADIUS && (z - cz).abs() <= RUNTIME_ID_RADIUS
+            })
+        });
+    }
+
+    /// Ask for the columns inside the published circle that have arrived but
+    /// have not been sent yet. They may have arrived before the publisher
+    /// update that named their centre.
+    fn queue_published(ctx: &mut Context) {
+        let Some(circle) = Circle::of(ctx) else {
+            return;
+        };
+        let waiting: Vec<(i32, i32)> = ctx
+            .columns
+            .iter()
+            .filter(|(position, state)| {
+                !state.sent && circle.contains(position.0, position.1)
+            })
+            .map(|(&(x, z), _)| (x, z))
+            .collect();
+        for (x, z) in waiting {
+            queue_column(ctx, x, z);
+        }
+    }
+
+    /// Note that a column finished, so it and the neighbours whose own 3x3 it
+    /// may have completed are candidates to be sent. They are queued by
+    /// distance and sent at a steady pace: the game gives chunk packets a
+    /// millisecond a frame and then, once a backlog is 50 ms old, handles the
+    /// whole of it in one frame — so a burst of hundreds of columns is a
+    /// second-long frame the player feels as a frozen chat box.
+    fn note_finished(ctx: &mut Context, x: i32, z: i32) {
+        // A column arriving is not a column finishing: only a finished one (and
+        // its neighbours) can be sent, so there is nothing to queue until then.
+        if !column_finished(ctx, x, z) {
+            return;
+        }
+        let (cx, cz) = ctx.wanted_center.unwrap_or((x, z));
         for dz in -1..=1 {
             for dx in -1..=1 {
-                if dx == 0 && dz == 0 {
-                    continue;
-                }
                 let (nx, nz) = (x + dx, z + dz);
-                if complete(ctx, nx, nz) && ctx.chunks.contains_key(&(nx, nz)) {
-                    if let Some(chunk) = column(ctx, nx, nz) {
-                        events.push(Event::Packet(Box::new(
-                            play::Clientbound::LevelChunkWithLight(chunk),
-                        )));
-                    }
-                }
+                let dx = i64::from(nx - cx);
+                let dz = i64::from(nz - cz);
+                ctx.ready
+                    .push(std::cmp::Reverse((dx * dx + dz * dz, nx, nz)));
+            }
+        }
+    }
+
+    /// Whether a column can be sent now: every section asked for is in, and
+    /// either its 3x3 neighbourhood is finished too (the light is then final)
+    /// or it has waited `REGION_PATIENCE` for a neighbour that never came.
+    fn region_complete(ctx: &Context, x: i32, z: i32) -> bool {
+        (-1..=1).all(|dz| {
+            (-1..=1).all(|dx| {
+                column_finished(ctx, x + dx, z + dz) && ctx.chunks.contains_key(&(x + dx, z + dz))
+            })
+        })
+    }
+
+    fn column_sendable(ctx: &Context, x: i32, z: i32) -> Option<bool> {
+        if ctx.columns.get(&(x, z)).is_none_or(|state| state.sent) || !column_finished(ctx, x, z)
+        {
+            return None;
+        }
+        if region_complete(ctx, x, z) {
+            return Some(true);
+        }
+        // The neighbour may simply still be filling. Only give up on it after a
+        // while: a column that never arrives (a reply the server dropped, the
+        // edge of the published area) must not leave a hole in the world.
+        let waited = ctx
+            .columns
+            .get(&(x, z))
+            .and_then(|state| state.asked)
+            .is_some_and(|at| at.elapsed() >= REGION_PATIENCE);
+        waited.then_some(false)
+    }
+
+    /// Light a column and turn it into the packet, marking it sent. `complete`
+    /// says whether its whole 3x3 was here, so a column sent early is
+    /// remembered for a light update once the missing neighbour shows up.
+    fn emit_column(ctx: &mut Context, x: i32, z: i32, complete: bool) -> Option<Event> {
+        if ctx.columns.get(&(x, z)).is_none_or(|state| state.sent) || !column_finished(ctx, x, z) {
+            return None;
+        }
+        let missing: Vec<i32> = match ctx.columns.get(&(x, z)) {
+            Some(state) => state
+                .requested
+                .iter()
+                .copied()
+                .filter(|y| !state.answered.contains(y))
+                .collect(),
+            None => return None,
+        };
+        let started = std::time::Instant::now();
+        let chunk = column(ctx, x, z)?;
+        let elapsed = started.elapsed();
+        if let Some(state) = ctx.columns.get_mut(&(x, z)) {
+            state.sent = true;
+            // A column lit with a neighbour missing takes a light update when
+            // that neighbour is emitted.
+            state.relight = !complete;
+        }
+        if chunk_trace() {
+            if missing.is_empty() {
+                bedrock_core::nethernet::trace(format!(
+                    "chunk emit ({x},{z}) total={}ms{}",
+                    elapsed.as_millis(),
+                    if complete { "" } else { " early" }
+                ));
+            } else {
+                bedrock_core::nethernet::trace(format!(
+                    "chunk emit ({x},{z}) incomplete missing={missing:?}"
+                ));
+            }
+        }
+        Some(Event::Packet(Box::new(
+            play::Clientbound::LevelChunkWithLight(chunk),
+        )))
+    }
+
+    /// Send a column that was lit with a neighbour missing again as light only,
+    /// now that the neighbour is here. Only the sections whose light changed go
+    /// out, and only columns sent early are ever checked.
+    fn relight_sent_neighbours(ctx: &mut Context, x: i32, z: i32) -> Vec<Event> {
+        let mut pending = std::collections::BTreeSet::new();
+        for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+            if ctx.columns.get(&(nx, nz)).is_some_and(|state| state.sent && state.relight) {
+                pending.insert((nx, nz));
+            }
+        }
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        for &(nx, nz) in &pending {
+            if let Some(state) = ctx.columns.get_mut(&(nx, nz)) {
+                state.relight = false;
+            }
+        }
+        relight_columns(ctx, &pending)
+    }
+
+    /// Send the nearest column that is ready, while the pacing budget allows.
+    /// The column under the player goes first whatever the rest are doing: it
+    /// is what the loading screen waits for, and it is what makes the world
+    /// visible.
+    pub fn emit_ready(ctx: &mut Context) -> Vec<Event> {
+        let now = std::time::Instant::now();
+        let elapsed = ctx
+            .last_emit
+            .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+        ctx.last_emit = Some(now);
+        ctx.emit_budget = (ctx.emit_budget + elapsed * EMIT_PER_SECOND).min(EMIT_BURST);
+        let mut events = Vec::new();
+        // The player's own column first, whatever its neighbours are doing: it
+        // is what the loading screen waits for, and what makes the world
+        // visible at all. If one is missing the light update follows later.
+        if let Some((x, z)) = ctx.wanted_center
+            && let Some(event) = emit_column(ctx, x, z, region_complete(ctx, x, z))
+        {
+            events.push(event);
+        }
+        while ctx.emit_budget >= 1.0 {
+            let Some(std::cmp::Reverse((_, x, z))) = ctx.ready.pop() else {
+                break;
+            };
+            let Some(complete) = column_sendable(ctx, x, z) else {
+                continue;
+            };
+            ctx.emit_budget -= 1.0;
+            if let Some(event) = emit_column(ctx, x, z, complete) {
+                events.push(event);
+                events.extend(relight_sent_neighbours(ctx, x, z));
             }
         }
         events
+    }
+
+    /// Queue the columns that became sendable without a packet naming them
+    /// (a reply the server dropped has now waited long enough), and report the
+    /// streaming state once a second under `HZ_CHUNK_TRACE`.
+    pub fn sweep_columns(ctx: &mut Context) {
+        let now = std::time::Instant::now();
+        if ctx
+            .last_sweep
+            .is_some_and(|last| now.duration_since(last) < SWEEP_INTERVAL)
+        {
+            return;
+        }
+        ctx.last_sweep = Some(now);
+        if chunk_trace() {
+            let total = ctx.columns.len();
+            let sent = ctx.columns.values().filter(|s| s.sent).count();
+            let waiting = ctx.columns.values().filter(|s| !s.complete_request).count();
+            bedrock_core::nethernet::trace(format!(
+                "chunks columns={total} sent={sent} waiting={waiting} queued={} inflight={} ready={} radius={} center={:?}",
+                ctx.wanted.len(),
+                ctx.pending_requests,
+                ctx.ready.len(),
+                ctx.radius,
+                ctx.wanted_center
+            ));
+        }
+        // Only a reply the server never sent needs re-queueing: a column that
+        // is merely waiting for a neighbour is queued again when that
+        // neighbour completes, which is what `note_finished` is for. Pushing
+        // every finished column here would grow the queue without bound.
+        let overdue: Vec<(i32, i32)> = ctx
+            .columns
+            .iter()
+            .filter(|(_, state)| {
+                !state.sent
+                    && state.complete_request
+                    && state.asked.is_some_and(|at| at.elapsed() >= COLUMN_PATIENCE)
+            })
+            .map(|(&(x, z), _)| (x, z))
+            .collect();
+        for (x, z) in overdue {
+            note_finished(ctx, x, z);
+        }
     }
 
     /// The stack a drawn item entity shows: every actor folded into it, summed.
@@ -1528,6 +2204,12 @@ mod translate {
                 ctx.spawn_yaw = g.yaw;
                 ctx.spawn_pitch = g.pitch;
                 ctx.spawn_info = Some(spawn.clone());
+                // The game's chunk storage is centred on the spawn column from
+                // here on; the first publisher update only repeats it if the
+                // player has already moved away.
+                ctx.sent_center = Some((g.position[0] as i32 >> 4, g.position[2] as i32 >> 4));
+                // `Login` carries the radius, so it is already known to the game.
+                ctx.sent_radius = Some(bridge.chunk_radius.load(Ordering::Relaxed).max(2));
                 // The biome registry in the client's own id order. Without it the
                 // client's biome table is empty and every chunk biome id falls
                 // back to the first biome (badlands — brown grass); with it, the
@@ -1556,11 +2238,10 @@ mod translate {
                         hardcore: false,
                         levels: vec!["minecraft:overworld".into()],
                         max_players: 100,
-                        // The radius the server granted, in chunks
-                        // (32 here): the game drops anything past it and
-                        // sizes its cache from it, so it comes from the
-                        // grant, never the publisher's byte count (512)
-                        // or a guess.
+                        // The streamed radius: the game's render-distance
+                        // setting capped by the server's grant. The game drops
+                        // anything past it and sizes its cache from it, so it
+                        // is never the publisher's block count (512).
                         chunk_radius: bridge.chunk_radius.load(Ordering::Relaxed),
                         simulation_distance: bridge.chunk_radius.load(Ordering::Relaxed),
                         reduced_debug_info: false,
@@ -2441,7 +3122,10 @@ mod translate {
             // there yet, so the position is repeated while the server publishes
             // chunks — a few times, then never again. The same update says which
             // columns to ask for.
-            bp::Packet::NetworkChunkPublisherUpdate { position, radius } => {
+            bp::Packet::NetworkChunkPublisherUpdate {
+                position,
+                radius: _,
+            } => {
                 let mut out = Vec::new();
                 if ctx.published < 4 {
                     ctx.published += 1;
@@ -2457,71 +3141,37 @@ mod translate {
                     ))));
                 }
                 let center = (position[0] >> 4, position[2] >> 4);
-                // Ask for the columns around the player every time they cross a
-                // chunk boundary, and keep what is already queued. Refilling only
-                // after several chunks, and emptying the queue to do it, left the
-                // client without the columns it was standing in: it draws those as
-                // holes, and the player falls through them.
-                if ctx.wanted_center != Some(center) {
-                    if ctx.wanted_center.is_none() {
-                        ctx.wanted.push_back((
-                            (
-                                (ctx.spawn[0].floor() as i32) >> 4,
-                                (ctx.spawn[2].floor() as i32) >> 4,
-                            ),
-                            -4,
-                        ));
-                    }
-                    ctx.wanted_center = Some(center);
-                    // The granted Bedrock radius is a distance in chunks
-                    // (32 here), not a count. Convert to a radius and retain
-                    // only columns inside the circle; never interpret the
-                    // publisher's sent amount (512) or a hard-coded cap.
-                    let granted = bridge.chunk_radius.load(Ordering::Relaxed);
-                    let r = granted.max(2);
-                    let r2 = (r as i64) * (r as i64);
-                    let in_circle = |x: i32, z: i32| {
-                        let dx = (x - center.0) as i64;
-                        let dz = (z - center.1) as i64;
-                        dx * dx + dz * dz <= r2
-                    };
-                    ctx.wanted.retain(|((x, z), _)| in_circle(*x, *z));
-                    let mut ring: Vec<(i32, i32)> = (-r..=r)
-                        .flat_map(|dx| (-r..=r).map(move |dz| (center.0 + dx, center.1 + dz)))
-                        .filter(|&(x, z)| in_circle(x, z))
-                        .collect();
-                    ring.sort_by_key(|(x, z)| {
-                        (x - center.0).abs().max((z - center.1).abs())
-                    });
-                    for column in ring {
-                        if !ctx.wanted.iter().any(|(c, _)| *c == column) {
-                            ctx.wanted.push_back((column, -4));
-                        }
-                    }
+                ctx.radius = bridge.chunk_radius.load(Ordering::Relaxed).max(2);
+                // The game ignores a column outside the storage around the
+                // centre it was last told, so the centre must follow the player
+                // (and a teleport) before the columns there arrive — not only
+                // at login, or the destination chunks are refused.
+                if ctx.sent_center != Some(center) {
+                    ctx.sent_center = Some(center);
+                    out.push(Event::Packet(Box::new(
+                        play::Clientbound::SetChunkCacheCenter(play::SetChunkCacheCenter {
+                            x: center.0,
+                            z: center.1,
+                        }),
+                    )));
                 }
-                let limit = ctx.request_limit.clamp(1, 24) as i8;
-                for _ in 0..super::REQUESTS_PER_TICK {
-                    let Some((column, from)) = ctx.wanted.pop_front() else {
-                        break;
-                    };
-                    let (cx, cz) = column;
-                    // Only as many sections as the server said it would send;
-                    // the rest go back on the queue for other columns to have
-                    // their turn. The base Y is 0 and the offsets carry the
-                    // absolute section index, which for the overworld (min_y
-                    // -64) runs -4..=19 — the convention a real Bedrock client
-                    // uses.
-                    let to = (from + limit - 1).min(19);
-                    let offsets: Vec<[i8; 3]> = (from..=to).map(|sy| [0i8, sy, 0]).collect();
-                    ctx.requests
-                        .push(bedrock_core::protocol::Out::SubChunkRequest {
-                            dimension: 0,
-                            center: [cx, 0, cz],
-                            offsets,
-                        });
-                    if to < 19 {
-                        ctx.wanted.push_back((column, to + 1));
-                    }
+                // Ask for the columns around the player whenever they cross a
+                // chunk boundary, and keep what is already queued. Each streamed
+                // column is queued as the server publishes it, not from a ring
+                // built here: a column the server never sent cannot be asked
+                // for, and a teleport's destination is queued the moment its
+                // `LevelChunk` arrives.
+                if ctx.wanted_center != Some(center) {
+                    ctx.wanted_center = Some(center);
+                    // The granted Bedrock radius is a distance in chunks (32
+                    // here), not a count: retain only columns inside the circle,
+                    // and never interpret the publisher's block amount (512).
+                    let circle = Circle::of(ctx).expect("the centre was just set");
+                    ctx.wanted
+                        .retain(|((x, z), _)| circle.contains(*x, *z));
+                    ctx.queued.retain(|&(x, z)| circle.contains(x, z));
+                    retain_near(ctx, center.0, center.1);
+                    queue_published(ctx);
                 }
                 out
             }
@@ -2575,40 +3225,81 @@ mod translate {
                     }),
                 ))]
             }
-            // The server's answer to the chunk-radius request: the game keeps
-            // only that far and drops anything past it, so the grant is passed
-            // on as the cache radius.
+            // The server's answer to the chunk-radius request. It is the cap
+            // on what may be granted, so the smaller of the game's setting and
+            // the grant is what the game's cache and the stream use.
             bp::Packet::ChunkRadiusUpdated(radius) => {
-                let radius = *radius;
-                bridge.chunk_radius.store(radius.max(2), Ordering::Relaxed);
-                vec![Event::Packet(Box::new(
-                    play::Clientbound::SetChunkCacheRadius(play::Distance {
-                        distance: radius.max(2),
-                    }),
-                ))]
+                let granted = (*radius).max(2);
+                bridge.granted_radius.store(granted, Ordering::Relaxed);
+                let effective = super::store_effective_radius(bridge);
+                // The loop sends the new radius and rebuilds the streamed set;
+                // setting `ctx.radius` here too would hide the change from it.
+                bridge.radius_dirty.store(true, Ordering::Relaxed);
+                if chunk_trace() {
+                    bedrock_core::nethernet::trace(format!(
+                        "chunk radius granted={granted} setting={} stream={effective}",
+                        bridge.requested_radius.load(Ordering::Relaxed)
+                    ));
+                }
+                Vec::new()
             }
             bp::Packet::LevelChunk(c) => {
-                // The server answers at most this many sub-chunk requests per
-                // column, so asking for the whole column at once loses the
-                // sections past the limit.
-                if let Some(limit) = c.request_limit {
-                    ctx.request_limit = i8::try_from(limit).unwrap_or(24).clamp(1, 24);
-                }
+                // A column sent again replaces the old one, exactly as the
+                // game's cache replaces a column it is handed twice.
+                forget_column(ctx, c.chunk_x, c.chunk_z);
+                let (first, last) = section_range();
+                // The server says how far up the column has blocks: the field
+                // is a section count from the bottom of the dimension (one
+                // based), and a negative value means "request the whole
+                // column". Sections above it are air, so they are never asked
+                // for.
+                let section_end = match c.highest_subchunk {
+                    Some(highest) if highest >= 0 => (first + highest).min(last),
+                    _ => last,
+                };
+                let mut state = ColumnState::new(first, section_end);
                 // Whatever blocks the payload carries; the rest arrive as
-                // sub-chunk replies.
+                // sub-chunk replies. A payload is only decoded up to the
+                // world's own section count, so a request-mode marker (which
+                // reads as a huge count) cannot make the decoder run away.
                 let air = ctx.blocks.as_ref().map(|b| b.air_runtime).unwrap_or(0);
-                if let Ok(decoded) = bedrock_core::chunk::decode_sections(c, air) {
-                    for section in decoded {
-                        put_section(
-                            ctx,
-                            c.chunk_x,
-                            c.chunk_z,
-                            i32::from(section.y),
-                            &section.blocks,
-                        );
+                let inline = c.sub_chunk_count.min(64) as i32;
+                if inline > 0 {
+                    if let Ok(decoded) = bedrock_core::chunk::decode_sections(c, air) {
+                        for section in decoded {
+                            let y = i32::from(section.y);
+                            put_section(ctx, c.chunk_x, c.chunk_z, y, &section.blocks);
+                            state.requested.insert(y);
+                            state.answered.insert(y);
+                            state.next_section = state.next_section.max(y + 1);
+                        }
                     }
                 }
-                emit_column(ctx, c.chunk_x, c.chunk_z)
+                if state.next_section > state.section_end {
+                    state.complete_request = true;
+                }
+                if chunk_trace() {
+                    bedrock_core::nethernet::trace(format!(
+                        "chunk recv ({},{}) sub_chunks={} inline={} highest={:?} end={} payload={} next={}",
+                        c.chunk_x,
+                        c.chunk_z,
+                        c.sub_chunk_count,
+                        inline,
+                        c.highest_subchunk,
+                        state.section_end,
+                        c.data.len(),
+                        state.next_section
+                    ));
+                }
+                ctx.columns.insert((c.chunk_x, c.chunk_z), state);
+                // The server publishes the columns around the player; each is
+                // asked for as it arrives, inside the streamed circle.
+                if in_circle(ctx, c.chunk_x, c.chunk_z) {
+                    queue_column(ctx, c.chunk_x, c.chunk_z);
+                }
+                // A payload carrying every section completes the column here.
+                note_finished(ctx, c.chunk_x, c.chunk_z);
+                Vec::new()
             }
             // A changed block. Without it, nothing built or broken shows up
             // until the column is sent again. The block also changes the light
@@ -2946,39 +3637,77 @@ mod translate {
             // generation sends partial chunks and answers these requests, so
             // without this every column stays empty and never lights.
             bp::Packet::SubChunk(sub) => {
-                let mut any = false;
-                for entry in &sub.entries {
-                    if entry.result != 1 || entry.payload.is_empty() {
-                        continue;
+                let started = std::time::Instant::now();
+                let (x, z) = (sub.position[0], sub.position[2]);
+                // Every offset refused as "the column is gone": the player
+                // left it, so what the bridge holds is stale.
+                if !sub.entries.is_empty() && sub.entries.iter().all(|e| e.result == 2) {
+                    forget_column(ctx, x, z);
+                    return Vec::new();
+                }
+                if let Some(state) = ctx.columns.get_mut(&(x, z)) {
+                    if state.pending {
+                        state.pending = false;
+                        ctx.pending_requests = ctx.pending_requests.saturating_sub(1);
                     }
-                    let mut r = bedrock_core::stream::Reader::new(&entry.payload[1..]);
-                    let Ok(sc) = bedrock_core::subchunk::SubChunk::read(&mut r, entry.payload[0])
-                    else {
-                        continue;
-                    };
+                }
+                let air = ctx.blocks.as_ref().map(|b| b.air_runtime).unwrap_or(0);
+                let mut delivered = 0usize;
+                let mut empty = 0usize;
+                let mut refused = 0usize;
+                for entry in &sub.entries {
                     // The entry's section is the reply's base Y plus the offset,
                     // both absolute section indices (the request asked with base
-                    // Y 0). `column` then places it against the dimension's
-                    // `min_y`, which is the shift that was missing before.
-                    let y = (sub.position[1] + i32::from(entry.offset[1])) as i8;
-                    let air = ctx.blocks.as_ref().map(|b| b.air_runtime).unwrap_or(0);
-                    let mut ids = vec![0u32; 4096];
-                    for sy in 0..16usize {
-                        for sz in 0..16usize {
-                            for sx in 0..16usize {
-                                let id = sc.runtime_id(sx, sy, sz, air).unwrap_or(0);
-                                ids[(sy * 16 + sz) * 16 + sx] = u32::try_from(id).unwrap_or(0);
+                    // Y 0). `put_section` then places it against the dimension's
+                    // `min_y`.
+                    let y = sub.position[1] + i32::from(entry.offset[1]);
+                    match entry.result {
+                        // Success: a serialized section.
+                        1 if !entry.payload.is_empty() => {
+                            let mut r = bedrock_core::stream::Reader::new(&entry.payload[1..]);
+                            let Ok(sc) =
+                                bedrock_core::subchunk::SubChunk::read(&mut r, entry.payload[0])
+                            else {
+                                continue;
+                            };
+                            let mut ids = vec![0u32; 4096];
+                            for sy in 0..16usize {
+                                for sz in 0..16usize {
+                                    for sx in 0..16usize {
+                                        let id = sc.runtime_id(sx, sy, sz, air).unwrap_or(0);
+                                        ids[(sy * 16 + sz) * 16 + sx] =
+                                            u32::try_from(id).unwrap_or(0);
+                                    }
+                                }
                             }
+                            put_section(ctx, x, z, y, &ids);
+                            delivered += 1;
                         }
+                        // Success, all air: the section exists with no blocks.
+                        // A column re-sent since is built from scratch, so its
+                        // sections already read as air; the column itself must
+                        // still exist for the light and the mesh.
+                        6 => {
+                            ensure_chunk(ctx, x, z);
+                            empty += 1;
+                        }
+                        _ => refused += 1,
                     }
-                    put_section(ctx, sub.position[0], sub.position[2], i32::from(y), &ids);
-                    any = true;
+                    // The section counts as answered whatever the result: a
+                    // refusal must not hold the column back forever.
+                    if let Some(state) = ctx.columns.get_mut(&(x, z)) {
+                        state.answered.insert(y);
+                    }
                 }
-                if any {
-                    emit_column(ctx, sub.position[0], sub.position[2])
-                } else {
-                    Vec::new()
+                if chunk_trace() {
+                    bedrock_core::nethernet::trace(format!(
+                        "subchunk ({x},{z}) entries={} delivered={delivered} air={empty} refused={refused} took={}ms",
+                        sub.entries.len(),
+                        started.elapsed().as_millis()
+                    ));
                 }
+                note_finished(ctx, x, z);
+                Vec::new()
             }
             // Block updates, block entities, inventories and the rest still
             // need their own translation; see the README.
@@ -4289,7 +5018,12 @@ mod translate {
             // the rest of the start-up burst.
             play::Serverbound::ClientInformation(info) => {
                 let radius = i32::from(info.view_distance).max(2);
-                bridge.chunk_radius.store(radius, Ordering::Relaxed);
+                bridge.requested_radius.store(radius, Ordering::Relaxed);
+                // The streamed radius is the smaller of this setting and the
+                // grant; a setting past the grant is not streamed, since the
+                // game drops columns past its own render distance anyway.
+                let _ = super::store_effective_radius(bridge);
+                bridge.radius_dirty.store(true, Ordering::Relaxed);
                 if bridge.runtime_id.load(Ordering::Relaxed) != 0 {
                     vec![bp::Out::RequestChunkRadius { radius }]
                 } else {

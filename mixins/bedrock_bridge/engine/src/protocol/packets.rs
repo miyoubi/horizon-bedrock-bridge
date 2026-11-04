@@ -1105,23 +1105,28 @@ pub struct LevelChunk {
     pub chunk_z: i32,
     pub dimension: i32,
     pub sub_chunk_count: u32,
-    /// The most sub-chunk requests the server will answer for this column.
-    pub request_limit: Option<u32>,
+    /// The last sub-chunk the client is asked to request, as a count of
+    /// sections from the bottom of the dimension: the packet carries the
+    /// highest populated section (one based), or a negative value when there
+    /// is no limit at all. Only present in request mode.
+    pub highest_subchunk: Option<i32>,
     pub data: Vec<u8>,
 }
 
 impl LevelChunk {
     pub fn read(r: &mut Reader) -> Result<LevelChunk> {
-        // Plain varints, not zigzag: reading them signed halves every positive
-        // coordinate and turns negatives into large positives, which put whole
-        // columns in the wrong place.
-        let chunk_x = r.varint()? as i32;
-        let chunk_z = r.varint()? as i32;
+        // `ChunkPos` is a pair of signed, compressed int32s: zigzag varints.
+        // Read as plain varints, a negative chunk maps to a positive odd
+        // number and every positive one is doubled, so the whole column set
+        // sits in the wrong place.
+        let chunk_x = r.zigzag32()?;
+        let chunk_z = r.zigzag32()?;
         let dimension = r.varint()? as i32;
         let sub_chunk_count = r.varint()?;
-        // Whether the server set a limit on how many sub-chunks to ask for.
-        let request_limit = if r.bool()? {
-            Some(r.varint()?)
+        // Whether the server named the highest sub-chunk to ask for. It is a
+        // signed field: a negative value means "request the whole column".
+        let highest_subchunk = if r.bool()? {
+            Some(r.zigzag32()?)
         } else {
             None
         };
@@ -1138,7 +1143,7 @@ impl LevelChunk {
             chunk_z,
             dimension,
             sub_chunk_count,
-            request_limit,
+            highest_subchunk,
             data,
         })
     }
