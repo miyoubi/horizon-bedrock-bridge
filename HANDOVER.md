@@ -577,6 +577,65 @@ content and some addon behaviour will be approximations.
 
 3. Repeat the initial connection with `HZ_INV_TRACE=1 HZ_ENT_TRACE=1` and verify whether the remaining terrain and outside chunks arrive; once they do, wire in predicate lighting following the Bedrock definitions. Two open items hang off this path: the death animation for hostile mobs, regular mobs and players (`EntityEvent(3)` and `HZ_ENT_TRACE=1 DEATH/REMOVE` have never been captured — needs a live kill), and the used-up-block consumption path (`ItemUseOnBlock` not decrementing server-side). Do not start new work unprompted.
 
+### Commands and item use (latest)
+
+**Commands work** (commit `Run Bedrock commands instead of sending them as chat`). A Java
+`ChatCommand` is no longer sent as a Bedrock `Text` with a leading slash (the server
+ignores those); it goes out as a `CommandRequest`, and the server's `CommandOutput` is
+decoded back into chat lines (one per message line; the help body arrives as plain text).
+
+The wire format was **settled against the local server**, and the schema was wrong for it:
+
+| Field | 1.26.60 schema | What BDS 1.26.61 accepts |
+|---|---|---|
+| origin type | `uint8` | **string** `player` |
+| command version | `int32` (CurrentCmdVersion) | **string** `latest` |
+
+Sending the numeric form is refused with `ViolationWarning: "Command exceeds maximum size
+of 512 characters"`, which is what a misaligned origin looks like. `CommandOutput` names
+its type as a string too (`alloutput`) and ends with one padding zero byte; the decoder
+tries the shapes that have shipped (named/numeric origin and header, fixed/varint success
+count) and keeps the one that consumes the packet, so both forms decode. The origin
+carries the player's unique id from `StartGame` and a random instance uuid.
+
+Known gaps, in order of annoyance:
+
+- the game's own language table has no entries for Bedrock's command keys, so a keyed
+  output shows as `key value...` (the help body reads fine);
+- `AvailableCommands` (76) is still not decoded, so `/` suggests nothing;
+- **`@s` is unreliable**: `/list`, `/help`, `/me`, `/tell @s` answered, but a later
+  `/give @s dirt 4` came back as `commands.generic.noTargetMatch` — a selector resolves
+  the executor from the command origin, so the uuid/player id we send is not always
+  enough. Capture a real client's `CommandRequest` if a selector needs to be exact.
+
+**Item use consumption is still open.** Placing a block works (the block appears) but the
+held stack never shrinks server-side, which is what a survival session feels as duplicated
+blocks. What was established, all measured against the local server:
+
+- the standalone `InventoryTransaction` (type 2, ItemUse/Place) we send is **byte-for-byte
+  what the Bedrock↔Java proxy sends** (verified by dumping our own packet with
+  `HZ_DUMP_OUT=30` and decoding it): one action `container inventory / slot 0 / dirt 10 ->
+  dirt 9` with the right stack net id, the correct action type (0 = Place), trigger 1,
+  block position/face/slot/hand, the clicked block's runtime id, predicted result 1 and
+  cooldown 0, bracketed by `PlayerAction` 28/29;
+- the server answers with an `InventoryContent` that still reads count 10, so it is not a
+  client-side display problem;
+- moves to the modern form — carrying the use inside `PlayerAuthInput` (`PERFORM_ITEM_
+  INTERACTION`, bit 34, `PackedItemUseLegacyInventoryTransaction`: legacy request id 0, a
+  "has legacy slots" bool false, then the actions and the item-use fields) — pass without
+  a violation when written that way, but nothing is consumed either; sending *both* forms
+  stopped the placement itself from happening, so they are not additive;
+- two encoding changes made during this were reverted and must not be "fixed" again
+  without a capture: removing the 4-byte user-data trailer from `write_item`, and dropping
+  the "source flags present" flag in the inventory action. Both broke the placement that
+  otherwise works.
+
+**Next step for this item:** capture a real Bedrock client's placement frames (the Wine
+client through the relay, or the JS client) and diff them against `OUT id=30` and the
+auth-input dump; the reference proxies agree with what we send, so the missing piece is
+probably *another* packet a real client sends around the placement (a `PlayerAuthInput`
+block action, an `ItemStackRequest` consume, or a `PlayerAction` variant).
+
 ### Chunk distance state (latest)
 
 The streamed radius is `min(the game's render-distance setting, the server's grant)`:
