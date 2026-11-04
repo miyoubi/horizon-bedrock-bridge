@@ -3236,6 +3236,29 @@ mod translate {
         }
     }
 
+    /// Put one slot back to what a snapshot held, returning what it now holds.
+    fn restore_slot(
+        bridge: &Bridge,
+        before: &Items,
+        container: u8,
+        slot: u8,
+    ) -> Option<bedrock_core::protocol::ItemDescriptor> {
+        let item = match container {
+            CONTAINER_COMBINED | CONTAINER_HOTBAR | CONTAINER_INVENTORY => {
+                before.items.get(usize::from(slot)).copied().flatten()
+            }
+            CONTAINER_ARMOR => before.armor.get(usize::from(slot)).copied().flatten(),
+            CONTAINER_OFFHAND => before.offhand,
+            CONTAINER_CURSOR => before.cursor,
+            _ => before
+                .window
+                .as_ref()
+                .and_then(|(_, slots)| slots.get(usize::from(slot)).copied().flatten()),
+        };
+        set_item_at(bridge, container, slot, item);
+        item
+    }
+
     /// Move `count` of the item at `from` into `to`, merging a matching stack,
     /// the way the server applies a take or a place.
     fn move_item(bridge: &Bridge, from: bp::SlotRef, to: bp::SlotRef, count: u8) {
@@ -3946,6 +3969,54 @@ mod translate {
                             .and_then(|d| map_item_by_id(ctx, d.runtime_id, i32::from(d.count))),
                     }),
                 )));
+            }
+        }
+        // A slot the move changed here but the answer did not name was predicted
+        // to a place the server did not use, so the copy drawn there has to go:
+        // put the slot back to the snapshot and show it.
+        if let Some(before) = &before {
+            let touched: Vec<(u8, u8)> = {
+                let pending = bridge.pending_ids.lock().unwrap();
+                pending
+                    .iter()
+                    .filter(|(_, id)| **id == response.request_id)
+                    .map(|(key, _)| *key)
+                    .collect()
+            };
+            let mut named = std::collections::HashSet::new();
+            for container in &response.containers {
+                for slot in &container.slots {
+                    named.insert((container.container.name, slot.slot));
+                }
+            }
+            for (container, slot) in touched {
+                if named.contains(&(container, slot)) {
+                    continue;
+                }
+                let item = restore_slot(bridge, before, container, slot);
+                bridge.pending_ids.lock().unwrap().remove(&(container, slot));
+                if container == CONTAINER_CURSOR {
+                    events.push(Event::Packet(Box::new(play::Clientbound::SetCursorItem(
+                        play::SetCursorItem {
+                            item: item.and_then(|d| {
+                                map_item_by_id(ctx, d.runtime_id, i32::from(d.count))
+                            }),
+                        },
+                    ))));
+                    continue;
+                }
+                if let Some(java) = java_slot_of(container, slot) {
+                    events.push(Event::Packet(Box::new(
+                        play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
+                            container: 0,
+                            state: 0,
+                            slot: java,
+                            item: item.and_then(|d| {
+                                map_item_by_id(ctx, d.runtime_id, i32::from(d.count))
+                            }),
+                        }),
+                    )));
+                }
             }
         }
         events
