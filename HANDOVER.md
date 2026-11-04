@@ -579,57 +579,89 @@ content and some addon behaviour will be approximations.
 
 ### Chunk distance state (latest)
 
-`chunk_radius` is now the server-granted value (`ChunkRadiusUpdated(32)` on the local
-BDS), not the publisher's radius (`512`) and not the old `8`-column clamp. `Login` reports
-it, `ChunkRadiusUpdated` installs it and emits `SetChunkCacheRadius`, and
-`NetworkChunkPublisherUpdate` only retains columns inside the circle (`r = granted`,
-`dx² + dz² <= r²`), not a square. On the `4188e4d` + `75b20e1` build the rejoin showed
-`recv ChunkRadiusUpdated(32)`, `1,732 LevelChunk` and `486 SubChunk` in the
-short check and no panic; the remaining question is whether the whole 32-chunk-granted
-radius becomes meshed — `emit_column` still emits every section arrival (not just the
-complete column), so the client still re-unpacks and re-lights partial columns; the next
-bounded change is per-column buffering to one emission with `sub_chunk_count` logging.
-The translate loop still drains only `4` packets per iteration, `12` with a backlog, so
-at a 32-radius circle load time is the expected remaining cost rather than a hard stop.
+The streamed radius is `min(the game's render-distance setting, the server's grant)`:
+`requested_radius` comes from `ClientInformation` (the game's setting), `granted_radius`
+from `ChunkRadiusUpdated`, and `chunk_radius` is the effective value. `Login` and
+`SetChunkCacheRadius` both carry it; a change emits `SetChunkCacheRadius` exactly once
+(tracked by `Context::sent_radius`, so a value set elsewhere cannot hide the change — that
+bug left the game with a 12-chunk storage while the bridge streamed 32 and the game
+silently dropped most columns).
 
-Unpushed at this point: `75b20e1` (code), `4188e4d`, `aba5475`, `ece7b66`, `be626df`
-and this handover. `main` is otherwise at `origin/main` (`d6d5a25`) apart from those.
+Each column is tracked individually (`Context::columns`):
 
-### Current task — render chunk distance
+- a `LevelChunk` deletes anything held for that column, records the sections the payload
+  carries and queues **one** `SubChunkRequest` for the sections up to the highest the
+  server named (`highest_subchunk`, a signed section count; a negative value means the
+  whole column). The request base Y is 0 and the offsets carry the absolute section
+  index, as before;
+- `SubChunk` replies fill the sections in and mark those answered (result `1` blocks,
+  `6` all air, anything else counted as answered so a refusal cannot stall a column);
+- a column is sent to the game **once**, when every section asked for is answered and its
+  3x3 neighbourhood is finished, so the game never re-unpacks or re-lights a partial
+  column and the light is final. If a neighbour has not arrived after 1.5 s the column is
+  sent anyway and remembered (`ColumnState::relight`): when the neighbour is emitted its
+  face neighbours get a `LightUpdate`, so a missing reply leaves no hole.
+- the player's own column is always emitted first, regardless of its neighbours — it is
+  what ends the loading screen.
+- emission is **distance ordered** and paced (`EMIT_PER_SECOND`, `EMIT_BURST`): the game
+  gives chunk packets 1 ms a frame and, once a backlog is 50 ms old, handles the whole
+  backlog in one frame, which the player feels as a frozen chat box.
 
-- **Objective:** make the render chunk distance match the setting the Horizon/bridge
-  client already has, and make a higher render distance actually work. This is the
-  active task; inventory work is held until this path is stable, unless the user asks
-  for inventory explicitly.
-- **Acceptance:** with the render distance set in Horizon/bridge to the granted radius
-  (`32` on the local BDS), the visible terrain must fill out to that radius rather
-  than stopping around `4`–`8`. New chunks must load without stalling, and a teleport
-  must request the chunks around the destination instead of refusing to load them.
-- **Suspects:**
-  - `emit_column` still emits every `SubChunk` section arrival (one `LevelChunkWithLight`
-    per section, with `reach` re-emitting neighbors), so each column changes shape
-    (`1` section, then `2`, …) and the client spends time re-unpacking and re-lighting
-    partial columns. Buffer per column and emit once when complete, and log
-    `sub_chunk_count`, `request_limit`, and the received-vs-expected section count so a
-    column whose `SubChunk` replies are dropped (results `2` empty, `6` out of range,
-    `8` beyond height) is visible in the trace instead of being invisible.
-  - The translate loop drains only `4` packets per iteration (`12` with a backlog), so
-    at a `32`-radius circle a teleport is throttled by the drain rate rather than by the
-    server. A teleport must bias the drain toward the new center's columns and cancel
-    the old `wanted` queue instead of letting stale columns block the new arrival.
-  - `NetworkChunkPublisherUpdate` only retains columns inside the circle (`r = granted`,
-    `dx² + dz² <= r²`), not a square; verify that the circle does not clip the corners
-    the renderer expects and that a teleport re-centers immediately rather than waiting
-    for the next publisher update that happens to land on a chunk boundary.
-- **Health checks before touching code:** confirm `recv ChunkRadiusUpdated(32)` appears
-  after each (re)connect, confirm the old `8`-column clamp and the `512` publisher
-  value are not used as a chunk radius anywhere in `session.rs`, and confirm `Login`
-  and `SetChunkCacheRadius` both carry the granted value, then read the
-  `LevelChunk`/`SubChunk` traces with `HZ_INV_TRACE=1 HZ_ENT_TRACE=1` for the teleport
-  case above. Only then make the bounded change and rebuild/launch with the rules
-  below.
+Ordering and pacing live on `Context::ready` (a min-heap keyed by distance²) and are fed
+by `note_finished`. Requests are paced by `REQUEST_WINDOW` (16 outstanding) rather than by
+the receive backlog: the server does work for every request, and a busy server answers the
+player's own chat late (measured 1.5–7 s of chat round trip when the window was wide).
+The translate step is time-bounded (`TRANSLATE_BUDGET`, 20 ms) so the outbound direction
+and the WebRTC pump are serviced every iteration.
 
----
+Measured live (local BDS, grant 32, game setting 80 → stream 32): loading screen closes
+~2 s after the join (`server.loaded` true), 54 columns at +2 s, ~270 at +6 s, ~1070 at
++20 s, ~3300 at +60 s, ending at 3400+ columns with the game holding exactly what was
+sent, no `Ignoring chunk since it's not in the view range`, no chunk decode errors and no
+panic. Chat round trip during streaming is ~180–270 ms (it was 1.5–7.3 s before the
+pacing changes). RSS is ~830 MB–1 GB, down from ~1.6 GB. A radius change to 12 and back
+to 32 follows correctly (`ChunkRadiusUpdated(12)` → `stream=12`, then `granted=32,
+stream=32`, columns refilling). The world spawn moved during testing, and a BDS respawn
+re-streams the area the same way (publisher centre follows the player).
+
+**The inflow, not the bridge, is now the limit.** With the window at 16 the server's
+LevelChunk replies arrive at roughly 50–85 columns/s (BDS's own per-tick chunk send
+budget; there is no client-side knob for it), and the loop keeps up: `wanted` and the
+in-flight count are usually 0–10 and the emit budget is never exhausted. Raising the
+window to 48 *lowered* throughput to ~30/s and pushed chat latency to ~650 ms, so
+widening it is not the answer. Multi-threading the bridge would not raise this either:
+the pipeline is waiting on the server's replies, and the client's own insertion/meshing
+is what the pacing protects.
+
+Known remaining gaps:
+
+- **Teleport by server command is not verifiable here** (no op, and `/tp` typed as chat
+  is ignored by BDS — Bedrock commands go in a `CommandRequest`, still unimplemented).
+  What was verified is the mechanism it depends on: `SetChunkCacheCenter` follows every
+  publisher update, so the game's chunk storage re-centres before the destination
+  columns arrive (walked 37+ chunks from spawn with no out-of-range drop). The same
+  path runs on a respawn.
+- The streamed area is a circle of radius `granted + 1` (the extra ring is what makes the
+  outermost rendered ring meshable; the game's own LAN host streams `view_distance + 1`).
+  A gap between that circle and the renderer's square storage is not yet measured; the
+  client ends with fewer columns than its `view_distance + 3` storage could hold, which
+  is expected for a circle.
+- Per-section runtime ids are kept only within 8 chunks of the publisher centre
+  (`RUNTIME_ID_RADIUS`); a block use further out falls back to the Java→Bedrock reverse
+  mapping, which is what the bridge did before the per-section copy existed.
+- `EMIT_PER_SECOND` is above the server's inflow in normal play, so it only shapes the
+  case where columns are already in hand (radius change, respawn).
+- A respawn that the client handles does not reset `ColumnState::sent`; recovery relies
+  on the server re-publishing (`LevelChunk` resets the column). This should be made
+  explicit: on `Respawn`/`ChangeDimension`, mark everything unsent and re-emit from the
+  cache.
+- `NETHER_DUMP=<packet id>` plus `NETHER_DUMP_FILE=…` dumps raw inbound bodies and was
+  what settled the signed `ChunkPos`: the wire has zigzag varints there, and reading them
+  as plain varints mapped negative chunks onto positive odd numbers (which the old code
+  did, and `ctx.chunks` only looked right because the sections were filed by the request's
+  coordinates). `HZ_CHUNK_TRACE=1` prints the per-column trace (`chunk recv`/`chunk req`/
+  `chunk emit`/`subchunk`/`chunks columns=…` with `inflight`, `ready` and the granted
+  radius).
 
 ## 14. Debts and risks
 
