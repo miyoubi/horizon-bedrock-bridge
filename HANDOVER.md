@@ -810,6 +810,46 @@ the server's position, so a long drift in water would be visible *to others* as 
 offset; if that ever matters, the offset should be capped tighter rather than applied to the
 camera.
 
+### Movement: measured, and what is actually left
+
+Thirty seconds of logging (client position, the position we reported, the carried correction
+and the correction count, sprint-jumping through water) settled this:
+
+- corrections arrive **repeatedly and large**: offsets of 1.0–2.2 blocks, several a second,
+  while a plain walk and a sprint-jump on dry ground draw **none**;
+- the server keeps its own simulation position: with corrections ignored, `/tp @s ~ ~ ~`
+  afterwards moved the client from **-201.27 to -198.96**, i.e. the server was 2.3 blocks
+  away from where the client stood. Ignoring a correction does not remove the drift, it
+  only postpones the moment it is shown;
+- applying it whole is a teleport; applying the rebased offset at 0.1 blocks a tick is a
+  visible float; at 0.02 blocks a tick the backlog grows to its 4-block clamp because
+  corrections arrive faster than they are paid off.
+
+So the drift is **not** bookkeeping — it is Java's movement physics disagreeing with
+Bedrock's, mostly in water and on sprint-jumps. No amount of correction handling can hide
+that without either moving the camera or letting the two simulations diverge.
+
+**The fix is the one the player suggested: adapt the movement to Bedrock's model.** Concretely:
+
+1. Port Bedrock's player-movement integrator (the rules are in `bedrock-protocol-docs`
+   `PlayerMovementOverview.md`, and in Pumpkin's `living_entity`/`player` movement code):
+   ground friction 0.6 and the 0.91 factors, the air factor, the sprint-jump boost, water
+   drag and buoyancy, ladder speed, and the `move_vec` → world-space conversion with yaw.
+2. Feed it the same keys the game uses (`PlayerInput` flags we already receive) plus the
+   block/fluid state under the player. That state is on the network thread in `ctx.chunks`
+   (block state and water are already available there), but the input tick runs on the game
+   thread through `serverbound`, so a small cached column region around the player has to be
+   shared between them.
+3. Compare the integrator's next position with the client's, and use the difference as a
+   small *velocity* correction each tick (a PlayerPosition by that frame's difference, not
+   the accumulated error). Once the integrator is close, the server's corrections stop
+   arriving at all — that is the only end state where nothing is ever visible.
+
+Until that exists, the committed behaviour is `Make a movement resync invisible`: the
+correction is folded into the position the bridge *reports* and marked down 2% a tick, so
+the camera never moves; the server's model converges on its own simulation and the client's
+screen is untouched. It is the least-visible of the options, not a cure.
+
 ## 14. Debts and risks
 
 - The GitHub token used for pushes was pasted in plaintext and is still valid — **rotate
