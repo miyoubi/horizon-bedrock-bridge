@@ -569,11 +569,11 @@ content and some addon behaviour will be approximations.
      Re-add it (or the `NETHER_DUMP` dump) to settle a slot question against a live server.
 2. Add chunk-quality trace fields and finish remaining Bedrock definition ports
 
-   - `LevelChunk` stays short; log its subchunk count. The 1.26.60 `LevelChunk` packet has `sub_chunk_count` (`0` here, real payloads of the client's `10`–`13` columns), so nothing arrives inline and every column depends on its `SubChunk` replies (results `1` success, `2` empty, `6` out of range, `8` beyond height).
-   - Distinguish requested vs received section counts: the old bridge emitted a column after every individual section arrival, so a column changed shape many times (`1` section, then `2`, …) and the client spent its time re-`unpack`-ing and re-lighting partial columns before they filled. Buffer per column and emit once when it is complete; the outstanding bounded work is logging `sub_chunk_count` alongside it.
-   - Keep the SubChunk replies three-part state machine out of the bridge file and keep draining the session pump bounded so ICE consent cannot lapse.
-   - Extend the `NetID` log handling to Bedrock and bedrock definitions.
-   - Remove the inventory items remains, which are temporary testing fields that can provide information for the continued Bridges API and ultimately for tracking and resolving the issues encountered.
+    - `LevelChunk` stays short; log its subchunk count. The 1.26.60 `LevelChunk` packet has `sub_chunk_count` (`0` here, real payloads of the client's `10`–`13` columns), so nothing arrives inline and every column depends on its `SubChunk` replies (results `1` success, `2` empty, `6` out of range, `8` beyond height).
+    - Distinguish requested vs received section counts: the old bridge emitted a column after every individual section arrival, so a column changed shape many times (`1` section, then `2`, …) and the client spent its time re-`unpack`-ing and re-lighting partial columns before they filled. Buffer per column and emit once when it is complete; the outstanding bounded work is logging `sub_chunk_count` alongside it.
+    - Keep the SubChunk replies three-part state machine out of the bridge file and keep draining the session pump bounded so ICE consent cannot lapse.
+    - Extend the `NetID` log handling to Bedrock and bedrock definitions.
+    - Remove the inventory items remains, which are temporary testing fields that can provide information for the continued Bridges API and ultimately for tracking and resolving the issues encountered.
 
 3. Repeat the initial connection with `HZ_INV_TRACE=1 HZ_ENT_TRACE=1` and verify whether the remaining terrain and outside chunks arrive; once they do, wire in predicate lighting following the Bedrock definitions. Two open items hang off this path: the death animation for hostile mobs, regular mobs and players (`EntityEvent(3)` and `HZ_ENT_TRACE=1 DEATH/REMOVE` have never been captured — needs a live kill), and the used-up-block consumption path (`ItemUseOnBlock` not decrementing server-side). Do not start new work unprompted.
 
@@ -594,6 +594,40 @@ at a 32-radius circle load time is the expected remaining cost rather than a har
 
 Unpushed at this point: `75b20e1` (code), `4188e4d`, `aba5475`, `ece7b66`, `be626df`
 and this handover. `main` is otherwise at `origin/main` (`d6d5a25`) apart from those.
+
+### Current task — render chunk distance
+
+- **Objective:** make the render chunk distance match the setting the Horizon/bridge
+  client already has, and make a higher render distance actually work. This is the
+  active task; inventory work is held until this path is stable, unless the user asks
+  for inventory explicitly.
+- **Acceptance:** with the render distance set in Horizon/bridge to the granted radius
+  (`32` on the local BDS), the visible terrain must fill out to that radius rather
+  than stopping around `4`–`8`. New chunks must load without stalling, and a teleport
+  must request the chunks around the destination instead of refusing to load them.
+- **Suspects:**
+  - `emit_column` still emits every `SubChunk` section arrival (one `LevelChunkWithLight`
+    per section, with `reach` re-emitting neighbors), so each column changes shape
+    (`1` section, then `2`, …) and the client spends time re-unpacking and re-lighting
+    partial columns. Buffer per column and emit once when complete, and log
+    `sub_chunk_count`, `request_limit`, and the received-vs-expected section count so a
+    column whose `SubChunk` replies are dropped (results `2` empty, `6` out of range,
+    `8` beyond height) is visible in the trace instead of being invisible.
+  - The translate loop drains only `4` packets per iteration (`12` with a backlog), so
+    at a `32`-radius circle a teleport is throttled by the drain rate rather than by the
+    server. A teleport must bias the drain toward the new center's columns and cancel
+    the old `wanted` queue instead of letting stale columns block the new arrival.
+  - `NetworkChunkPublisherUpdate` only retains columns inside the circle (`r = granted`,
+    `dx² + dz² <= r²`), not a square; verify that the circle does not clip the corners
+    the renderer expects and that a teleport re-centers immediately rather than waiting
+    for the next publisher update that happens to land on a chunk boundary.
+- **Health checks before touching code:** confirm `recv ChunkRadiusUpdated(32)` appears
+  after each (re)connect, confirm the old `8`-column clamp and the `512` publisher
+  value are not used as a chunk radius anywhere in `session.rs`, and confirm `Login`
+  and `SetChunkCacheRadius` both carry the granted value, then read the
+  `LevelChunk`/`SubChunk` traces with `HZ_INV_TRACE=1 HZ_ENT_TRACE=1` for the teleport
+  case above. Only then make the bounded change and rebuild/launch with the rules
+  below.
 
 ---
 
