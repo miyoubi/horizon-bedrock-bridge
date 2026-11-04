@@ -3487,21 +3487,46 @@ mod translate {
                     }]
                 }
             }
-            // Dragging: each slot the drag passes over gives one item to the
-            // cursor, and the release leaves them there.
+            // Dragging: a left drag takes one item from each slot it crosses to
+            // the cursor, a right drag leaves one from the cursor in each slot.
+            // The start and end clicks (buttons 0/4 and 2/6) move nothing.
             5 => {
                 let Some(clicked) = clicked else {
                     return Vec::new();
                 };
-                let add = c.button == 1 || c.button == 5;
-                if !add {
-                    return Vec::new();
+                match c.button {
+                    // Left drag, a slot crossed: one item to the cursor.
+                    1 => {
+                        if item_at(bridge, clicked.container.name, clicked.slot).is_none() {
+                            return Vec::new();
+                        }
+                        vec![bp::StackAction::Take {
+                            count: 1,
+                            source: clicked,
+                            destination: cursor,
+                        }]
+                    }
+                    // Right drag, a slot crossed: one item from the cursor. An
+                    // empty slot is a valid target here.
+                    5 => {
+                        let held = *bridge.cursor.lock().unwrap();
+                        let Some(holding) = held else {
+                            return Vec::new();
+                        };
+                        let here = item_at(bridge, clicked.container.name, clicked.slot);
+                        match here {
+                            Some(existing) if existing.runtime_id != holding.runtime_id => {
+                                Vec::new()
+                            }
+                            _ => vec![bp::StackAction::Place {
+                                count: 1,
+                                source: cursor,
+                                destination: clicked,
+                            }],
+                        }
+                    }
+                    _ => Vec::new(),
                 }
-                vec![bp::StackAction::Take {
-                    count: 1,
-                    source: clicked,
-                    destination: cursor,
-                }]
             }
             // Double-click: collect the stacks that match what is on the
             // cursor, one slot at a time.
