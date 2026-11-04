@@ -1517,8 +1517,11 @@ mod translate {
                         hardcore: false,
                         levels: vec!["minecraft:overworld".into()],
                         max_players: 100,
-                        chunk_radius: 8,
-                        simulation_distance: 8,
+                        // What the session asked the server for: the game sizes
+                        // its chunk cache from this, so a fixed small value
+                        // caps the world however much the server sends.
+                        chunk_radius: bridge.chunk_radius.load(Ordering::Relaxed),
+                        simulation_distance: bridge.chunk_radius.load(Ordering::Relaxed),
                         reduced_debug_info: false,
                         show_death_screen: true,
                         limited_crafting: false,
@@ -2523,6 +2526,18 @@ mod translate {
                         // ADD_PLAYER, UPDATE_LISTED, UPDATE_LATENCY.
                         actions: 0b0001_1001,
                         entries,
+                    }),
+                ))]
+            }
+            // The server's answer to the chunk-radius request: the game keeps
+            // only that far and drops anything past it, so the grant is passed
+            // on as the cache radius.
+            bp::Packet::ChunkRadiusUpdated(radius) => {
+                let radius = *radius;
+                bridge.chunk_radius.store(radius.max(2), Ordering::Relaxed);
+                vec![Event::Packet(Box::new(
+                    play::Clientbound::SetChunkCacheRadius(play::Distance {
+                        distance: radius.max(2),
                     }),
                 ))]
             }
