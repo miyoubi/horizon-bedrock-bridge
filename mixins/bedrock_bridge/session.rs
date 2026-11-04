@@ -5603,6 +5603,26 @@ mod translate {
                             position: pos,
                         }];
                     }
+                    // RELEASE_USE_ITEM: the use has ended (food, a bow, a
+                    // shield). Bedrock ends it with an item-release
+                    // transaction, and without one the server keeps the item
+                    // in use: the arm stays out and the shield stays up.
+                    6 => {
+                        let pos = *bridge.position.lock().unwrap();
+                        let item = held_item(bridge);
+                        bedrock_core::nethernet::trace(format!(
+                            "RELEASE use slot={} item={item:?}",
+                            bridge.hotbar.load(Ordering::Relaxed)
+                        ));
+                        return vec![bp::Out::ItemUseRelease {
+                            // `ItemReleaseActionType::Release`; the server decides
+                            // from the ticks whether a consumable was finished.
+                            action: 0,
+                            hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                            item,
+                            position: pos,
+                        }];
+                    }
                     _ => return Vec::new(),
                 };
                 bridge.actions.lock().unwrap().push(bp::BlockAction {

@@ -296,6 +296,16 @@ pub enum Out {
         window_id: u8,
         window_type: u8,
     },
+    /// Ending an item use: an `ItemReleaseTransaction`. `action` is the
+    /// `ItemReleaseActionType` (0 release, 1 use/consume). Without it the server
+    /// keeps the use running, which is what left a bow drawn, a shield raised
+    /// and food being eaten forever.
+    ItemUseRelease {
+        action: i32,
+        hotbar_slot: i32,
+        item: Option<ItemDescriptor>,
+        position: [f32; 3],
+    },
     /// Dropping an item: an `ItemStackRequest` with a drop action, which is how
     /// a current client drops (there is no drop flag on an inventory source).
     ItemRelease {
@@ -1075,6 +1085,26 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.u8(*window_id);
             w.u8(*window_type);
             w.bool(false); // not server initiated
+        }
+        Out::ItemUseRelease {
+            action,
+            hotbar_slot,
+            item,
+            position,
+        } => {
+            // `ItemReleaseTransaction`: the release action, the slot it was
+            // used from, the item and where the player's head was.
+            w.varint(ids::INVENTORY_TRANSACTION);
+            w.varint(0); // legacy request id
+            w.bool(false); // no legacy data
+            w.varint(4); // ItemReleaseTransaction
+            w.zigzag32(*action);
+            w.zigzag32(*hotbar_slot);
+            write_item(&mut w, *item);
+            w.f32(position[0]);
+            w.f32(position[1]);
+            w.f32(position[2]);
+            w.u8(0); // hand: main
         }
         Out::ItemRelease {
             slot,
