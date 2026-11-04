@@ -160,7 +160,8 @@ pub enum Packet {
     PlaySound,
     LevelSoundEvent,
     BossEvent,
-    AvailableCommands,
+    /// The command tree (76).
+    AvailableCommands(AvailableCommands),
     /// The result of a `CommandRequest` (79).
     CommandOutput(CommandOutput),
     /// An actor state change. Death (3) and instant death (61) mean the entity
@@ -533,7 +534,9 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::PLAY_SOUND => Packet::PlaySound,
         ids::LEVEL_SOUND_EVENT => Packet::LevelSoundEvent,
         ids::BOSS_EVENT => Packet::BossEvent,
-        ids::AVAILABLE_COMMANDS => Packet::AvailableCommands,
+        ids::AVAILABLE_COMMANDS => {
+            Packet::AvailableCommands(AvailableCommands::read(&mut r)?)
+        }
         ids::COMMAND_OUTPUT => Packet::CommandOutput(CommandOutput::read(&mut r)?),
         ids::UPDATE_PLAYER_GAME_TYPE => {
             // UpdatePlayerGameType: gamemode varint, then the player's runtime id.

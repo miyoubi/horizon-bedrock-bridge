@@ -1639,3 +1639,185 @@ fn output_type_name(name: &str) -> Result<i32> {
     })
 }
 
+
+/// One command's enum: a name (also its type, e.g. `Boolean`, `BlockPos`) and
+/// the indices into `AvailableCommands::enum_values` that are its members.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandEnum {
+    pub name: String,
+    pub values: Vec<u32>,
+}
+
+/// One parameter of a command overload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandParam {
+    pub name: String,
+    /// Bitfield: `0x100000` valid type, `0x200000` enum index, `0x4000000`
+    /// soft enum, `0x1000000` postfix; the low 20 bits are the type id or the
+    /// index. Without the valid bit the symbol indexes `enum_values` and is a
+    /// literal subcommand.
+    pub symbol: u32,
+    pub optional: bool,
+}
+
+/// One command the server offers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandData {
+    pub name: String,
+    pub description: String,
+    pub flags: u16,
+    /// `CommandPermissionLevel` as the server spells it (`any`,
+    /// `gamedirectors`, `admin`, `host`, `owner`, `custom`).
+    pub permission: String,
+    /// Index into `enums` naming this command's aliases, or -1.
+    pub alias: i32,
+    pub overloads: Vec<Vec<CommandParam>>,
+}
+
+/// `AvailableCommands` (76): the command tree the server offers. Read in the
+/// order the server writes it: enum values, chained values, postfixes, enums,
+/// chained subcommands, commands, soft enums, constraints. Only the parts the
+/// client can use are kept, but the whole payload is consumed so a large packet
+/// does not leave the batch half-read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AvailableCommands {
+    pub enum_values: Vec<String>,
+    pub chained_values: Vec<String>,
+    pub postfixes: Vec<String>,
+    pub enums: Vec<CommandEnum>,
+    pub commands: Vec<CommandData>,
+    pub soft_enums: Vec<CommandEnum>,
+}
+
+/// Marks a parameter symbol as a type (rather than a literal subcommand).
+pub const ARG_FLAG_VALID: u32 = 0x10_0000;
+/// The type is an index into `AvailableCommands::enums`.
+pub const ARG_FLAG_ENUM: u32 = 0x20_0000;
+/// The type is a fixed postfix from `postfixes`.
+pub const ARG_FLAG_POSTFIX: u32 = 0x100_0000;
+/// The type is a soft (dynamic) enum.
+pub const ARG_FLAG_SOFT_ENUM: u32 = 0x400_0000;
+
+impl AvailableCommands {
+    pub fn read(r: &mut Reader) -> Result<AvailableCommands> {
+        fn strings(r: &mut Reader) -> Result<Vec<String>> {
+            let n = r.varint()?.min(65536);
+            let mut out = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                out.push(r.string()?);
+            }
+            Ok(out)
+        }
+        // A count that cannot be right means the packet is not the shape this
+        // reader knows; bail out instead of allocating for it.
+        fn count(r: &mut Reader, max: u32) -> Result<usize> {
+            let n = r.varint()?;
+            if n > max {
+                return Err(crate::error::Error::decode("available commands count"));
+            }
+            Ok(n as usize)
+        }
+        let enum_values = strings(r)?;
+        let chained_values = strings(r)?;
+        let postfixes = strings(r)?;
+        let mut enums = Vec::new();
+        for _ in 0..count(r, 4096)? {
+            let name = r.string()?;
+            let n = count(r, 65536)?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                values.push(r.i32()? as u32);
+            }
+            enums.push(CommandEnum { name, values });
+        }
+        for _ in 0..count(r, 256)? {
+            let _name = r.string()?;
+            let n = count(r, 4096)?;
+            for _ in 0..n {
+                let _ = r.varint()?; // index into chained values
+                let _ = r.varint()?; // the option's type
+            }
+        }
+        let mut commands = Vec::new();
+        for _ in 0..count(r, 4096)? {
+            let name = r.string()?;
+            let description = r.string()?;
+            let flags = r.u16()?;
+            // The permission level is an enum written as its name.
+            let permission = r.string()?;
+            let alias = r.i32()?;
+            let chained = count(r, 4096)?;
+            for _ in 0..chained {
+                let _ = r.i32()?;
+            }
+            let mut overloads = Vec::new();
+            for _ in 0..count(r, 256)? {
+                let _chaining = r.u8()?;
+                let mut params = Vec::new();
+                for _ in 0..count(r, 256)? {
+                    let name = r.string()?;
+                    let symbol = r.i32()? as u32;
+                    let optional = r.u8()? != 0;
+                    let _options = r.u8()?;
+                    params.push(CommandParam {
+                        name,
+                        symbol,
+                        optional,
+                    });
+                }
+                overloads.push(params);
+            }
+            commands.push(CommandData {
+                name,
+                description,
+                flags,
+                permission,
+                alias,
+                overloads,
+            });
+        }
+        let mut soft_enums = Vec::new();
+        for _ in 0..count(r, 4096)? {
+            let name = r.string()?;
+            let options = strings(r)?;
+            soft_enums.push(CommandEnum {
+                name,
+                values: Vec::new(),
+            });
+            // The options themselves are not needed, and `strings` consumed
+            // them; keep the count honest for the trace.
+            let _ = options;
+        }
+        // Constraints follow, but the packet is delimited, so they are not read.
+        Ok(AvailableCommands {
+            enum_values,
+            chained_values,
+            postfixes,
+            enums,
+            commands,
+            soft_enums,
+        })
+    }
+
+    /// A parameter's type: the enum's name when the symbol names one, else the
+    /// built-in type id.
+    pub fn param_type(&self, symbol: u32) -> Option<&str> {
+        if symbol & ARG_FLAG_VALID == 0 {
+            return None;
+        }
+        if symbol & ARG_FLAG_ENUM != 0 {
+            let index = (symbol & 0x0f_ffff) as usize;
+            return self.enums.get(index).map(|e| e.name.as_str());
+        }
+        None
+    }
+
+    /// The literal a parameter stands for, when it is a subcommand rather than
+    /// a value.
+    pub fn param_literal(&self, symbol: u32) -> Option<&str> {
+        if symbol & ARG_FLAG_VALID != 0 {
+            return None;
+        }
+        self.enum_values.get(symbol as usize).map(String::as_str)
+    }
+}

@@ -1619,6 +1619,165 @@ mod translate {
         }
     }
 
+    /// The Java command tree for the server's list: a root whose children are
+    /// the command names (and their aliases), and under each a chain of
+    /// literal subcommands and typed arguments, one chain per overload. Chains
+    /// that share a prefix share nodes, and a node is executable where a
+    /// command could end — at the end of an overload and before an optional
+    /// parameter.
+    fn command_tree(commands: &bp::AvailableCommands) -> play::Commands {
+        fn literal(name: &str) -> play::CommandNode {
+            play::CommandNode {
+                kind: 1,
+                executable: false,
+                restricted: false,
+                children: Vec::new(),
+                redirect: None,
+                name: name.to_owned(),
+                parser: None,
+                suggestions: None,
+            }
+        }
+        /// The Java argument type and its property bytes for a Bedrock
+        /// parameter, by the enum's name or by the built-in type id.
+        fn parser(kind: Option<&str>, symbol: u32) -> (i32, Vec<u8>) {
+            // Java's `minecraft:command_argument_type` ids, by name.
+            let id = |name: &str| {
+                play::ARGUMENT_TYPES
+                    .iter()
+                    .position(|n| *n == name)
+                    .map_or(5, |i| i as i32)
+            };
+            match kind {
+                Some("Boolean") => (id("brigadier:bool"), Vec::new()),
+                Some("Float") => (id("brigadier:float"), vec![0]),
+                Some("GameMode") => (id("minecraft:gamemode"), Vec::new()),
+                Some("Item") => (id("minecraft:item_stack"), Vec::new()),
+                Some("Dimension") => (id("minecraft:dimension"), Vec::new()),
+                Some("BlockPos") | Some("Position") => (id("minecraft:block_pos"), Vec::new()),
+                Some("Target") | Some("Entity") | Some("Selector") | Some("EntityTypeSelector") => {
+                    (id("minecraft:entity"), vec![0])
+                }
+                Some("Message") | Some("Json") => (id("minecraft:message"), Vec::new()),
+                Some("Time") => (id("minecraft:time"), vec![0; 4]),
+                // Everything else, and the numeric built-ins, behave like an
+                // integer or a single word.
+                _ => match symbol & 0x0f_ffff {
+                    1 | 5 => (id("brigadier:integer"), vec![0]),
+                    3 => (id("brigadier:float"), vec![0]),
+                    0x0f | 0x33 => (id("brigadier:string"), vec![2]), // greedy
+                    _ => (id("brigadier:string"), vec![0]),
+                },
+            }
+        }
+        let mut nodes: Vec<play::CommandNode> = Vec::new();
+        // Index 0 is the root; every command name hangs off it.
+        nodes.push(play::CommandNode {
+            kind: 0,
+            executable: false,
+            restricted: false,
+            children: Vec::new(),
+            redirect: None,
+            name: String::new(),
+            parser: None,
+            suggestions: None,
+        });
+        let mut root_children: Vec<i32> = Vec::new();
+
+        /// The child of `from` with the same name and parser, or a new one.
+        fn child(
+            nodes: &mut Vec<play::CommandNode>,
+            from: i32,
+            node: play::CommandNode,
+        ) -> i32 {
+            if let Some(existing) = nodes[from as usize]
+                .children
+                .iter()
+                .find(|c| {
+                    let n = &nodes[**c as usize];
+                    n.kind == node.kind && n.name == node.name && n.parser.as_ref().map(|p| p.0) == node.parser.as_ref().map(|p| p.0)
+                })
+                .copied()
+            {
+                return existing;
+            }
+            let index = nodes.len() as i32;
+            nodes.push(node);
+            nodes[from as usize].children.push(index);
+            index
+        }
+
+        for command in &commands.commands {
+            // The command's own subtree: one chain per overload, merged where
+            // they share a prefix.
+            let mut children: Vec<i32> = Vec::new();
+            let mut entries: Vec<Vec<play::CommandNode>> = Vec::new();
+            let _ = &mut entries;
+            // Temporarily attach to a scratch node so the shared `child`
+            // helper can build the chains, then move its children onto the
+            // command's literal node.
+            let scratch = nodes.len() as i32;
+            nodes.push(literal(&command.name));
+            for overload in &command.overloads {
+                let mut from = scratch;
+                for (index, param) in overload.iter().enumerate() {
+                    if param.optional {
+                        nodes[from as usize].executable = true;
+                    }
+                    let node = match commands.param_literal(param.symbol) {
+                        Some(value) => literal(value),
+                        None => {
+                            let kind = commands.param_type(param.symbol);
+                            let (id, props) = parser(kind, param.symbol);
+                            play::CommandNode {
+                                kind: 2,
+                                executable: false,
+                                restricted: false,
+                                children: Vec::new(),
+                                redirect: None,
+                                name: param.name.clone(),
+                                parser: Some((id, props)),
+                                suggestions: None,
+                            }
+                        }
+                    };
+                    from = child(&mut nodes, from, node);
+                    if index + 1 == overload.len() {
+                        nodes[from as usize].executable = true;
+                    }
+                }
+                if overload.is_empty() {
+                    nodes[scratch as usize].executable = true;
+                }
+            }
+            children.extend(nodes[scratch as usize].children.clone());
+            // The scratch holds the subtree; the real literal reuses it.
+            nodes[scratch as usize].children = Vec::new();
+            let index = child(&mut nodes, 0, literal(&command.name));
+            nodes[index as usize].children = children;
+            nodes[index as usize].executable = nodes[scratch as usize].executable;
+            root_children.push(index);
+            // Aliases share the subtree.
+            if let Ok(alias) = usize::try_from(command.alias)
+                && let Some(alias_enum) = commands.enums.get(alias)
+            {
+                for value in &alias_enum.values {
+                    let Some(name) = commands.enum_values.get(*value as usize) else {
+                        continue;
+                    };
+                    let index = child(&mut nodes, 0, literal(name));
+                    nodes[index as usize].children = nodes[root_children[root_children.len() - 1] as usize]
+                        .children
+                        .clone();
+                    nodes[index as usize].executable =
+                        nodes[root_children[root_children.len() - 1] as usize].executable;
+                }
+            }
+        }
+        nodes[0].children = root_children;
+        play::Commands { nodes, root: 0 }
+    }
+
     /// One `CommandOutput` message as chat lines. BDS prefixes the key with a
     /// colour code and a `%` (`"§2%commands.help.header"`), so the code is kept,
     /// the key is looked up in the game's language table and the values the
@@ -2390,6 +2549,22 @@ mod translate {
                     .iter()
                     .flat_map(command_lines)
                     .collect()
+            }
+            // The server's command list: the game's command tree, so `/` lists
+            // the commands, tab-completion works and an unknown command gets
+            // the game's own "did you mean" suggestion.
+            bp::Packet::AvailableCommands(commands) => {
+                if chunk_trace() {
+                    bedrock_core::nethernet::trace(format!(
+                        "commands: {} offered, {} enums, {} soft",
+                        commands.commands.len(),
+                        commands.enums.len(),
+                        commands.soft_enums.len()
+                    ));
+                }
+                vec![Event::Packet(Box::new(play::Clientbound::Commands(
+                    command_tree(commands),
+                )))]
             }
             bp::Packet::SetDifficulty(difficulty) => vec![Event::Packet(Box::new(
                 play::Clientbound::ChangeDifficulty(play::ChangeDifficulty {
