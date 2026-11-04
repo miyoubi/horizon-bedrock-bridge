@@ -62,6 +62,7 @@ pub const GAME_RULES_CHANGED: u32 = 0x48;
 pub const BOSS_EVENT: u32 = 0x4a;
 pub const AVAILABLE_COMMANDS: u32 = 0x4c;
 pub const COMMAND_REQUEST: u32 = 0x4d;
+pub const COMMAND_OUTPUT: u32 = 0x4f;
 pub const PLAY_SOUND: u32 = 0x56;
 pub const SET_TITLE: u32 = 0x58;
 pub const PLAYER_SKIN: u32 = 0x5d;

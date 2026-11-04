@@ -116,6 +116,15 @@ fn store_effective_radius(bridge: &Bridge) -> i32 {
     radius
 }
 
+/// Whether commands are sent in the schema's numeric origin/version form. A
+/// live BDS answers a `player`/`latest` string origin and refuses the numeric
+/// one (it reads the request as a huge command), so the string form is the
+/// default and `HZ_CMD_NUMERIC=1` selects the other.
+fn command_numeric_layout() -> bool {
+    static NUMERIC: OnceLock<bool> = OnceLock::new();
+    *NUMERIC.get_or_init(|| std::env::var_os("HZ_CMD_NUMERIC").is_some())
+}
+
 /// Whether `address` names a Bedrock server rather than a Java one.
 pub fn is_bedrock(address: &str) -> bool {
     address.starts_with(PREFIX) || address.starts_with(RAKNET_PREFIX)
@@ -187,6 +196,9 @@ struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
+    /// The player's unique id as `StartGame` reported it, which a command
+    /// origin carries.
+    unique_id: AtomicI64,
     /// The chunk radius this session streams: the smaller of the game's
     /// render-distance setting and the server's grant. Login and
     /// `SetChunkCacheRadius` both carry it, and it bounds the columns the
@@ -446,6 +458,7 @@ pub fn try_connect(
     let bridge = Arc::new(Bridge {
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
+        unique_id: AtomicI64::new(0),
         chunk_radius: AtomicI32::new(
             i32::from(view_distance).max(2).min(BEDROCK_MAX_RADIUS),
         ),
@@ -826,6 +839,9 @@ fn run(
                 bridge
                     .runtime_id
                     .store(g.entity_runtime_id as i64, Ordering::Relaxed);
+                bridge
+                    .unique_id
+                    .store(g.entity_unique_id, Ordering::Relaxed);
                 // Ask for what the game's setting wants; the grant decides what
                 // is actually streamed (and `ChunkRadiusUpdated` reports it).
                 let _ = client.request_chunks(
@@ -1593,6 +1609,48 @@ mod translate {
         }
     }
 
+    /// One `CommandOutput` message as chat lines. BDS prefixes the key with a
+    /// colour code and a `%` (`"§2%commands.help.header"`), so the code is kept,
+    /// the key is looked up in the game's language table and the values the
+    /// message carries are substituted in. A single message can hold several
+    /// lines (the help body does).
+    fn command_lines(message: &bp::CommandMessage) -> Vec<Event> {
+        let (colour, rest) = match message.message.strip_prefix('§') {
+            Some(tail) => {
+                let split = tail.char_indices().nth(1).map_or(tail.len(), |(i, _)| i);
+                let (code, rest) = tail.split_at(split);
+                (format!("§{code}"), rest)
+            }
+            None => (String::new(), message.message.as_str()),
+        };
+        let key = rest.strip_prefix('%').unwrap_or(rest);
+        let mut text = if key.contains('.') {
+            crate::lang::get_or(key, key)
+        } else {
+            key.to_owned()
+        };
+        for (index, value) in message.parameters.iter().enumerate() {
+            let exact = format!("%{}$s", index + 1);
+            if text.contains(&exact) {
+                text = text.replace(&exact, value);
+            } else if text.contains("%s") {
+                text = text.replacen("%s", value, 1);
+            } else {
+                text.push(' ');
+                text.push_str(value);
+            }
+        }
+        format!("{colour}{text}")
+            .split('\n')
+            .map(|line| {
+                Event::Packet(Box::new(play::Clientbound::SystemChat(play::SystemChat {
+                    content: text_component(line.trim_end()),
+                    overlay: false,
+                })))
+            })
+            .collect()
+    }
+
     fn text_component(message: &str) -> JTag {
         JTag::compound([("text", JTag::String(JavaString::from(message)))])
     }
@@ -2300,6 +2358,28 @@ mod translate {
                         overlay: false,
                     },
                 )))]
+            }
+            // What a command printed, or why it was refused. Bedrock names a
+            // translation key and passes the values separately; the game's own
+            // table is Java's, so the key is looked up and the values are
+            // appended, the same way chat parameters are.
+            bp::Packet::CommandOutput(output) => {
+                if std::env::var_os("HZ_CMD_TRACE").is_some() {
+                    bedrock_core::nethernet::trace(format!(
+                        "command output success={} messages={:?}",
+                        output.success_count,
+                        output
+                            .messages
+                            .iter()
+                            .map(|m| (m.message.as_str(), m.parameters.len()))
+                            .collect::<Vec<_>>()
+                    ));
+                }
+                output
+                    .messages
+                    .iter()
+                    .flat_map(command_lines)
+                    .collect()
             }
             bp::Packet::SetDifficulty(difficulty) => vec![Event::Packet(Box::new(
                 play::Clientbound::ChangeDifficulty(play::ChangeDifficulty {
@@ -5347,11 +5427,23 @@ mod translate {
                 source: String::new(),
                 message: c.message.clone(),
             }],
-            play::Serverbound::ChatCommand(c) => vec![bp::Out::Text {
-                kind: 1,
-                source: String::new(),
-                message: format!("/{}", c.command),
-            }],
+            // A typed command is a `CommandRequest`, not chat: the server does
+            // not parse a leading slash out of a `Text` packet.
+            play::Serverbound::ChatCommand(c) => {
+                if std::env::var_os("HZ_CMD_TRACE").is_some() {
+                    bedrock_core::nethernet::trace(format!(
+                        "SEND command request: /{} player={}",
+                        c.command,
+                        bridge.unique_id.load(Ordering::Relaxed)
+                    ));
+                }
+                vec![bp::Out::CommandRequest {
+                    command: format!("/{}", c.command),
+                    player_id: bridge.unique_id.load(Ordering::Relaxed),
+                    numeric: super::command_numeric_layout(),
+                    uuid: None,
+                }]
+            }
             _ => Vec::new(),
         }
     }

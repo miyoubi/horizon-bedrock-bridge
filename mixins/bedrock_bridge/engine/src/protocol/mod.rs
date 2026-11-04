@@ -13,6 +13,32 @@ pub use packets::*;
 use crate::error::Result;
 use crate::stream::{Reader, Writer};
 
+/// `CurrentCmdVersion::Latest` for 1.26.60: the command syntax revision a
+/// `CommandRequest` is parsed with.
+const COMMAND_VERSION_LATEST: i32 = 55;
+
+/// A fresh instance UUID for a command, which the server echoes back in the
+/// output. Not cryptographic: it only has to be unique per request.
+fn command_uuid() -> [u8; 16] {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut state = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let mut out = [0u8; 16];
+    for word in out.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        word.copy_from_slice(&state.to_le_bytes());
+    }
+    // Version 4 (random) and the RFC 4122 variant, as a uuid should be.
+    out[6] = (out[6] & 0x0f) | 0x40;
+    out[8] = (out[8] & 0x3f) | 0x80;
+    out
+}
+
 /// A decoded server→client packet. Unmodelled packets keep their raw bytes.
 #[derive(Clone, Debug)]
 pub enum Packet {
@@ -135,6 +161,8 @@ pub enum Packet {
     LevelSoundEvent,
     BossEvent,
     AvailableCommands,
+    /// The result of a `CommandRequest` (79).
+    CommandOutput(CommandOutput),
     /// An actor state change. Death (3) and instant death (61) mean the entity
     /// is gone, whether or not the server removes it afterwards.
     ActorEvent {
@@ -291,6 +319,17 @@ pub enum Out {
         kind: u8,
         source: String,
         message: String,
+    },
+    /// `CommandRequest` (77): a command the player typed, as `/name args`.
+    /// `player_id` is the player's unique id (the origin's), and `numeric`
+    /// picks the schema-wide numeric origin/version form; the name form is what
+    /// a live BDS accepts.
+    CommandRequest {
+        command: String,
+        player_id: i64,
+        numeric: bool,
+        /// The origin's instance uuid; a fresh one when absent.
+        uuid: Option<[u8; 16]>,
     },
     Animate {
         runtime_id: u64,
@@ -495,6 +534,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::LEVEL_SOUND_EVENT => Packet::LevelSoundEvent,
         ids::BOSS_EVENT => Packet::BossEvent,
         ids::AVAILABLE_COMMANDS => Packet::AvailableCommands,
+        ids::COMMAND_OUTPUT => Packet::CommandOutput(CommandOutput::read(&mut r)?),
         ids::UPDATE_PLAYER_GAME_TYPE => {
             // UpdatePlayerGameType: gamemode varint, then the player's runtime id.
             let gamemode = r.zigzag32()?;
@@ -1104,6 +1144,36 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             }
             w.string("").string("");
             w.bool(false);
+        }
+        Out::CommandRequest {
+            command,
+            player_id,
+            numeric,
+            uuid,
+        } => {
+            w.varint(ids::COMMAND_REQUEST);
+            w.string(command);
+            let uuid = uuid.unwrap_or_else(command_uuid);
+            if *numeric {
+                // The schema's form: an origin type byte and the command
+                // version as a `CurrentCmdVersion` number.
+                w.u8(0); // `CommandOriginType::Player`
+                w.bytes(&uuid);
+                w.string(""); // request id
+                w.i64(*player_id);
+                w.bool(false); // not internal
+                w.i32(COMMAND_VERSION_LATEST);
+            } else {
+                // What a live BDS accepts: the origin type by name (`player`)
+                // and the command version as the string the client sends
+                // (`latest`). Both are echoed back the same way.
+                w.string("player");
+                w.bytes(&uuid);
+                w.string("");
+                w.i64(*player_id);
+                w.bool(false);
+                w.string("latest");
+            }
         }
         Out::Animate { runtime_id, action } => {
             // 1.26's Animate: a byte action, the runtime id, a float, then the

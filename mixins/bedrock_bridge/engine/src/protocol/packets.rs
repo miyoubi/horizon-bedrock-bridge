@@ -1493,3 +1493,149 @@ mod tests {
         assert!(r.is_empty(), "STOP_BREAK carries no position or face");
     }
 }
+
+/// One message of a `CommandOutput`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandMessage {
+    /// The command's own verdict for this line (`successful?`).
+    pub success: bool,
+    /// A localisation key, or the text itself when the server sends plain
+    /// words.
+    pub message: String,
+    /// The values the key takes.
+    pub parameters: Vec<String>,
+}
+
+/// `CommandOutput` (79): what a `CommandRequest` produced. The origin the
+/// server echoes back is not needed, but it has to be read past first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandOutput {
+    pub success_count: u32,
+    pub messages: Vec<CommandMessage>,
+}
+
+impl CommandOutput {
+    /// The packet is read by trying the shapes a Bedrock server has used for
+    /// its headers and keeping the one that consumes it exactly: the origin
+    /// type as a name (`player`) or a byte, the output type as a name
+    /// (`alloutput`) or a number, and the success count fixed or varint. BDS
+    /// 1.26.61 sends names for both and a fixed count — captured from a live
+    /// `/help` — while the 1.26.60 schema names numbers.
+    pub fn read(r: &mut Reader) -> Result<CommandOutput> {
+        let start = r.position();
+        for named_origin in [true, false] {
+            for output_header in OutputHeader::ALL {
+                for varint_success in [false, true] {
+                    r.seek(start);
+                    if let Ok(output) = Self::read_with(r, named_origin, output_header, varint_success)
+                    {
+                        return Ok(output);
+                    }
+                }
+            }
+        }
+        r.seek(start);
+        Err(crate::error::Error::decode(
+            "no command output layout fits the packet",
+        ))
+    }
+
+    fn read_with(
+        r: &mut Reader,
+        named_origin: bool,
+        output_header: OutputHeader,
+        varint_success: bool,
+    ) -> Result<CommandOutput> {
+        // `CommandOriginData`: type, instance uuid, request id, unique id.
+        if named_origin {
+            let _ = r.string()?;
+        } else {
+            let kind = r.u8()?;
+            if kind > 0x0f {
+                return Err(crate::error::Error::decode("command origin type"));
+            }
+        }
+        let _ = r.bytes(16)?;
+        let _ = r.string()?;
+        let _ = r.i64()?;
+        let output_type = match output_header {
+            OutputHeader::Name => output_type_name(&r.string()?)?,
+            OutputHeader::Fixed => r.i32()?,
+            OutputHeader::Varint => i32::try_from(r.varint()?).unwrap_or(-1),
+        };
+        if !(0..=4).contains(&output_type) {
+            return Err(crate::error::Error::decode("command output type"));
+        }
+        let success = if varint_success {
+            r.varint()?
+        } else {
+            r.i32()? as u32
+        };
+        let count = r.varint()?;
+        if count > 4096 {
+            return Err(crate::error::Error::decode("command output messages"));
+        }
+        let mut messages = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let message = r.string()?;
+            let success = r.bool()?;
+            let values = r.varint()?;
+            if values > 4096 {
+                return Err(crate::error::Error::decode("command output parameters"));
+            }
+            let mut parameters = Vec::with_capacity(values as usize);
+            for _ in 0..values {
+                parameters.push(r.string()?);
+            }
+            messages.push(CommandMessage {
+                success,
+                message,
+                parameters,
+            });
+        }
+        // `DataSet` output carries the data set's name after the messages.
+        if output_type == 4 && !r.is_empty() {
+            let _ = r.string()?;
+        }
+        // A live BDS leaves one zero byte at the end. Anything that is not
+        // padding means the wrong layout was picked.
+        if r.rest().iter().any(|byte| *byte != 0) {
+            return Err(crate::error::Error::decode(
+                "trailing bytes after the command output",
+            ));
+        }
+        Ok(CommandOutput {
+            success_count: success,
+            messages,
+        })
+    }
+}
+
+/// Where a command packet's output type sits.
+#[derive(Clone, Copy)]
+enum OutputHeader {
+    Name,
+    Fixed,
+    Varint,
+}
+
+impl OutputHeader {
+    const ALL: [OutputHeader; 3] = [
+        OutputHeader::Name,
+        OutputHeader::Fixed,
+        OutputHeader::Varint,
+    ];
+}
+
+/// `CommandOutputType` by its wire name.
+fn output_type_name(name: &str) -> Result<i32> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "none" => 0,
+        "lastoutput" => 1,
+        "silent" => 2,
+        "alloutput" => 3,
+        "dataset" => 4,
+        _ => return Err(crate::error::Error::decode("command output type name")),
+    })
+}
+
