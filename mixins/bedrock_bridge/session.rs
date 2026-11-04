@@ -2824,6 +2824,14 @@ mod translate {
             }
             bp::Packet::InventoryContent(c) if c.window_id == 119 => {
                 let item = c.slots.first();
+                if std::env::var_os("HZ_INV_TRACE").is_some() {
+                    bedrock_core::nethernet::trace(format!(
+                        "off hand container: {:?} -> slot 45 {:?}",
+                        item.map(|i| (i.runtime_id, i.count, i.net_id)),
+                        item.and_then(|i| map_item(ctx, i))
+                            .map(|s| (s.item, s.count)),
+                    ));
+                }
                 *bridge.offhand.lock().unwrap() = item.and_then(|i| descriptor(i));
                 vec![Event::Packet(Box::new(
                     play::Clientbound::ContainerSetSlot(play::ContainerSetSlot {
@@ -3538,10 +3546,18 @@ mod translate {
                     (name, from.slot, (0..w.kind.slots() as u8).collect())
                 }
                 None => match from.container.name {
-                    CONTAINER_COMBINED if from.slot < 9 => (CONTAINER_COMBINED, from.slot, (9..36).collect()),
+                    CONTAINER_COMBINED if from.slot < 9 => {
+                        (CONTAINER_COMBINED, from.slot, (9..36).collect())
+                    }
                     CONTAINER_COMBINED => (CONTAINER_COMBINED, from.slot, (0..9).collect()),
-                    // Armour and the off hand hand their items back.
-                    _ => (CONTAINER_COMBINED, from.slot, (0..36).collect()),
+                    // Armour and the off hand hand their items back, into the
+                    // main inventory before the hotbar -- the order the game
+                    // picks, so both sides name the same slot.
+                    _ => (
+                        CONTAINER_COMBINED,
+                        from.slot,
+                        (9..36).chain(0..9).collect(),
+                    ),
                 },
             }
         };
