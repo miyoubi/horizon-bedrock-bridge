@@ -3545,21 +3545,54 @@ mod translate {
                 let Some(here) = item_at(bridge, clicked.container.name, clicked.slot) else {
                     return Vec::new();
                 };
+                // Pick-all, the way a real client gathers: every stack of the
+                // item the cursor holds (or, with an empty cursor, the clicked
+                // slot's) goes to the cursor until it is a full stack.
                 let held = *bridge.cursor.lock().unwrap();
-                match held {
-                    Some(holding) if holding.runtime_id == here.runtime_id => {
-                        vec![bp::StackAction::Place {
-                            count: holding.count.max(0) as u8,
-                            source: cursor,
-                            destination: clicked,
-                        }]
-                    }
-                    _ => vec![bp::StackAction::Take {
-                        count: here.count.max(0) as u8,
-                        source: clicked,
-                        destination: cursor,
-                    }],
+                let target = held.unwrap_or(here);
+                let mut room = 64i16 - held.map_or(0, |h| h.count.max(0));
+                if room <= 0 {
+                    return Vec::new();
                 }
+                // The clicked slot first, then the player's own slots, then the
+                // open container's.
+                let mut slots: Vec<bp::SlotRef> = vec![clicked];
+                for slot in 0..36u8 {
+                    let at = player_slot_ref(bridge, slot);
+                    if at.container.name != clicked.container.name || at.slot != clicked.slot {
+                        slots.push(at);
+                    }
+                }
+                if let Some(window) = bridge.window.lock().unwrap().as_ref() {
+                    let name = window.name.unwrap_or_default();
+                    for slot in 0..window.kind.slots() as u8 {
+                        slots.push(bp::SlotRef {
+                            container: name,
+                            slot,
+                            stack_id: 0,
+                        });
+                    }
+                }
+                let mut actions = Vec::new();
+                for at in slots {
+                    if room <= 0 {
+                        break;
+                    }
+                    let Some(item) = item_at(bridge, at.container.name, at.slot) else {
+                        continue;
+                    };
+                    if item.runtime_id != target.runtime_id || item.count <= 0 {
+                        continue;
+                    }
+                    let take = item.count.min(room);
+                    room -= take;
+                    actions.push(bp::StackAction::Take {
+                        count: take as u8,
+                        source: slot_ref(bridge, at.container.name, at.slot),
+                        destination: cursor,
+                    });
+                }
+                actions
             }
             _ => Vec::new(),
         };
