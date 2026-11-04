@@ -2603,17 +2603,6 @@ mod translate {
                         "inventory resynced after a use at {pos:?}"
                     ));
                 }
-                let mut items: Vec<Option<Stack>> = (0..46).map(|_| None).collect();
-                for (i, item) in c.slots.iter().enumerate() {
-                    let Some(slot) = java_inventory_slot(i as u32) else {
-                        continue;
-                    };
-                    if let Ok(index) = usize::try_from(slot) {
-                        if index < items.len() {
-                            items[index] = map_item(ctx, item);
-                        }
-                    }
-                }
                 {
                     let mut held = bridge.items.lock().unwrap();
                     *held = c.slots.iter().take(36).map(descriptor).collect();
@@ -2645,14 +2634,10 @@ mod translate {
                     });
                     bridge.inv_open.store(true, Ordering::Relaxed);
                 }
-                let mut events = vec![Event::Packet(Box::new(
-                    play::Clientbound::ContainerSetContent(play::ContainerSetContent {
-                        container: 0,
-                        state: 0,
-                        items,
-                        carried: None,
-                    }),
-                ))];
+                // The whole menu comes from the bridge's model, so the armour and
+                // the off hand keep their contents: a content packet replaces
+                // every slot, and one built only from window 0 would wipe them.
+                let mut events = vec![inventory_content(ctx, bridge)];
                 // The same slots are shown inside an open window's menu.
                 let guard = bridge.window.lock().unwrap();
                 if let Some(window) = guard.as_ref() {
@@ -3070,12 +3055,15 @@ mod translate {
         if let Some(d) = *bridge.offhand.lock().unwrap() {
             slots[45] = map(&d);
         }
+        // A content packet carries the stack on the cursor too; leaving it out
+        // would clear whatever the player is holding.
+        let carried = bridge.cursor.lock().unwrap().as_ref().and_then(|d| map(d));
         Event::Packet(Box::new(play::Clientbound::ContainerSetContent(
             play::ContainerSetContent {
                 container: 0,
                 state: 0,
                 items: slots,
-                carried: None,
+                carried,
             },
         )))
     }
