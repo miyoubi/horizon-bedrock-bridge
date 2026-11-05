@@ -819,6 +819,9 @@ fn run(
             translate::refresh_water(&ctx, bridge);
             last_water = std::time::Instant::now();
         }
+        for event in translate::flush_removals(bridge) {
+            let _ = events.send(event);
+        }
         // Sub-chunk requests queued while translating.
         if !ctx.requests.is_empty() {
             let batch: Vec<bedrock_core::protocol::Out> = ctx.requests.drain(..).collect();
@@ -2490,25 +2493,31 @@ mod translate {
 
     pub fn clientbound(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
         let mut events = clientbound_inner(ctx, bridge, packet);
-        // Any entity whose death animation has run its course leaves now, on
-        // whichever packet comes next.
+        events.extend(flush_removals(bridge));
+        events
+    }
+
+    /// Take away every entity whose death animation has finished. This is
+    /// driven by the session loop as well as by incoming packets, so an entity
+    /// still leaves when the server has nothing else to say.
+    pub fn flush_removals(bridge: &Bridge) -> Vec<Event> {
         let now = bridge.tick.load(Ordering::Relaxed);
         let mut removals = bridge.removals.lock().unwrap();
-        if removals.iter().any(|(due, _)| *due <= now) {
-            let ids: Vec<i32> = removals
-                .iter()
-                .filter(|(due, _)| *due <= now)
-                .map(|(_, id)| *id as i32)
-                .collect();
-            removals.retain(|(due, _)| *due > now);
-            if std::env::var_os("HZ_ENT_TRACE").is_some() {
-                bedrock_core::nethernet::trace(format!("REMOVE ids={ids:?} now={now}"));
-            }
-            events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
-                play::RemoveEntities { ids },
-            ))));
+        if !removals.iter().any(|(due, _)| *due <= now) {
+            return Vec::new();
         }
-        events
+        let ids: Vec<i32> = removals
+            .iter()
+            .filter(|(due, _)| *due <= now)
+            .map(|(_, id)| *id as i32)
+            .collect();
+        removals.retain(|(due, _)| *due > now);
+        if std::env::var_os("HZ_ENT_TRACE").is_some() {
+            bedrock_core::nethernet::trace(format!("REMOVE ids={ids:?} now={now}"));
+        }
+        vec![Event::Packet(Box::new(play::Clientbound::RemoveEntities(
+            play::RemoveEntities { ids },
+        )))]
     }
 
     fn clientbound_inner(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
