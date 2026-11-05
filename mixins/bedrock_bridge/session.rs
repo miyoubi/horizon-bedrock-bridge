@@ -1402,6 +1402,20 @@ mod translate {
         section[(((pos[1] & 15) << 8) | ((pos[2] & 15) << 4) | (pos[0] & 15)) as usize] = id;
     }
 
+    /// Ask the server to respawn after a death. A real client does this from
+    /// the death screen; doing it here as well keeps a dead player from being
+    /// stuck when the button's command is delayed.
+    fn request_respawn(ctx: &mut Context, bridge: &Bridge) {
+        if ctx.runtime_id == 0 || bridge.respawn_asked.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        ctx.requests.push(bp::Out::Respawn {
+            position: [0.0; 3],
+            state: 2,
+            runtime_id: ctx.runtime_id,
+        });
+    }
+
     /// Sample the few blocks around the player that decide the swimming and
     /// water-jump flags. This runs on the network thread, where the columns are.
     pub fn refresh_movement_blocks(ctx: &mut Context, bridge: &Bridge) {
@@ -2723,6 +2737,9 @@ mod translate {
                     saturation: vitals.saturation,
                 };
                 drop(vitals);
+                if *health <= 0 {
+                    request_respawn(ctx, bridge);
+                }
                 vec![Event::Packet(Box::new(play::Clientbound::SetHealth(set)))]
             }
             // The player's hunger and saturation are Bedrock attributes, so a
@@ -2764,6 +2781,9 @@ mod translate {
                     saturation: vitals.saturation,
                 };
                 drop(vitals);
+                if set.health <= 0.0 {
+                    request_respawn(ctx, bridge);
+                }
                 vec![Event::Packet(Box::new(play::Clientbound::SetHealth(set)))]
             }
             // Time of day. Bedrock sends only the tick count, and the game takes
