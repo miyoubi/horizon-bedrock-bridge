@@ -5883,9 +5883,67 @@ pub(crate) fn bedrock_travel(
     input: horizon_core::geometry::Vec3,
 ) -> crate::Result<bool> {
     use horizon_core::geometry::Vec3;
-    if world.player.flying || !world.player.fluids.was_touching_water {
+    if world.player.flying || world.player.fall_flying {
         return Ok(false);
     }
+    let water = world.player.fluids.was_touching_water;
+    let climbable = world.climbable()?;
+    if !water && !climbable {
+        // Bedrock's ordinary ground/air travel. The jump itself is already
+        // applied by Horizon's jump phase before travel.
+        let on_ground = world.player.ground.on_ground;
+        let sprinting = world.player.sprinting;
+        let speed = if on_ground {
+            if sprinting { 0.13_f64 } else { 0.1 }
+        } else if sprinting {
+            0.026
+        } else {
+            0.02
+        };
+        let mut velocity = world.player.velocity;
+        add_input(&mut velocity, input, world.player.yaw, speed);
+        world.player.velocity = velocity;
+        world.move_self(velocity)?;
+        let mut velocity = world.player.velocity;
+        velocity.y -= 0.08;
+        velocity.y *= 0.98;
+        let drag = if on_ground { 0.6_f64 * 0.91 } else { 0.91 };
+        velocity.x *= drag;
+        velocity.z *= drag;
+        world.player.velocity = velocity;
+        return Ok(true);
+    }
+    if climbable && !water {
+        let on_ground = world.player.ground.on_ground;
+        let sprinting = world.player.sprinting;
+        let speed = if on_ground {
+            if sprinting { 0.13_f64 } else { 0.1 }
+        } else if sprinting {
+            0.026
+        } else {
+            0.02
+        };
+        let mut velocity = world.player.velocity;
+        add_input(&mut velocity, input, world.player.yaw, speed);
+        world.player.velocity = velocity;
+        world.move_self(velocity)?;
+        let mut velocity = world.player.velocity;
+        velocity.y -= 0.08;
+        velocity.y *= 0.98;
+        velocity.y = velocity.y.max(-0.2);
+        if world.player.jumping {
+            velocity.y = 0.2;
+        }
+        if world.player.shift_key_down && velocity.y < 0.0 {
+            velocity.y = 0.0;
+        }
+        velocity.x *= 0.91;
+        velocity.z *= 0.91;
+        world.player.velocity = velocity;
+        world.player.fall_distance = 0.0;
+        return Ok(true);
+    }
+    // Water.
     let swimming = world.player.swimming;
     let jumping = world.player.jumping;
     let was_jumping = world.player.was_jumping;
@@ -5894,13 +5952,10 @@ pub(crate) fn bedrock_travel(
     let yaw = world.player.yaw;
     let pitch = world.player.pitch;
     let mut velocity = world.player.velocity;
-
-    // Bedrock's impulse is the move vector with the 0.98 multiplier, and its
-    // underwater acceleration is a fixed 0.02.
     let impulse = Vec3::new(input.x * 0.98, input.y, input.z * 0.98);
     let force = impulse.x * impulse.x + impulse.z * impulse.z;
     if force >= 1.0e-4 {
-        let scale = 0.02 / force.sqrt().max(1.0);
+        let scale = 0.02_f64 / force.sqrt().max(1.0);
         let radians = f64::from(yaw) * std::f64::consts::PI / 180.0;
         let (sin, cos) = (radians.sin(), radians.cos());
         velocity.x += impulse.x * scale * cos - impulse.z * scale * sin;
@@ -5922,9 +5977,8 @@ pub(crate) fn bedrock_travel(
     }
     world.player.velocity = velocity;
     world.move_self(velocity)?;
-
     let mut velocity = world.player.velocity;
-    let drag = if sprinting { 0.9 } else { 0.8 };
+    let drag = if sprinting { 0.9_f64 } else { 0.8 };
     velocity.x *= drag;
     velocity.z *= drag;
     velocity.y *= 0.8;
@@ -5934,6 +5988,19 @@ pub(crate) fn bedrock_travel(
     world.player.velocity = velocity;
     world.player.fall_distance = 0.0;
     Ok(true)
+}
+
+fn add_input(velocity: &mut horizon_core::geometry::Vec3, input: horizon_core::geometry::Vec3, yaw: f32, speed: f64) {
+    let impulse = horizon_core::geometry::Vec3::new(input.x * 0.98, input.y, input.z * 0.98);
+    let force = impulse.x * impulse.x + impulse.z * impulse.z;
+    if force < 1.0e-4 {
+        return;
+    }
+    let scale = speed / force.sqrt().max(1.0);
+    let radians = f64::from(yaw) * std::f64::consts::PI / 180.0;
+    let (sin, cos) = (radians.sin(), radians.cos());
+    velocity.x += impulse.x * scale * cos - impulse.z * scale * sin;
+    velocity.z += impulse.x * scale * sin + impulse.z * scale * cos;
 }
 
 // The Xbox sign-in helper is kept beside the session glue so the game thread
