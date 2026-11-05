@@ -4238,16 +4238,6 @@ mod translate {
         } else if on_ground {
             flags |= 1 << 50;
         }
-        // The reported position carries whatever correction has not settled
-        // yet; the client is not moved by it.
-        let position = {
-            let offset = *bridge.correction.lock().unwrap();
-            [
-                position[0] + offset[0],
-                position[1] + offset[1],
-                position[2] + offset[2],
-            ]
-        };
         {
             // Keep the feet position by tick for the correction handler.
             let mut history = bridge.history.lock().unwrap();
@@ -5429,9 +5419,12 @@ mod translate {
     /// The input for the client tick that just ended: one `PlayerAuthInput`,
     /// and the inventory resync a pickup asked for once its tick is due.
     pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
-        // Let a correction settle into the reported position; the player's own
-        // view is never moved by one.
-        settle_correction(bridge);
+        // A correction is folded into the player's *velocity*, not into the
+        // position: the camera is never teleported, and the movement itself
+        // steers back onto the server's simulation.
+        for event in correction_motion(bridge) {
+            let _ = bridge.events.send(event);
+        }
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
@@ -5445,24 +5438,34 @@ mod translate {
         out
     }
 
-    /// Let a movement correction settle into the position the server is told,
-    /// a little each client tick. It never moves the player's own view: the
-    /// correction is applied to the *reported* position, so the server's model
-    /// of the player converges on its simulation while the screen shows the
-    /// client's own, uninterrupted movement. That is the only way a resync can
-    /// be invisible — anything that moves the camera is a visible snap, however
-    /// small the step.
-    fn settle_correction(bridge: &Bridge) {
+    /// Turn the server's position error into a short velocity nudge. The game
+    /// keeps its own camera and collision response; this only adds the missing
+    /// motion, so a vine or bamboo disagreement is corrected as a push instead
+    /// of a teleport.
+    fn correction_motion(bridge: &Bridge) -> Vec<Event> {
         let mut offset = bridge.correction.lock().unwrap();
         if *offset == [0.0; 3] {
-            return;
+            return Vec::new();
         }
-        for at in offset.iter_mut() {
-            *at *= 0.98;
-            if at.abs() < 1e-4 {
-                *at = 0.0;
+        let position = *bridge.position.lock().unwrap();
+        let last = *bridge.last_sent.lock().unwrap();
+        let mut velocity = [0.0f32; 3];
+        for axis in 0..3 {
+            let moved = position[axis] - last[axis];
+            let nudge = (offset[axis] * 0.25).clamp(-0.5, 0.5);
+            velocity[axis] = moved + nudge;
+            offset[axis] *= 0.75;
+            if offset[axis].abs() < 0.01 {
+                offset[axis] = 0.0;
             }
         }
+        let id = bridge.runtime_id.load(Ordering::Relaxed) as i32;
+        vec![Event::Packet(Box::new(play::Clientbound::SetEntityMotion(
+            play::SetEntityMotion {
+                id,
+                velocity: [velocity[0] as f64, velocity[1] as f64, velocity[2] as f64],
+            },
+        )))]
     }
 
     /// A block use, translated where the columns are: the state of the clicked
