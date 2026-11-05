@@ -191,94 +191,6 @@ fn split(address: &str) -> (String, u16) {
     }
 }
 
-/// What the movement model needs to know about the blocks around the player.
-/// The network thread samples it from the columns it already holds; the game
-/// thread reads it without touching `ctx.chunks`.
-#[derive(Clone, Copy, Default)]
-struct MoveBlock(u8);
-
-impl MoveBlock {
-    const WATER: u8 = 1;
-    const LAVA: u8 = 2;
-    const CLIMBABLE: u8 = 4;
-}
-
-/// A local snapshot of the blocks around the player, keyed by block position.
-/// Only the flags movement asks for are kept, so a tick never touches the
-/// block registry.
-#[derive(Default)]
-struct MoveBlocks {
-    flags: HashMap<(i32, i32, i32), u8>,
-    center: (i32, i32, i32),
-    valid: bool,
-}
-
-impl MoveBlocks {
-    fn get(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.flags.get(&(x, y, z)).copied().unwrap_or(0)
-    }
-
-    /// Whether any block in the player's box has `flag`.
-    fn touched(&self, feet: [f32; 3], height: f32, width: f32, flag: u8) -> bool {
-        let min_x = (feet[0] - width * 0.5).floor() as i32;
-        let max_x = (feet[0] + width * 0.5).floor() as i32;
-        let min_z = (feet[2] - width * 0.5).floor() as i32;
-        let max_z = (feet[2] + width * 0.5).floor() as i32;
-        let min_y = (feet[1] + 0.001).floor() as i32;
-        let max_y = (feet[1] + height - 0.001).floor() as i32;
-        (min_x..=max_x).any(|x| {
-            (min_y..=max_y).any(|y| {
-                (min_z..=max_z).any(|z| self.get(x, y, z) & flag != 0)
-            })
-        })
-    }
-}
-
-/// The bridge's own view of the player, stepped from the same input the packet
-/// carries. Bedrock's server simulates from that input, so this is the position
-/// it expects; the Java client's own physics is only used where a collision
-/// resolves it.
-struct MoveState {
-    position: [f32; 3],
-    velocity: [f32; 3],
-    last_game: [f32; 3],
-    jump_delay: u32,
-    on_ground: bool,
-    swimming: bool,
-    sprinting: bool,
-    /// The input flags of the previous tick, for press and release edges.
-    previous_input: u8,
-    /// Whether the previous packet reported the swimming pose, for the
-    /// start/stop edges.
-    packet_swimming: bool,
-    ready: bool,
-}
-
-impl Default for MoveState {
-    fn default() -> Self {
-        Self {
-            position: [0.0; 3],
-            velocity: [0.0; 3],
-            last_game: [0.0; 3],
-            jump_delay: 0,
-            on_ground: false,
-            swimming: false,
-            sprinting: false,
-            previous_input: 0,
-            packet_swimming: false,
-            ready: false,
-        }
-    }
-}
-
-/// Bedrock's player box is 0.6 wide and 1.8 tall.
-const PLAYER_WIDTH: f32 = 0.6;
-const PLAYER_HEIGHT: f32 = 1.8;
-const JUMP_HEIGHT: f32 = 0.42;
-const JUMP_DELAY_TICKS: u32 = 10;
-const WATER_DRAG: f32 = 0.8;
-const SPRINT_WATER_DRAG: f32 = 0.9;
-
 /// Shared state for a live Bedrock session, reachable from the game thread.
 struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
@@ -336,11 +248,6 @@ struct Bridge {
     /// off a little each client tick: one jump of half a block is a teleport,
     /// the same half block spread over five ticks is a step.
     correction: Mutex<[f32; 3]>,
-    /// The position the Bedrock simulation predicts from the input flags, and
-    /// the block snapshot it reads. The server compares against this, not the
-    /// Java client's own physics, so it is what the input packet reports.
-    movement: Mutex<MoveState>,
-    movement_blocks: Mutex<MoveBlocks>,
     /// The game's event channel, so the tick path can nudge the player without
     /// waiting for a packet to translate.
     events: mpsc::Sender<Event>,
@@ -587,8 +494,6 @@ pub fn try_connect(
         last_sent: Mutex::new([0.0; 3]),
         history: Mutex::new(std::collections::VecDeque::new()),
         correction: Mutex::new([0.0; 3]),
-        movement: Mutex::new(MoveState::default()),
-        movement_blocks: Mutex::new(MoveBlocks::default()),
         events: send.clone(),
         tick: AtomicI64::new(1),
         input_tick: AtomicI64::new(0),
@@ -842,9 +747,6 @@ fn run(
         std::collections::VecDeque::new();
 
     let mut chunks_seen = 0u32;
-    let mut last_move_blocks = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
         // shutdown) ends the thread.
@@ -895,12 +797,6 @@ fn run(
             let _ = events.send(event);
         }
         translate::sweep_columns(&mut ctx);
-        // The game thread steps movement from this snapshot; refresh it often
-        // enough that walking into water is seen on the tick it happens.
-        if last_move_blocks.elapsed() >= std::time::Duration::from_millis(25) {
-            translate::refresh_movement_blocks(&mut ctx, bridge);
-            last_move_blocks = std::time::Instant::now();
-        }
         // Sub-chunk requests queued while translating.
         if !ctx.requests.is_empty() {
             let batch: Vec<bedrock_core::protocol::Out> = ctx.requests.drain(..).collect();
@@ -1016,10 +912,9 @@ fn run(
 // -------------------------------------------------------------------------
 mod translate {
     use super::{
-        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, JUMP_DELAY_TICKS,
-        JUMP_HEIGHT, MoveBlock, OpenWindow, PLAYER_HEIGHT, PLAYER_WIDTH, RECEIVE_QUEUE_LIMIT,
-        REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW, RUNTIME_ID_RADIUS,
-        SPRINT_WATER_DRAG, SWEEP_INTERVAL, WATER_DRAG, WindowKind,
+        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, OpenWindow,
+        RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW,
+        RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
     };
     use bedrock_core::protocol as bp;
     use crate::chunk::{
@@ -1191,8 +1086,6 @@ mod translate {
         /// The other direction, built when a block use needs the runtime id of
         /// the block that was clicked.
         reverse: Option<std::collections::HashMap<u32, i32>>,
-        /// Movement flags per Java block state, resolved on first use.
-        move_flags: std::collections::HashMap<u32, u8>,
         pub air: u32,
         /// The runtime id of air in the block palette. A sub-chunk's layers are
         /// filled from the bottom up, and a layer of air means the block is in
@@ -1232,7 +1125,6 @@ mod translate {
                 table,
                 cache: vec![UNRESOLVED],
                 reverse: None,
-                move_flags: std::collections::HashMap::new(),
                 air,
                 air_runtime,
                 light,
@@ -1289,36 +1181,6 @@ mod translate {
                 .as_ref()
                 .and_then(|map| map.get(&java).copied())
                 .unwrap_or(0) as u32
-        }
-
-        /// What movement needs to know about a Java block state: whether it is
-        /// a liquid, or a ladder-like block a player climbs.
-        pub fn movement_flags(&mut self, state: u32) -> u8 {
-            if let Some(flags) = self.move_flags.get(&state) {
-                return *flags;
-            }
-            let flags = match self
-                .registry
-                .state(horizon_world::registry::BlockStateId(state))
-                .map(|state| state.name.as_str())
-            {
-                Some("minecraft:water") => MoveBlock::WATER,
-                Some("minecraft:lava") => MoveBlock::LAVA,
-                Some(
-                    "minecraft:ladder"
-                    | "minecraft:vine"
-                    | "minecraft:twisting_vines"
-                    | "minecraft:twisting_vines_plant"
-                    | "minecraft:weeping_vines"
-                    | "minecraft:weeping_vines_plant"
-                    | "minecraft:cave_vines"
-                    | "minecraft:cave_vines_plant"
-                    | "minecraft:scaffolding",
-                ) => MoveBlock::CLIMBABLE,
-                _ => 0,
-            };
-            self.move_flags.insert(state, flags);
-            flags
         }
 
         fn resolve(&self, runtime_id: i32) -> u32 {
@@ -1449,40 +1311,6 @@ mod translate {
         }
         let section = entry[slot].get_or_insert_with(|| Box::new([0u32; 4096]));
         section[(((pos[1] & 15) << 8) | ((pos[2] & 15) << 4) | (pos[0] & 15)) as usize] = id;
-    }
-
-    /// Refresh the small block snapshot the game thread steps movement
-    /// against. Only a few blocks around the player matter, and the columns
-    /// already hold their Java states, so this never touches the registry for
-    /// a state it has seen before.
-    pub fn refresh_movement_blocks(ctx: &mut Context, bridge: &Bridge) {
-        let feet = *bridge.position.lock().unwrap();
-        let center = [
-            feet[0].floor() as i32,
-            feet[1].floor() as i32,
-            feet[2].floor() as i32,
-        ];
-        let mut flags = std::collections::HashMap::with_capacity(512);
-        let Some(blocks) = ctx.blocks.as_mut() else {
-            return;
-        };
-        for x in center[0] - 3..=center[0] + 3 {
-            for z in center[2] - 3..=center[2] + 3 {
-                let Some(chunk) = ctx.chunks.get(&(x >> 4, z >> 4)) else {
-                    continue;
-                };
-                for y in center[1] - 3..=center[1] + 3 {
-                    let value = blocks.movement_flags(chunk.get(x & 15, y, z & 15));
-                    if value != 0 {
-                        flags.insert((x, y, z), value);
-                    }
-                }
-            }
-        }
-        let mut shared = bridge.movement_blocks.lock().unwrap();
-        shared.flags = flags;
-        shared.center = (center[0], center[1], center[2]);
-        shared.valid = true;
     }
 
     /// One column as the Java client wants it: every section, its heightmaps
@@ -3233,15 +3061,25 @@ mod translate {
                     return Vec::new();
                 }
                 let big = offset[0].abs() > 3.0 || offset[1].abs() > 3.0 || offset[2].abs() > 3.0;
-                // The input packet now reports a Bedrock-model position, so a
-                // small correction is the model trailing a tick, not a debt to
-                // carry into the reported position. Only a teleport is applied.
+                {
+                    let mut pending = bridge.correction.lock().unwrap();
+                    for (at, add) in pending.iter_mut().zip(offset) {
+                        *at = (*at + add).clamp(-4.0, 4.0);
+                    }
+                    if big {
+                        // A teleport (respawn, a void fall) is the one case the
+                        // client has to see.
+                        *pending = [0.0; 3];
+                    }
+                }
                 bedrock_core::nethernet::trace(format!(
-                    "CORR offset=[{:.3},{:.3},{:.3}] big={big}",
-                    offset[0], offset[1], offset[2]
+                    "CORR offset=[{:.3},{:.3},{:.3}] big={big} debt={:?}",
+                    offset[0],
+                    offset[1],
+                    offset[2],
+                    *bridge.correction.lock().unwrap()
                 ));
                 if big {
-                    bridge.movement.lock().unwrap().ready = false;
                     return vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                         play::PlayerPosition {
                             teleport: 0,
@@ -3562,7 +3400,6 @@ mod translate {
                 let at = [feet[0] as f32, feet[1] as f32, feet[2] as f32];
                 *bridge.position.lock().unwrap() = at;
                 *bridge.last_sent.lock().unwrap() = at;
-                bridge.movement.lock().unwrap().ready = false;
                 bridge.teleport_ack.store(true, Ordering::Relaxed);
                 events.push(Event::Packet(Box::new(play::Clientbound::PlayerPosition(
                     play::PlayerPosition {
@@ -4217,16 +4054,7 @@ mod translate {
             bridge.input_tick.fetch_add(1, Ordering::Relaxed);
             u64::try_from(seeded.max(1)).unwrap_or(1)
         };
-        // The model's position is what the server simulates; the game's own
-        // position is only its collision-resolved fallback.
-        let position = {
-            let movement = bridge.movement.lock().unwrap();
-            if movement.ready {
-                movement.position
-            } else {
-                *bridge.position.lock().unwrap()
-            }
-        };
+        let position = *bridge.position.lock().unwrap();
         let [yaw, pitch] = *bridge.rotation.lock().unwrap();
         let input = bridge.input.load(Ordering::Relaxed) as u8;
         // The game sends its bitfield only when it changes, so the previous
@@ -4246,25 +4074,6 @@ mod translate {
             was_on_ground,
             collision,
         );
-        // Water needs the swimming and water-jump flags a real client sends;
-        // without them the server keeps the player walking on the pool floor
-        // while the client floats.
-        let swimming = {
-            let blocks = bridge.movement_blocks.lock().unwrap();
-            let in_water = blocks.touched(position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::WATER);
-            let mut movement = bridge.movement.lock().unwrap();
-            let swimming = in_water && (sprinting || move_vec[1] != 0.0);
-            if swimming && !movement.packet_swimming {
-                flags |= 1 << 29; // start_swimming
-            } else if !swimming && movement.packet_swimming {
-                flags |= 1 << 30; // stop_swimming
-            }
-            movement.packet_swimming = swimming;
-            in_water
-        };
-        if swimming && input & 0x10 != 0 {
-            flags |= (1 << 7) | (1 << 21); // auto_jumping_in_water, ascend_block
-        }
         if !actions.is_empty() {
             flags |= 1 << 35; // perform_block_actions
         }
@@ -5448,14 +5257,6 @@ mod translate {
         }
         // Bedrock's local move vector: +x is LEFT, +y is FORWARD. A diagonal is
         // scaled by 1/√2 and sneaking by 0.3, as the reference translator does.
-        (bits, move_vector(input))
-    }
-
-    /// The local move vector for the game's input bitfield.
-    fn move_vector(input: u8) -> [f32; 2] {
-        let (forward, backward) = (input & 0x01 != 0, input & 0x02 != 0);
-        let (left, right) = (input & 0x04 != 0, input & 0x08 != 0);
-        let sneak = input & 0x20 != 0;
         let mut mv = [
             if left {
                 1.0f32
@@ -5480,226 +5281,15 @@ mod translate {
             mv[0] *= 0.3;
             mv[1] *= 0.3;
         }
-        mv
-    }
-
-    /// Step the bridge's own Bedrock movement model, and keep the game's
-    /// camera on the position the server will simulate. Only fluids and
-    /// climbing are simulated here: dry walking already agrees with the
-    /// server, so the game's own collision-resolved movement stays untouched.
-    fn movement_tick(bridge: &Bridge) -> Vec<Event> {
-        let game = *bridge.position.lock().unwrap();
-        let [yaw, pitch] = *bridge.rotation.lock().unwrap();
-        let input = bridge.input.load(Ordering::Relaxed) as u8;
-        let sprinting = bridge.sprinting.load(Ordering::Relaxed);
-        let on_ground = bridge.on_ground.load(Ordering::Relaxed);
-        let collision = bridge.collision.load(Ordering::Relaxed);
-        let move_vec = move_vector(input);
-        let blocks = bridge.movement_blocks.lock().unwrap();
-        let mut state = bridge.movement.lock().unwrap();
-
-        let distance = ((game[0] - state.position[0]).powi(2)
-            + (game[1] - state.position[1]).powi(2)
-            + (game[2] - state.position[2]).powi(2))
-        .sqrt();
-        let game_jump = ((game[0] - state.last_game[0]).powi(2)
-            + (game[1] - state.last_game[1]).powi(2)
-            + (game[2] - state.last_game[2]).powi(2))
-        .sqrt();
-        // A respawn, a teleport or an unexplained jump in the game's position
-        // is authoritative: start again from where it put the player.
-        if !state.ready || distance > 3.0 || game_jump > 1.0 {
-            state.position = game;
-            state.velocity = [0.0; 3];
-            state.last_game = game;
-            state.on_ground = on_ground;
-            state.previous_input = input;
-            state.jump_delay = 0;
-            state.ready = true;
-            return Vec::new();
-        }
-
-        let in_water = blocks.touched(state.position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::WATER);
-        let in_lava = blocks.touched(state.position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::LAVA);
-        let climbable = {
-            let x = state.position[0].floor() as i32;
-            let y = state.position[1].floor() as i32;
-            let z = state.position[2].floor() as i32;
-            blocks.get(x, y, z) & MoveBlock::CLIMBABLE != 0
-        };
-        let liquid = in_water || in_lava;
-        if !liquid && !climbable {
-            // Dry and not climbing: the game already lands where the server
-            // expects, so its position is the reference.
-            state.velocity = [
-                game[0] - state.last_game[0],
-                game[1] - state.last_game[1],
-                game[2] - state.last_game[2],
-            ];
-            state.position = game;
-            state.last_game = game;
-            state.on_ground = on_ground;
-            state.swimming = false;
-            state.previous_input = input;
-            state.jump_delay = state.jump_delay.saturating_sub(1);
-            if input & 0x10 == 0 {
-                state.jump_delay = 0;
-            }
-            return Vec::new();
-        }
-
-        let jumping = input & 0x10 != 0;
-        let was_jumping = state.previous_input & 0x10 != 0;
-        let sneak = input & 0x20 != 0;
-        // Bedrock enters its swimming pose when sprinting into water.
-        state.swimming = in_water && sprinting && move_vec[1] > 0.0;
-        state.sprinting = sprinting;
-        state.on_ground = on_ground;
-
-        let mut velocity = state.velocity;
-        let impulse = [move_vec[0] * 0.98, move_vec[1] * 0.98];
-
-        // Horizontal acceleration. The water speed is Bedrock's underwater
-        // speed, not the ground movement attribute; sprinting only changes the
-        // drag in water.
-        let speed = if in_water || in_lava {
-            0.02
-        } else if on_ground {
-            if sprinting { 0.13 } else { 0.1 }
-        } else if sprinting {
-            0.026
-        } else {
-            0.02
-        };
-        move_relative(&mut velocity, impulse, yaw, speed);
-
-        // Vertical.
-        if liquid {
-            if jumping {
-                if state.swimming && !was_jumping {
-                    velocity[1] = 0.0;
-                } else {
-                    velocity[1] += 0.04;
-                }
-            } else if in_water && state.swimming {
-                // Pitch steers the swim, as the client does.
-                let target = -(pitch.to_radians().sin());
-                let rate = if target < -0.2 { 0.085 } else { 0.06 };
-                velocity[1] += (target - velocity[1]) * rate;
-            }
-        } else if climbable && jumping {
-            velocity[1] = 0.2;
-            state.jump_delay = JUMP_DELAY_TICKS;
-        } else if on_ground && jumping && state.jump_delay == 0 {
-            velocity[1] = velocity[1].max(JUMP_HEIGHT);
-            if sprinting {
-                velocity[0] -= yaw.to_radians().sin() * 0.2;
-                velocity[2] += yaw.to_radians().cos() * 0.2;
-            }
-            state.jump_delay = JUMP_DELAY_TICKS;
-        }
-        if climbable {
-            velocity[1] = velocity[1].clamp(-0.2, 0.2);
-            if sneak && velocity[1] < 0.0 {
-                velocity[1] = 0.0;
-            }
-        }
-
-        state.position[0] += velocity[0];
-        state.position[1] += velocity[1];
-        state.position[2] += velocity[2];
-
-        // Use the game's collision result where it has one. This keeps the
-        // bridge's prediction off walls without needing the whole swept-box
-        // engine here; the server resolves the same shapes independently.
-        if collision {
-            state.position[0] = game[0];
-            state.position[2] = game[2];
-            velocity[0] = 0.0;
-            velocity[2] = 0.0;
-        }
-        if on_ground && velocity[1] <= 0.0 {
-            state.position[1] = game[1];
-            velocity[1] = 0.0;
-        }
-
-        // Drag and gravity, in Bedrock's order (after the move).
-        if in_water {
-            let drag = if sprinting { SPRINT_WATER_DRAG } else { WATER_DRAG };
-            velocity[0] *= drag;
-            velocity[2] *= drag;
-            velocity[1] *= 0.8;
-            if !state.swimming {
-                velocity[1] -= 0.005;
-            }
-        } else if in_lava {
-            velocity[0] *= 0.5;
-            velocity[1] *= 0.5;
-            velocity[2] *= 0.5;
-            velocity[1] -= 0.02;
-        } else {
-            velocity[1] -= 0.08;
-            velocity[1] *= 0.98;
-            let drag = if on_ground { 0.6 * 0.91 } else { 0.91 };
-            velocity[0] *= drag;
-            velocity[2] *= drag;
-        }
-
-        state.velocity = velocity;
-        state.jump_delay = state.jump_delay.saturating_sub(1);
-        if !jumping {
-            state.jump_delay = 0;
-        }
-        state.previous_input = input;
-        state.last_game = game;
-        let predicted = state.position;
-
-        let delta = [
-            predicted[0] - game[0],
-            predicted[1] - game[1],
-            predicted[2] - game[2],
-        ];
-        // Only move the camera when the two models actually differ. On dry
-        // ground this path is not reached at all.
-        if delta[0].abs() + delta[1].abs() + delta[2].abs() > 0.02 {
-            return vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
-                play::PlayerPosition {
-                    teleport: 0,
-                    position: [predicted[0] as f64, predicted[1] as f64, predicted[2] as f64],
-                    delta: [0.0; 3],
-                    yaw,
-                    pitch,
-                    relatives: 0x18,
-                },
-            )))];
-        }
-        Vec::new()
-    }
-
-    /// Bedrock's `moveRelative`: turn the local input into world velocity.
-    fn move_relative(velocity: &mut [f32; 3], impulse: [f32; 2], yaw: f32, speed: f32) {
-        let force = impulse[1] * impulse[1] + impulse[0] * impulse[0];
-        if force < 1.0e-4 {
-            return;
-        }
-        let force = speed / force.sqrt().max(1.0);
-        let forward = impulse[1] * force;
-        let strafe = impulse[0] * force;
-        let yaw = yaw.to_radians();
-        let (sin, cos) = (yaw.sin(), yaw.cos());
-        velocity[0] += strafe * cos - sin * impulse[1] * force;
-        velocity[2] += strafe * sin + forward * cos;
+        (bits, mv)
     }
 
     /// The input for the client tick that just ended: one `PlayerAuthInput`,
     /// and the inventory resync a pickup asked for once its tick is due.
     pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
-        // Step the Bedrock model first: `auth_input` reports its position, and
-        // any difference from the game's own physics is sent back as a small
-        // position correction.
-        for event in movement_tick(bridge) {
-            let _ = bridge.events.send(event);
-        }
+        // Let a correction settle into the reported position; the player's own
+        // view is never moved by one.
+        settle_correction(bridge);
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
@@ -5711,6 +5301,26 @@ mod translate {
             out.push(bedrock_core::protocol::Out::InventoryMismatch);
         }
         out
+    }
+
+    /// Let a movement correction settle into the position the server is told,
+    /// a little each client tick. It never moves the player's own view: the
+    /// correction is applied to the *reported* position, so the server's model
+    /// of the player converges on its simulation while the screen shows the
+    /// client's own, uninterrupted movement. That is the only way a resync can
+    /// be invisible — anything that moves the camera is a visible snap, however
+    /// small the step.
+    fn settle_correction(bridge: &Bridge) {
+        let mut offset = bridge.correction.lock().unwrap();
+        if *offset == [0.0; 3] {
+            return;
+        }
+        for at in offset.iter_mut() {
+            *at *= 0.98;
+            if at.abs() < 1e-4 {
+                *at = 0.0;
+            }
+        }
     }
 
     /// A block use, translated where the columns are: the state of the clicked
