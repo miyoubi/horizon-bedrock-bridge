@@ -191,6 +191,54 @@ fn split(address: &str) -> (String, u16) {
     }
 }
 
+/// Movement flags for a block.
+#[derive(Clone, Copy, Default)]
+struct MoveBlock(u8);
+impl MoveBlock {
+    const WATER: u8 = 1;
+    const LAVA: u8 = 2;
+    const CLIMBABLE: u8 = 4;
+}
+
+/// A small snapshot of the blocks around the player, sampled on the network
+/// thread so the input tick can know what the local player is standing in.
+#[derive(Default)]
+struct MoveBlocks {
+    flags: HashMap<(i32, i32, i32), u8>,
+}
+impl MoveBlocks {
+    fn get(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.flags.get(&(x, y, z)).copied().unwrap_or(0)
+    }
+    fn touched(&self, feet: [f32; 3], height: f32, width: f32, flag: u8) -> bool {
+        let min_x = (feet[0] - width * 0.5).floor() as i32;
+        let max_x = (feet[0] + width * 0.5).floor() as i32;
+        let min_z = (feet[2] - width * 0.5).floor() as i32;
+        let max_z = (feet[2] + width * 0.5).floor() as i32;
+        let min_y = (feet[1] + 0.001).floor() as i32;
+        let max_y = (feet[1] + height - 0.001).floor() as i32;
+        (min_x..=max_x).any(|x| (min_y..=max_y).any(|y| (min_z..=max_z).any(|z| self.get(x, y, z) & flag != 0)))
+    }
+}
+
+/// Server-side movement prediction. It is reported to Bedrock but never moves
+/// the local camera or the local player.
+struct Shadow {
+    position: [f32; 3],
+    velocity: [f32; 3],
+    last_game: [f32; 3],
+    previous_input: u8,
+    jump_delay: u32,
+    ready: bool,
+}
+impl Default for Shadow {
+    fn default() -> Self { Self { position: [0.0;3], velocity: [0.0;3], last_game: [0.0;3], previous_input: 0, jump_delay: 0, ready: false } }
+}
+const PLAYER_WIDTH: f32 = 0.6;
+const PLAYER_HEIGHT: f32 = 1.8;
+const JUMP_HEIGHT: f32 = 0.42;
+const JUMP_DELAY_TICKS: u32 = 10;
+
 /// Shared state for a live Bedrock session, reachable from the game thread.
 struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
@@ -248,6 +296,8 @@ struct Bridge {
     /// off a little each client tick: one jump of half a block is a teleport,
     /// the same half block spread over five ticks is a step.
     correction: Mutex<[f32; 3]>,
+    shadow: Mutex<Shadow>,
+    movement_blocks: Mutex<MoveBlocks>,
     /// Whether the player's body is in water, sampled from the columns.
     in_water: AtomicBool,
     /// Whether the previous input packet reported the swimming pose.
@@ -501,6 +551,8 @@ pub fn try_connect(
         last_sent: Mutex::new([0.0; 3]),
         history: Mutex::new(std::collections::VecDeque::new()),
         correction: Mutex::new([0.0; 3]),
+        shadow: Mutex::new(Shadow::default()),
+        movement_blocks: Mutex::new(MoveBlocks::default()),
         in_water: AtomicBool::new(false),
         sent_swimming: AtomicBool::new(false),
         events: send.clone(),
@@ -816,7 +868,7 @@ fn run(
         }
         translate::sweep_columns(&mut ctx);
         if last_water.elapsed() >= std::time::Duration::from_millis(50) {
-            translate::refresh_water(&ctx, bridge);
+            translate::refresh_water(&mut ctx, bridge);
             last_water = std::time::Instant::now();
         }
         // Sub-chunk requests queued while translating.
@@ -936,9 +988,10 @@ fn run(
 // -------------------------------------------------------------------------
 mod translate {
     use super::{
-        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, OpenWindow,
-        RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW,
-        RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
+        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, JUMP_DELAY_TICKS,
+        JUMP_HEIGHT, MoveBlock, OpenWindow, PLAYER_HEIGHT, PLAYER_WIDTH, RECEIVE_QUEUE_LIMIT,
+        REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW, RUNTIME_ID_RADIUS,
+        SWEEP_INTERVAL, WindowKind,
     };
     use bedrock_core::protocol as bp;
     use crate::chunk::{
@@ -1110,6 +1163,7 @@ mod translate {
         /// The other direction, built when a block use needs the runtime id of
         /// the block that was clicked.
         reverse: Option<std::collections::HashMap<u32, i32>>,
+        move_flags: std::collections::HashMap<u32, u8>,
         pub air: u32,
         /// The runtime id of air in the block palette. A sub-chunk's layers are
         /// filled from the bottom up, and a layer of air means the block is in
@@ -1149,6 +1203,7 @@ mod translate {
                 table,
                 cache: vec![UNRESOLVED],
                 reverse: None,
+                move_flags: std::collections::HashMap::new(),
                 air,
                 air_runtime,
                 light,
@@ -1212,6 +1267,17 @@ mod translate {
             self.registry
                 .state(horizon_world::registry::BlockStateId(state))
                 .is_some_and(|state| state.name == "minecraft:water")
+        }
+
+        pub fn movement_flags(&mut self, state: u32) -> u8 {
+            if let Some(flags) = self.move_flags.get(&state) { return *flags; }
+            let flags = match self.registry.state(horizon_world::registry::BlockStateId(state)).map(|s| s.name.as_str()) {
+                Some("minecraft:water") => MoveBlock::WATER,
+                Some("minecraft:lava") => MoveBlock::LAVA,
+                Some("minecraft:ladder" | "minecraft:vine" | "minecraft:twisting_vines" | "minecraft:twisting_vines_plant" | "minecraft:weeping_vines" | "minecraft:weeping_vines_plant" | "minecraft:cave_vines" | "minecraft:cave_vines_plant" | "minecraft:scaffolding") => MoveBlock::CLIMBABLE,
+                _ => 0,
+            };
+            self.move_flags.insert(state, flags); flags
         }
 
         fn resolve(&self, runtime_id: i32) -> u32 {
@@ -1360,31 +1426,29 @@ mod translate {
 
     /// Whether the player's body is submerged, sampled on the network thread.
     /// This only decides the swimming input flag; it never moves the player.
-    pub fn refresh_water(ctx: &Context, bridge: &Bridge) {
-        let feet = *bridge.position.lock().unwrap();
-        let Some(blocks) = ctx.blocks.as_ref() else {
-            return;
-        };
-        let min_x = (feet[0] - 0.3).floor() as i32;
-        let max_x = (feet[0] + 0.3).floor() as i32;
-        let min_z = (feet[2] - 0.3).floor() as i32;
-        let max_z = (feet[2] + 0.3).floor() as i32;
-        let min_y = (feet[1] + 0.4).floor() as i32;
-        let max_y = (feet[1] + 1.4).floor() as i32;
+    pub fn refresh_water(ctx: &mut Context, bridge: &Bridge) {
+        let shadow = bridge.shadow.lock().unwrap();
+        let feet = if shadow.ready { shadow.position } else { *bridge.position.lock().unwrap() };
+        drop(shadow);
+        let Some(blocks) = ctx.blocks.as_mut() else { return; };
+        let center = [feet[0].floor() as i32, feet[1].floor() as i32, feet[2].floor() as i32];
+        let mut flags = std::collections::HashMap::with_capacity(512);
         let mut water = false;
-        'search: for x in min_x..=max_x {
-            for z in min_z..=max_z {
-                let Some(chunk) = ctx.chunks.get(&(x >> 4, z >> 4)) else {
-                    continue;
-                };
-                for y in min_y..=max_y {
-                    if blocks.is_water(chunk.get(x & 15, y, z & 15)) {
-                        water = true;
-                        break 'search;
+        for x in center[0] - 3..=center[0] + 3 {
+            for z in center[2] - 3..=center[2] + 3 {
+                let Some(chunk) = ctx.chunks.get(&(x >> 4, z >> 4)) else { continue; };
+                for y in center[1] - 3..=center[1] + 3 {
+                    let value = blocks.movement_flags(chunk.get(x & 15, y, z & 15));
+                    if value != 0 {
+                        flags.insert((x, y, z), value);
+                        if x == center[0] && z == center[2] && (center[1]..=center[1] + 1).contains(&y) && value & MoveBlock::WATER != 0 {
+                            water = true;
+                        }
                     }
                 }
             }
         }
+        bridge.movement_blocks.lock().unwrap().flags = flags;
         bridge.in_water.store(water, Ordering::Relaxed);
     }
 
@@ -4140,7 +4204,10 @@ mod translate {
             bridge.input_tick.fetch_add(1, Ordering::Relaxed);
             u64::try_from(seeded.max(1)).unwrap_or(1)
         };
-        let position = *bridge.position.lock().unwrap();
+        let position = {
+            let shadow = bridge.shadow.lock().unwrap();
+            if shadow.ready { shadow.position } else { *bridge.position.lock().unwrap() }
+        };
         let [yaw, pitch] = *bridge.rotation.lock().unwrap();
         let input = bridge.input.load(Ordering::Relaxed) as u8;
         // The game sends its bitfield only when it changes, so the previous
@@ -5381,12 +5448,119 @@ mod translate {
         (bits, mv)
     }
 
+    fn shadow_move_vector(input: u8) -> [f32; 2] {
+        let (forward, backward) = (input & 0x01 != 0, input & 0x02 != 0);
+        let (left, right) = (input & 0x04 != 0, input & 0x08 != 0);
+        let sneak = input & 0x20 != 0;
+        let mut mv = [
+            if left { 1.0 } else if right { -1.0 } else { 0.0 },
+            if forward { 1.0 } else if backward { -1.0 } else { 0.0 },
+        ];
+        if mv[0] != 0.0 && mv[1] != 0.0 {
+            mv[0] *= std::f32::consts::FRAC_1_SQRT_2;
+            mv[1] *= std::f32::consts::FRAC_1_SQRT_2;
+        }
+        if sneak { mv[0] *= 0.3; mv[1] *= 0.3; }
+        mv
+    }
+
+    /// Advance the server-side shadow. It never touches the local camera or
+    /// player; only the position reported to Bedrock comes from here.
+    fn shadow_movement(bridge: &Bridge) {
+        let game = *bridge.position.lock().unwrap();
+        let [yaw, pitch] = *bridge.rotation.lock().unwrap();
+        let input = bridge.input.load(Ordering::Relaxed) as u8;
+        let sprinting = bridge.sprinting.load(Ordering::Relaxed);
+        let on_ground = bridge.on_ground.load(Ordering::Relaxed);
+        let collision = bridge.collision.load(Ordering::Relaxed);
+        let mv = shadow_move_vector(input);
+        let blocks = bridge.movement_blocks.lock().unwrap();
+        let mut shadow = bridge.shadow.lock().unwrap();
+        let distance = ((game[0]-shadow.position[0]).powi(2)+(game[1]-shadow.position[1]).powi(2)+(game[2]-shadow.position[2]).powi(2)).sqrt();
+        let game_jump = ((game[0]-shadow.last_game[0]).powi(2)+(game[1]-shadow.last_game[1]).powi(2)+(game[2]-shadow.last_game[2]).powi(2)).sqrt();
+        if !shadow.ready || distance > 3.0 || game_jump > 1.0 {
+            shadow.position = game;
+            shadow.velocity = [game[0]-shadow.last_game[0], game[1]-shadow.last_game[1], game[2]-shadow.last_game[2]];
+            shadow.last_game = game;
+            shadow.previous_input = input;
+            shadow.jump_delay = 0;
+            shadow.ready = true;
+            return;
+        }
+        let water = blocks.touched(shadow.position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::WATER);
+        let lava = blocks.touched(shadow.position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::LAVA);
+        let climbable = {
+            let x=shadow.position[0].floor() as i32; let y=shadow.position[1].floor() as i32; let z=shadow.position[2].floor() as i32;
+            blocks.get(x,y,z) & MoveBlock::CLIMBABLE != 0
+        };
+        if !water && !lava && !climbable {
+            shadow.velocity = [game[0]-shadow.last_game[0], game[1]-shadow.last_game[1], game[2]-shadow.last_game[2]];
+            shadow.position = game;
+            shadow.last_game = game;
+            shadow.previous_input = input;
+            shadow.jump_delay = 0;
+            return;
+        }
+        let jumping = input & 0x10 != 0;
+        let was_jumping = shadow.previous_input & 0x10 != 0;
+        let swimming = water && sprinting && mv[1] > 0.0;
+        let mut velocity = shadow.velocity;
+        let impulse = [mv[0]*0.98, mv[1]*0.98];
+        let force = impulse[0]*impulse[0] + impulse[1]*impulse[1];
+        if force >= 1.0e-4 {
+            let scale = (if water || lava { 0.02 } else if on_ground { if sprinting {0.13} else {0.1} } else if sprinting {0.026} else {0.02}) / force.sqrt().max(1.0);
+            let yawr = yaw.to_radians();
+            let (sin, cos) = (yawr.sin(), yawr.cos());
+            velocity[0] += impulse[0]*scale*cos - sin*impulse[1]*scale;
+            velocity[2] += impulse[0]*scale*sin + impulse[1]*scale*cos;
+        }
+        if water || lava {
+            if jumping {
+                if swimming && !was_jumping { velocity[1] = 0.0; } else { velocity[1] += 0.04; }
+            } else if water && swimming {
+                let target = -(pitch.to_radians().sin());
+                let rate = if target < -0.2 { 0.085 } else { 0.06 };
+                velocity[1] += (target - velocity[1]) * rate;
+            }
+        } else if climbable && jumping {
+            velocity[1] = 0.2;
+            shadow.jump_delay = JUMP_DELAY_TICKS;
+        } else if on_ground && jumping && shadow.jump_delay == 0 {
+            velocity[1] = velocity[1].max(JUMP_HEIGHT);
+            if sprinting { velocity[0] -= yaw.to_radians().sin()*0.2; velocity[2] += yaw.to_radians().cos()*0.2; }
+            shadow.jump_delay = JUMP_DELAY_TICKS;
+        }
+        if climbable { velocity[1] = velocity[1].clamp(-0.2, 0.2); }
+        shadow.position[0] += velocity[0];
+        shadow.position[1] += velocity[1];
+        shadow.position[2] += velocity[2];
+        if collision { shadow.position[0] = game[0]; shadow.position[2] = game[2]; velocity[0]=0.0; velocity[2]=0.0; }
+        if on_ground && velocity[1] <= 0.0 { shadow.position[1] = game[1]; velocity[1]=0.0; }
+        if water {
+            let drag = if sprinting {0.9} else {0.8};
+            velocity[0] *= drag; velocity[2] *= drag; velocity[1] *= 0.8;
+            if !swimming { velocity[1] -= 0.005; }
+        } else if lava {
+            velocity[0]*=0.5; velocity[1]*=0.5; velocity[2]*=0.5; velocity[1]-=0.02;
+        } else {
+            velocity[1] = (velocity[1]-0.08)*0.98;
+            let drag = if on_ground {0.6*0.91} else {0.91};
+            velocity[0]*=drag; velocity[2]*=drag;
+        }
+        shadow.velocity = velocity;
+        shadow.last_game = game;
+        shadow.previous_input = input;
+        shadow.jump_delay = shadow.jump_delay.saturating_sub(1);
+        if !jumping { shadow.jump_delay = 0; }
+    }
+
     /// The input for the client tick that just ended: one `PlayerAuthInput`,
     /// and the inventory resync a pickup asked for once its tick is due.
     pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
         // The bridge's own clock. Death animations and delayed removals are
         // scheduled against it, so it must advance once per client tick.
         bridge.tick.fetch_add(1, Ordering::Relaxed);
+        shadow_movement(bridge);
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
