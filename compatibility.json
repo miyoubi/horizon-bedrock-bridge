@@ -1,17 +1,17 @@
 {
-  "horizon_revision": "4c3bf94376193082c08c4e80443affc719598fd5",
+  "horizon_revision": "d7077bc27208a33a874d4c397b59f4b6e46270f1",
   "source_sha256": {
-    "crates/horizon-client/src/game.rs": "3b01e2599763a3787c65db32ddcd663d01b665d224e48609a39006f73979d0dc"
+    "crates/horizon-client/src/game.rs": "ae14e6c97c86023d2ba121f3597087137c993684e1d7fa5bd40c42978397c169"
   },
   "horizon_repository": "https://github.com/horizon-rust/horizon",
   "horizon_mixins_repository": "https://github.com/horizon-rust/horizon-mixins",
-  "horizon_mixins_revision": "d9c83d7096b7ea5b83678da2efdfd6161f74997e",
+  "horizon_mixins_revision": "e8cd0aa38cffef49cb2e088ef716baa107148c02",
   "mixin_schema": 6,
   "bedrock_protocol_version": 2225,
   "bedrock_version": "1.26.60",
   "notes": [
-    "Pins Horizon 4c3bf9437 (newest main plus 'build: allow native mods to use WebRTC'), so a bundle crate may declare rtc, plus horizon-mixins d9c83d7 for the [[crate]] schema.",
-    "That revision is not in horizon-rust/horizon, so the launcher must reuse a cached native/source/<revision> tree.",
+    "Pins Horizon d7077bc27 (new main plus 'build: allow native mods to use WebRTC'), so a bundle crate may declare rtc.",
+    "horizon-mixins e8cd0aa38.",
     "When moving to a newer Nightly, update horizon_revision here and in the manifest, and refresh source_sha256."
   ]
 }

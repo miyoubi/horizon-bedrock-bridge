@@ -191,45 +191,6 @@ fn split(address: &str) -> (String, u16) {
     }
 }
 
-/// What movement packets need to know about the block the player is in.
-#[derive(Clone, Copy, Default)]
-struct MoveBlock(u8);
-
-impl MoveBlock {
-    const WATER: u8 = 1;
-    const LAVA: u8 = 2;
-    const CLIMBABLE: u8 = 4;
-}
-
-/// A small snapshot of the blocks around the player, sampled on the network
-/// thread. It only feeds packet flags; it never moves the client.
-#[derive(Default)]
-struct MoveBlocks {
-    flags: HashMap<(i32, i32, i32), u8>,
-    valid: bool,
-}
-
-impl MoveBlocks {
-    fn get(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.flags.get(&(x, y, z)).copied().unwrap_or(0)
-    }
-
-    fn touched(&self, feet: [f32; 3], height: f32, width: f32, flag: u8) -> bool {
-        let min_x = (feet[0] - width * 0.5).floor() as i32;
-        let max_x = (feet[0] + width * 0.5).floor() as i32;
-        let min_z = (feet[2] - width * 0.5).floor() as i32;
-        let max_z = (feet[2] + width * 0.5).floor() as i32;
-        let min_y = (feet[1] + 0.001).floor() as i32;
-        let max_y = (feet[1] + height - 0.001).floor() as i32;
-        (min_x..=max_x).any(|x| {
-            (min_y..=max_y).any(|y| (min_z..=max_z).any(|z| self.get(x, y, z) & flag != 0))
-        })
-    }
-}
-
-const PLAYER_WIDTH: f32 = 0.6;
-const PLAYER_HEIGHT: f32 = 1.8;
-
 /// Shared state for a live Bedrock session, reachable from the game thread.
 struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
@@ -287,9 +248,9 @@ struct Bridge {
     /// off a little each client tick: one jump of half a block is a teleport,
     /// the same half block spread over five ticks is a step.
     correction: Mutex<[f32; 3]>,
-    /// Blocks around the player, for the swimming/water input flags.
-    movement_blocks: Mutex<MoveBlocks>,
-    /// Whether the previous input packet said the player was swimming.
+    /// Whether the player's body is in water, sampled from the columns.
+    in_water: AtomicBool,
+    /// Whether the previous input packet reported the swimming pose.
     sent_swimming: AtomicBool,
     /// The game's event channel, so the tick path can nudge the player without
     /// waiting for a packet to translate.
@@ -540,7 +501,7 @@ pub fn try_connect(
         last_sent: Mutex::new([0.0; 3]),
         history: Mutex::new(std::collections::VecDeque::new()),
         correction: Mutex::new([0.0; 3]),
-        movement_blocks: Mutex::new(MoveBlocks::default()),
+        in_water: AtomicBool::new(false),
         sent_swimming: AtomicBool::new(false),
         events: send.clone(),
         tick: AtomicI64::new(1),
@@ -600,6 +561,8 @@ pub fn try_connect(
         counters,
         cookies,
         debug: std::env::var_os("HORIZON_NET_DEBUG").is_some(),
+        far: Arc::new(crate::lod_net::Inbox::default()),
+        recorder: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -694,6 +657,7 @@ fn run(
         Err(e) => {
             let _ = events.send(Event::Disconnected {
                 reason: format!("Xbox sign-in failed: {e}"),
+                key: None,
                 from_server: false,
             });
             return;
@@ -712,6 +676,7 @@ fn run(
                     if attempt >= 8 {
                         let _ = events.send(Event::Disconnected {
                             reason: format!("Bedrock connection failed: {e}"),
+                            key: None,
                             from_server: false,
                         });
                         return;
@@ -727,6 +692,7 @@ fn run(
     {
         let _ = events.send(Event::Disconnected {
             reason: format!("Bedrock login failed: {e}"),
+            key: None,
             from_server: false,
         });
         return;
@@ -796,7 +762,7 @@ fn run(
         std::collections::VecDeque::new();
 
     let mut chunks_seen = 0u32;
-    let mut last_move_blocks = std::time::Instant::now()
+    let mut last_water = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
     loop {
@@ -849,9 +815,9 @@ fn run(
             let _ = events.send(event);
         }
         translate::sweep_columns(&mut ctx);
-        if last_move_blocks.elapsed() >= std::time::Duration::from_millis(25) {
-            translate::refresh_movement_blocks(&mut ctx, bridge);
-            last_move_blocks = std::time::Instant::now();
+        if last_water.elapsed() >= std::time::Duration::from_millis(50) {
+            translate::refresh_water(&ctx, bridge);
+            last_water = std::time::Instant::now();
         }
         // Sub-chunk requests queued while translating.
         if !ctx.requests.is_empty() {
@@ -866,6 +832,7 @@ fn run(
             Err(e) => {
                 let _ = events.send(Event::Disconnected {
                     reason: format!("Bedrock read failed: {e}"),
+                    key: None,
                     from_server: false,
                 });
                 return;
@@ -958,6 +925,7 @@ fn run(
 
     let _ = events.send(Event::Disconnected {
         reason: "Bedrock session closed".into(),
+        key: None,
         from_server: false,
     });
     let _ = name;
@@ -968,9 +936,9 @@ fn run(
 // -------------------------------------------------------------------------
 mod translate {
     use super::{
-        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, MoveBlock, OpenWindow,
-        PLAYER_HEIGHT, PLAYER_WIDTH, RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL,
-        REQUESTS_PER_TICK, REQUEST_WINDOW, RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
+        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, OpenWindow,
+        RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW,
+        RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
     };
     use bedrock_core::protocol as bp;
     use crate::chunk::{
@@ -1142,8 +1110,6 @@ mod translate {
         /// The other direction, built when a block use needs the runtime id of
         /// the block that was clicked.
         reverse: Option<std::collections::HashMap<u32, i32>>,
-        /// Movement flags per Java block state, resolved on first use.
-        move_flags: std::collections::HashMap<u32, u8>,
         pub air: u32,
         /// The runtime id of air in the block palette. A sub-chunk's layers are
         /// filled from the bottom up, and a layer of air means the block is in
@@ -1183,7 +1149,6 @@ mod translate {
                 table,
                 cache: vec![UNRESOLVED],
                 reverse: None,
-                move_flags: std::collections::HashMap::new(),
                 air,
                 air_runtime,
                 light,
@@ -1242,34 +1207,11 @@ mod translate {
                 .unwrap_or(0) as u32
         }
 
-        /// Whether a Java state is water, lava or climbable, for the input
-        /// flags that tell the server how to travel through it.
-        pub fn movement_flags(&mut self, state: u32) -> u8 {
-            if let Some(flags) = self.move_flags.get(&state) {
-                return *flags;
-            }
-            let flags = match self
-                .registry
+        /// Whether a Java state is a water block.
+        pub fn is_water(&self, state: u32) -> bool {
+            self.registry
                 .state(horizon_world::registry::BlockStateId(state))
-                .map(|state| state.name.as_str())
-            {
-                Some("minecraft:water") => MoveBlock::WATER,
-                Some("minecraft:lava") => MoveBlock::LAVA,
-                Some(
-                    "minecraft:ladder"
-                    | "minecraft:vine"
-                    | "minecraft:twisting_vines"
-                    | "minecraft:twisting_vines_plant"
-                    | "minecraft:weeping_vines"
-                    | "minecraft:weeping_vines_plant"
-                    | "minecraft:cave_vines"
-                    | "minecraft:cave_vines_plant"
-                    | "minecraft:scaffolding",
-                ) => MoveBlock::CLIMBABLE,
-                _ => 0,
-            };
-            self.move_flags.insert(state, flags);
-            flags
+                .is_some_and(|state| state.name == "minecraft:water")
         }
 
         fn resolve(&self, runtime_id: i32) -> u32 {
@@ -1416,35 +1358,34 @@ mod translate {
         });
     }
 
-    /// Sample the few blocks around the player that decide the swimming and
-    /// water-jump flags. This runs on the network thread, where the columns are.
-    pub fn refresh_movement_blocks(ctx: &mut Context, bridge: &Bridge) {
+    /// Whether the player's body is submerged, sampled on the network thread.
+    /// This only decides the swimming input flag; it never moves the player.
+    pub fn refresh_water(ctx: &Context, bridge: &Bridge) {
         let feet = *bridge.position.lock().unwrap();
-        let center = [
-            feet[0].floor() as i32,
-            feet[1].floor() as i32,
-            feet[2].floor() as i32,
-        ];
-        let mut flags = std::collections::HashMap::with_capacity(512);
-        let Some(blocks) = ctx.blocks.as_mut() else {
+        let Some(blocks) = ctx.blocks.as_ref() else {
             return;
         };
-        for x in center[0] - 3..=center[0] + 3 {
-            for z in center[2] - 3..=center[2] + 3 {
+        let min_x = (feet[0] - 0.3).floor() as i32;
+        let max_x = (feet[0] + 0.3).floor() as i32;
+        let min_z = (feet[2] - 0.3).floor() as i32;
+        let max_z = (feet[2] + 0.3).floor() as i32;
+        let min_y = (feet[1] + 0.4).floor() as i32;
+        let max_y = (feet[1] + 1.4).floor() as i32;
+        let mut water = false;
+        'search: for x in min_x..=max_x {
+            for z in min_z..=max_z {
                 let Some(chunk) = ctx.chunks.get(&(x >> 4, z >> 4)) else {
                     continue;
                 };
-                for y in center[1] - 3..=center[1] + 3 {
-                    let value = blocks.movement_flags(chunk.get(x & 15, y, z & 15));
-                    if value != 0 {
-                        flags.insert((x, y, z), value);
+                for y in min_y..=max_y {
+                    if blocks.is_water(chunk.get(x & 15, y, z & 15)) {
+                        water = true;
+                        break 'search;
                     }
                 }
             }
         }
-        let mut shared = bridge.movement_blocks.lock().unwrap();
-        shared.flags = flags;
-        shared.valid = true;
+        bridge.in_water.store(water, Ordering::Relaxed);
     }
 
     /// One column as the Java client wants it: every section, its heightmaps
@@ -1479,6 +1420,22 @@ mod translate {
             ClientLight::Uniform(packed) => {
                 let value = at(*packed);
                 vec![value | value << 4; 2048]
+            }
+            ClientLight::Sky(data, block) => {
+                if sky {
+                    data.to_vec()
+                } else {
+                    let value = *block;
+                    vec![value | value << 4; 2048]
+                }
+            }
+            ClientLight::Block(data, sky_light) => {
+                if sky {
+                    let value = *sky_light;
+                    vec![value | value << 4; 2048]
+                } else {
+                    data.to_vec()
+                }
             }
             ClientLight::Full(data) => data
                 .chunks_exact(2)
@@ -2870,6 +2827,11 @@ mod translate {
                     "add entity {} {} at {:?}",
                     entity.runtime_id, entity.identifier, entity.position
                 ));
+                bridge
+                    .removals
+                    .lock()
+                    .unwrap()
+                    .retain(|(_, id)| *id != entity.runtime_id);
                 ctx.entities.insert(
                     entity.runtime_id,
                     (entity.position, entity.yaw, entity.pitch, entity.head_yaw),
@@ -3201,28 +3163,29 @@ mod translate {
                 if offset[0].abs() < 0.001 && offset[1].abs() < 0.001 && offset[2].abs() < 0.001 {
                     return Vec::new();
                 }
-                let big = offset[0].abs() > 3.0 || offset[1].abs() > 3.0 || offset[2].abs() > 3.0;
-                {
-                    let mut pending = bridge.correction.lock().unwrap();
-                    for (at, add) in pending.iter_mut().zip(offset) {
-                        *at = (*at + add).clamp(-4.0, 4.0);
-                    }
-                    if big {
-                        // A teleport (respawn, a void fall) is the one case the
-                        // client has to see.
-                        *pending = [0.0; 3];
-                    }
-                }
                 bedrock_core::nethernet::trace(format!(
-                    "CORR offset=[{:.3},{:.3},{:.3}] big={big} debt={:?}",
-                    offset[0],
-                    offset[1],
-                    offset[2],
-                    *bridge.correction.lock().unwrap()
+                    "CORR offset=[{:.3},{:.3},{:.3}] held=[{:.2},{:.2},{:.2}]",
+                    offset[0], offset[1], offset[2], held[0], held[1], held[2]
                 ));
-                // Corrections are handled only in the position the bridge
-                // reports. The client camera and player are never moved.
-                Vec::new()
+                // The server is authoritative. Apply its position immediately
+                // and exactly, once, with no smoothing or interpolation. The
+                // next input starts from this position, so the server stops
+                // correcting after this tick.
+                let at = [position[0], feet, position[2]];
+                *bridge.position.lock().unwrap() = at;
+                *bridge.last_sent.lock().unwrap() = at;
+                return vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
+                    play::PlayerPosition {
+                        teleport: 0,
+                        position: [at[0] as f64, at[1] as f64, at[2] as f64],
+                        delta: [0.0; 3],
+                        // Position only: the view is already correct and a
+                        // relative rotation here would spin it.
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        relatives: 0x18,
+                    },
+                )))];
             }
             bp::Packet::MovePlayer(m) => {
                 // Bedrock reports a player's position at the eye; Java entity
@@ -3405,6 +3368,11 @@ mod translate {
                 let children = ctx.drop_children.remove(&id).unwrap_or_default();
                 let mut gone = vec![id];
                 gone.extend(children);
+                bridge
+                    .removals
+                    .lock()
+                    .unwrap()
+                    .retain(|(_, pending)| !gone.contains(pending));
                 let mut events = Vec::new();
                 for entity in gone {
                     ctx.entities.remove(&entity);
@@ -3576,6 +3544,7 @@ mod translate {
                 } else {
                     d.message.clone()
                 },
+                key: None,
                 from_server: true,
             }],
             // The client creates its own player from a position packet, and that
@@ -4205,22 +4174,17 @@ mod translate {
             was_on_ground,
             collision,
         );
-        // A real client sends the swimming pose and the water-jump flag while
-        // it is in water. The server uses them to choose liquid travel, so
-        // without them it simulates ground movement under the water.
-        let in_water = {
-            let blocks = bridge.movement_blocks.lock().unwrap();
-            blocks.touched(position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::WATER)
-        };
-        let swimming = in_water && (sprinting || move_vec[1] != 0.0);
+        // Bedrock only uses the fast sprint-water drag while the swimming
+        // pose is reported. Horizon enters that pose when sprinting and moving
+        // forward in water, so report the same start/stop edge.
+        let swimming = bridge.in_water.load(Ordering::Relaxed)
+            && sprinting
+            && move_vec[1] > 0.0;
         let was_swimming = bridge.sent_swimming.swap(swimming, Ordering::Relaxed);
         if swimming && !was_swimming {
             flags |= 1 << 29; // start_swimming
         } else if !swimming && was_swimming {
             flags |= 1 << 30; // stop_swimming
-        }
-        if in_water && input & 0x10 != 0 {
-            flags |= (1 << 7) | (1 << 21); // auto_jumping_in_water, ascend_block
         }
         if !actions.is_empty() {
             flags |= 1 << 35; // perform_block_actions
@@ -4253,18 +4217,8 @@ mod translate {
         } else if on_ground {
             flags |= 1 << 50;
         }
-        // The reported position carries whatever correction has not settled
-        // yet; the client is not moved by it.
-        let position = {
-            let offset = *bridge.correction.lock().unwrap();
-            [
-                position[0] + offset[0],
-                position[1] + offset[1],
-                position[2] + offset[2],
-            ]
-        };
         {
-            // Keep the feet position by tick for the correction handler.
+            // Keep the feet position by tick for the correction trace.
             let mut history = bridge.history.lock().unwrap();
             history.push_back((i64::try_from(tick).unwrap_or(0), position));
             while history.len() > 64 {
@@ -5444,9 +5398,9 @@ mod translate {
     /// The input for the client tick that just ended: one `PlayerAuthInput`,
     /// and the inventory resync a pickup asked for once its tick is due.
     pub fn tick_input(bridge: &Bridge) -> Vec<bp::Out> {
-        // Let a correction settle into the position the server is told. The
-        // client camera and the player are never moved by one.
-        settle_correction(bridge);
+        // The bridge's own clock. Death animations and delayed removals are
+        // scheduled against it, so it must advance once per client tick.
+        bridge.tick.fetch_add(1, Ordering::Relaxed);
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
         // A pickup is granted on the server a moment after it happens, so ask
@@ -5458,21 +5412,6 @@ mod translate {
             out.push(bedrock_core::protocol::Out::InventoryMismatch);
         }
         out
-    }
-
-    /// Let a movement correction settle into the position the server is told,
-    /// a little each client tick. It never moves the player's own view.
-    fn settle_correction(bridge: &Bridge) {
-        let mut offset = bridge.correction.lock().unwrap();
-        if *offset == [0.0; 3] {
-            return;
-        }
-        for at in offset.iter_mut() {
-            *at *= 0.98;
-            if at.abs() < 1e-4 {
-                *at = 0.0;
-            }
-        }
     }
 
     /// A block use, translated where the columns are: the state of the clicked
@@ -5687,7 +5626,11 @@ mod translate {
                     bridge.hotbar.load(Ordering::Relaxed),
                     held
                 ));
-                if let Some(from) = held {
+                // A block is consumed when it is placed. An item such as a
+                // bow, shield or firework is only started, and the count must
+                // not change.
+                let placing = held.as_ref().is_some_and(|item| item.block_runtime_id > 0);
+                if placing && let Some(from) = held {
                     let slot = bridge.hotbar.load(Ordering::Relaxed).max(0) as usize;
                     let mut items = bridge.items.lock().unwrap();
                     if let Some(entry) = items.get_mut(slot) {
@@ -5721,8 +5664,8 @@ mod translate {
                         u.pos[2] + normal[2],
                     ]
                 };
-                vec![
-                    // Placing swings the arm, as a hit does.
+                let mut out = vec![
+                    // Placing or using swings the arm, as a hit does.
                     bp::Out::Animate {
                         runtime_id,
                         action: 1, // swing_arm
@@ -5734,25 +5677,38 @@ mod translate {
                         result,
                         face: u.face,
                     },
-                    bp::Out::ItemUseOnBlock {
-                        block: u.pos,
-                        face: u.face,
-                        hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
-                        action: 0, // place
-                        item: held,
-                        cursor: u.cursor,
-                        // The transaction carries the feet position, not the
-                        // eye: the server measures reach from here.
-                        position: pos,
-                        block_id,
-                    },
-                    bp::Out::PlayerAction {
+                ];
+                if !placing {
+                    // A bow, shield, firework or other usable item starts its
+                    // use animation. A real client reports this as action 37.
+                    out.push(bp::Out::PlayerAction {
                         runtime_id,
-                        action: 29, // stop item use on
+                        action: 37, // start using item
                         position: u.pos,
                         result: [0; 3],
-                        face: 0,
-                    },
+                        face: 255,
+                    });
+                }
+                out.push(bp::Out::ItemUseOnBlock {
+                    block: u.pos,
+                    face: u.face,
+                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                    action: if placing { 0 } else { 1 }, // place / use
+                    item: held,
+                    cursor: u.cursor,
+                    // The transaction carries the feet position, not the eye:
+                    // the server measures reach from here.
+                    position: pos,
+                    block_id,
+                });
+                out.push(bp::Out::PlayerAction {
+                    runtime_id,
+                    action: 29, // stop item use on
+                    position: u.pos,
+                    result: [0; 3],
+                    face: 0,
+                });
+                out.push(
                     // The stack shrank; the held item the server shows must say
                     // so, or everyone else keeps seeing the old count.
                     bp::Out::MobEquipment {
@@ -5761,22 +5717,33 @@ mod translate {
                         window_id: 0,
                         item: held_item(bridge),
                     },
-                ]
+                );
+                out
             }
-            // Using the held item in the air (eating, throwing): the same
-            // transaction with a use action and no block.
+            // Using the held item in the air (eating, throwing, drawing,
+            // raising): the same transaction with a use action and no block.
             play::Serverbound::UseItem(_) => {
                 let pos = *bridge.position.lock().unwrap();
-                vec![bp::Out::ItemUseOnBlock {
-                    block: [0, 0, 0],
-                    face: 255,
-                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
-                    action: 1, // use
-                    item: held_item(bridge),
-                    cursor: [0.0; 3],
-                    position: pos,
-                    block_id: 0,
-                }]
+                let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
+                vec![
+                    bp::Out::PlayerAction {
+                        runtime_id,
+                        action: 37, // start using item
+                        position: [0; 3],
+                        result: [0; 3],
+                        face: 255,
+                    },
+                    bp::Out::ItemUseOnBlock {
+                        block: [0, 0, 0],
+                        face: 255,
+                        hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                        action: 1, // use
+                        item: held_item(bridge),
+                        cursor: [0.0; 3],
+                        position: pos,
+                        block_id: 0,
+                    },
+                ]
             }
             // The game closed a container: tell the server, which is the only
             // side that can actually close it.

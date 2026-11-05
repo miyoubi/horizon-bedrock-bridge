@@ -4,14 +4,14 @@ version = "0.1.1"
 priority = 100
 
 [compatibility]
-horizon_revision = "4c3bf94376193082c08c4e80443affc719598fd5"
+horizon_revision = "d7077bc27208a33a874d4c397b59f4b6e46270f1"
 
 # The Bedrock stack (RakNet, codecs, Xbox auth, crypto, mappings) is this
 # bundle's own crate; the game glue in the two modules below is thin.
 [[crate]]
 id = "engine"
 path = "engine"
-dependent = "horizon-client"
+dependent = "horizon-client-lib"
 
 # The session bridge lives in the client's `net` module: it can reach Session's
 # private fields and SocketWriter state, and it owns the translation module.
@@ -26,7 +26,7 @@ source = "session.rs"
 # address and otherwise delegates to the original `Session::start`.
 [[injection]]
 id = "connect"
-target = "horizon_client::net::Session::connect"
+target = "horizon_client_lib::net::Session::connect"
 kind = "OVERWRITE"
 helper = "hooks/connect.rs"
 bindings = [
@@ -40,7 +40,7 @@ bindings = [
 
 [[injection]]
 id = "connect-transferred"
-target = "horizon_client::net::Session::connect_transferred"
+target = "horizon_client_lib::net::Session::connect_transferred"
 kind = "OVERWRITE"
 helper = "hooks/connect_transferred.rs"
 bindings = [
@@ -58,7 +58,7 @@ bindings = [
 # with a synthesized status instead.
 [[injection]]
 id = "ping"
-target = "horizon_client::net::ping"
+target = "horizon_client_lib::net::ping"
 kind = "HEAD"
 cancellable = true
 helper = "hooks/ping.rs"
@@ -72,7 +72,7 @@ bindings = [
 # packet to the bridge, so the original encoder never runs.
 [[injection]]
 id = "send"
-target = "horizon_client::net::Session::send"
+target = "horizon_client_lib::net::Session::send"
 kind = "HEAD"
 cancellable = true
 helper = "hooks/send.rs"
@@ -83,7 +83,7 @@ bindings = [
 
 [[injection]]
 id = "disconnect"
-target = "horizon_client::net::Session::disconnect"
+target = "horizon_client_lib::net::Session::disconnect"
 kind = "HEAD"
 helper = "hooks/disconnect.rs"
 bindings = [

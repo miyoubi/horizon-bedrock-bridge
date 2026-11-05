@@ -16,5 +16,5 @@ fn connect(
     ) {
         return session;
     }
-    crate::net::Session::start(address, name, auth, info, lang, None, None, resources)
+    crate::net::Session::start(address, name, auth, info, lang, None, None, resources, false)
 }

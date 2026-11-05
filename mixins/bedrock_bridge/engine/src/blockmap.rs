@@ -170,10 +170,6 @@ fn java_name(bedrock: &str) -> String {
         "waterlily" => "lily_pad",
         "noteblock" => "note_block",
         "reeds" => "sugar_cane",
-        // The Bedrock server lets a player walk through a bamboo stalk, while
-        // Java's bamboo shape is a thin randomized column that deflects them.
-        // A bamboo sapling has the same look and no collision.
-        "bamboo" => "bamboo_sapling",
         "melon_block" => "melon",
         "mob_spawner" | "monster_spawner" => "spawner",
         "lit_redstone_ore" => "redstone_ore",

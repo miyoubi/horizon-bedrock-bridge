@@ -12,5 +12,5 @@ fn connect_transferred(
     if crate::net::bedrock::is_bedrock(address) {
         eprintln!("[bedrock] transfers to a Bedrock address are not supported yet");
     }
-    crate::net::Session::start(address, name, auth, info, lang, None, Some(cookies), resources)
+    crate::net::Session::start(address, name, auth, info, lang, None, Some(cookies), resources, false)
 }

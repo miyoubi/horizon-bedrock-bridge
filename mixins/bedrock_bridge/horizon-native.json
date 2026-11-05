@@ -1,8 +1,8 @@
 {
   "game": "26.3",
-  "horizon": "ba6344a59cb9e755b730dcf02285fc0d33b97d3c",
+  "horizon": "d7077bc27208a33a874d4c397b59f4b6e46270f1",
   "id": "bedrock_bridge",
-  "mixins": "d9c83d7096b7ea5b83678da2efdfd6161f74997e",
+  "mixins": "e8cd0aa38cffef49cb2e088ef716baa107148c02",
   "schema": 1,
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
