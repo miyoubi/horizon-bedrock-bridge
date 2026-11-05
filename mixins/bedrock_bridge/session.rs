@@ -343,6 +343,9 @@ struct Bridge {
     /// server's `Respawn` is answered only for their own request and not for
     /// the one that ends the join handshake.
     respawn_asked: AtomicBool,
+    /// The spawn info `StartGame` gave, so the death screen can be closed even
+    /// if the server's own `Respawn` is delayed behind the input tick.
+    spawn_info: Mutex<Option<play::SpawnInfo>>,
     /// Set when a teleport (a respawn) has just been applied, so the next input
     /// tells the server it was handled.
     teleport_ack: AtomicBool,
@@ -555,6 +558,7 @@ pub fn try_connect(
         resync_at: AtomicI64::new(0),
         vitals: Mutex::new(Vitals::default()),
         respawn_asked: AtomicBool::new(false),
+        spawn_info: Mutex::new(None),
         teleport_ack: AtomicBool::new(false),
         pending_use: Mutex::new(Vec::new()),
         last_use: Mutex::new(None),
@@ -2566,6 +2570,7 @@ mod translate {
                 ctx.spawn_yaw = g.yaw;
                 ctx.spawn_pitch = g.pitch;
                 ctx.spawn_info = Some(spawn.clone());
+                *bridge.spawn_info.lock().unwrap() = Some(spawn.clone());
                 // The game's chunk storage is centred on the spawn column from
                 // here on; the first publisher update only repeats it if the
                 // player has already moved away.
@@ -5581,15 +5586,23 @@ mod translate {
             // Bedrock respawns through its own handshake, sent as a client that
             // is ready to spawn, and the server then places the player.
             play::Serverbound::ClientCommand(c) if c.action == 0 => {
+                bedrock_core::nethernet::trace("respawn: client command 0".to_string());
                 bridge.respawn_asked.store(true, Ordering::Relaxed);
+                let mut out = Vec::new();
+                if let Some(spawn) = bridge.spawn_info.lock().unwrap().clone() {
+                    let _ = bridge.events.send(Event::Packet(Box::new(
+                        play::Clientbound::Respawn(play::Respawn { spawn, keep: 0 }),
+                    )));
+                }
                 let runtime_id = bridge.runtime_id.load(Ordering::Relaxed).max(0) as u64;
                 // The client-ready respawn carries no position; the server
                 // places the player where its own spawn is.
-                vec![bp::Out::Respawn {
+                out.push(bp::Out::Respawn {
                     position: [0.0; 3],
                     state: 2,
                     runtime_id,
-                }]
+                });
+                out
             }
             // Swinging the arm. Bedrock has no local swing packet: it is an
             // `Animate` of the swing-arm action on the player's own runtime id.
