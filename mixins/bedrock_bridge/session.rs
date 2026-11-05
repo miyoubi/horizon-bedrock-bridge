@@ -476,8 +476,10 @@ pub fn try_connect(
     resources: std::path::PathBuf,
 ) -> Option<Session> {
     if !is_bedrock(address) {
+        crate::motion::set_bedrock_travel(None);
         return None;
     }
+    crate::motion::set_bedrock_travel(Some(bedrock_travel));
     let (send, events) = mpsc::channel();
     let (out_tx, out_rx) = mpsc::channel::<Vec<bedrock_core::protocol::Out>>();
     let bridge = Arc::new(Bridge {
@@ -590,6 +592,7 @@ pub fn send(session: &Session, packet: &play::Serverbound) -> bool {
 pub fn on_disconnect(address: &str) {
     if let Some(bridge) = bridges().lock().unwrap().remove(address) {
         bridge.shutdown.store(true, Ordering::Relaxed);
+        crate::motion::set_bedrock_travel(None);
     }
 }
 
@@ -5871,6 +5874,66 @@ mod translate {
             _ => Vec::new(),
         }
     }
+}
+
+/// Bedrock's local liquid travel. Installed only for a Bedrock session; the
+/// Java travel remains untouched everywhere else.
+pub(crate) fn bedrock_travel(
+    world: &mut crate::motion::MotionWorld<'_, '_, '_>,
+    input: horizon_core::geometry::Vec3,
+) -> crate::Result<bool> {
+    use horizon_core::geometry::Vec3;
+    if world.player.flying || !world.player.fluids.was_touching_water {
+        return Ok(false);
+    }
+    let swimming = world.player.swimming;
+    let jumping = world.player.jumping;
+    let was_jumping = world.player.was_jumping;
+    let sprinting = world.player.sprinting;
+    let shift = world.player.shift_key_down;
+    let yaw = world.player.yaw;
+    let pitch = world.player.pitch;
+    let mut velocity = world.player.velocity;
+
+    // Bedrock's impulse is the move vector with the 0.98 multiplier, and its
+    // underwater acceleration is a fixed 0.02.
+    let impulse = Vec3::new(input.x * 0.98, input.y, input.z * 0.98);
+    let force = impulse.x * impulse.x + impulse.z * impulse.z;
+    if force >= 1.0e-4 {
+        let scale = 0.02 / force.sqrt().max(1.0);
+        let radians = f64::from(yaw) * std::f64::consts::PI / 180.0;
+        let (sin, cos) = (radians.sin(), radians.cos());
+        velocity.x += impulse.x * scale * cos - impulse.z * scale * sin;
+        velocity.z += impulse.x * scale * sin + impulse.z * scale * cos;
+    }
+    if shift {
+        velocity.y -= 0.04;
+    }
+    if jumping {
+        if swimming && !was_jumping {
+            velocity.y = 0.0;
+        } else {
+            velocity.y += 0.04;
+        }
+    } else if swimming {
+        let target = -f64::from(pitch).to_radians().sin();
+        let rate = if target < -0.2 { 0.085 } else { 0.06 };
+        velocity.y += (target - velocity.y) * rate;
+    }
+    world.player.velocity = velocity;
+    world.move_self(velocity)?;
+
+    let mut velocity = world.player.velocity;
+    let drag = if sprinting { 0.9 } else { 0.8 };
+    velocity.x *= drag;
+    velocity.z *= drag;
+    velocity.y *= 0.8;
+    if !swimming {
+        velocity.y -= 0.005;
+    }
+    world.player.velocity = velocity;
+    world.player.fall_distance = 0.0;
+    Ok(true)
 }
 
 // The Xbox sign-in helper is kept beside the session glue so the game thread
