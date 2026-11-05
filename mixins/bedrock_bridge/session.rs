@@ -3167,25 +3167,11 @@ mod translate {
                     "CORR offset=[{:.3},{:.3},{:.3}] held=[{:.2},{:.2},{:.2}]",
                     offset[0], offset[1], offset[2], held[0], held[1], held[2]
                 ));
-                // The server is authoritative. Apply its position immediately
-                // and exactly, once, with no smoothing or interpolation. The
-                // next input starts from this position, so the server stops
-                // correcting after this tick.
-                let at = [position[0], feet, position[2]];
-                *bridge.position.lock().unwrap() = at;
-                *bridge.last_sent.lock().unwrap() = at;
-                return vec![Event::Packet(Box::new(play::Clientbound::PlayerPosition(
-                    play::PlayerPosition {
-                        teleport: 0,
-                        position: [at[0] as f64, at[1] as f64, at[2] as f64],
-                        delta: [0.0; 3],
-                        // Position only: the view is already correct and a
-                        // relative rotation here would spin it.
-                        yaw: 0.0,
-                        pitch: 0.0,
-                        relatives: 0x18,
-                    },
-                )))];
+                // Never move the client from a movement correction. The
+                // server's prediction is diagnostic; the local simulation is
+                // the player's movement. Applying this packet is what caused
+                // the visible teleports and the correction feedback loop.
+                Vec::new()
             }
             bp::Packet::MovePlayer(m) => {
                 // Bedrock reports a player's position at the eye; Java entity
