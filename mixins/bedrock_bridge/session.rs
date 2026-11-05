@@ -191,6 +191,45 @@ fn split(address: &str) -> (String, u16) {
     }
 }
 
+/// What movement packets need to know about the block the player is in.
+#[derive(Clone, Copy, Default)]
+struct MoveBlock(u8);
+
+impl MoveBlock {
+    const WATER: u8 = 1;
+    const LAVA: u8 = 2;
+    const CLIMBABLE: u8 = 4;
+}
+
+/// A small snapshot of the blocks around the player, sampled on the network
+/// thread. It only feeds packet flags; it never moves the client.
+#[derive(Default)]
+struct MoveBlocks {
+    flags: HashMap<(i32, i32, i32), u8>,
+    valid: bool,
+}
+
+impl MoveBlocks {
+    fn get(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.flags.get(&(x, y, z)).copied().unwrap_or(0)
+    }
+
+    fn touched(&self, feet: [f32; 3], height: f32, width: f32, flag: u8) -> bool {
+        let min_x = (feet[0] - width * 0.5).floor() as i32;
+        let max_x = (feet[0] + width * 0.5).floor() as i32;
+        let min_z = (feet[2] - width * 0.5).floor() as i32;
+        let max_z = (feet[2] + width * 0.5).floor() as i32;
+        let min_y = (feet[1] + 0.001).floor() as i32;
+        let max_y = (feet[1] + height - 0.001).floor() as i32;
+        (min_x..=max_x).any(|x| {
+            (min_y..=max_y).any(|y| (min_z..=max_z).any(|z| self.get(x, y, z) & flag != 0))
+        })
+    }
+}
+
+const PLAYER_WIDTH: f32 = 0.6;
+const PLAYER_HEIGHT: f32 = 1.8;
+
 /// Shared state for a live Bedrock session, reachable from the game thread.
 struct Bridge {
     /// Outbound Java packets translated to Bedrock on the game thread.
@@ -248,6 +287,10 @@ struct Bridge {
     /// off a little each client tick: one jump of half a block is a teleport,
     /// the same half block spread over five ticks is a step.
     correction: Mutex<[f32; 3]>,
+    /// Blocks around the player, for the swimming/water input flags.
+    movement_blocks: Mutex<MoveBlocks>,
+    /// Whether the previous input packet said the player was swimming.
+    sent_swimming: AtomicBool,
     /// The game's event channel, so the tick path can nudge the player without
     /// waiting for a packet to translate.
     events: mpsc::Sender<Event>,
@@ -494,6 +537,8 @@ pub fn try_connect(
         last_sent: Mutex::new([0.0; 3]),
         history: Mutex::new(std::collections::VecDeque::new()),
         correction: Mutex::new([0.0; 3]),
+        movement_blocks: Mutex::new(MoveBlocks::default()),
+        sent_swimming: AtomicBool::new(false),
         events: send.clone(),
         tick: AtomicI64::new(1),
         input_tick: AtomicI64::new(0),
@@ -747,6 +792,9 @@ fn run(
         std::collections::VecDeque::new();
 
     let mut chunks_seen = 0u32;
+    let mut last_move_blocks = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
         // shutdown) ends the thread.
@@ -797,6 +845,10 @@ fn run(
             let _ = events.send(event);
         }
         translate::sweep_columns(&mut ctx);
+        if last_move_blocks.elapsed() >= std::time::Duration::from_millis(25) {
+            translate::refresh_movement_blocks(&mut ctx, bridge);
+            last_move_blocks = std::time::Instant::now();
+        }
         // Sub-chunk requests queued while translating.
         if !ctx.requests.is_empty() {
             let batch: Vec<bedrock_core::protocol::Out> = ctx.requests.drain(..).collect();
@@ -912,9 +964,9 @@ fn run(
 // -------------------------------------------------------------------------
 mod translate {
     use super::{
-        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, OpenWindow,
-        RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL, REQUESTS_PER_TICK, REQUEST_WINDOW,
-        RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
+        Bridge, COLUMN_PATIENCE, EMIT_BURST, EMIT_PER_SECOND, Event, Items, MoveBlock, OpenWindow,
+        PLAYER_HEIGHT, PLAYER_WIDTH, RECEIVE_QUEUE_LIMIT, REGION_PATIENCE, REQUEST_INTERVAL,
+        REQUESTS_PER_TICK, REQUEST_WINDOW, RUNTIME_ID_RADIUS, SWEEP_INTERVAL, WindowKind,
     };
     use bedrock_core::protocol as bp;
     use crate::chunk::{
@@ -1086,6 +1138,8 @@ mod translate {
         /// The other direction, built when a block use needs the runtime id of
         /// the block that was clicked.
         reverse: Option<std::collections::HashMap<u32, i32>>,
+        /// Movement flags per Java block state, resolved on first use.
+        move_flags: std::collections::HashMap<u32, u8>,
         pub air: u32,
         /// The runtime id of air in the block palette. A sub-chunk's layers are
         /// filled from the bottom up, and a layer of air means the block is in
@@ -1125,6 +1179,7 @@ mod translate {
                 table,
                 cache: vec![UNRESOLVED],
                 reverse: None,
+                move_flags: std::collections::HashMap::new(),
                 air,
                 air_runtime,
                 light,
@@ -1181,6 +1236,36 @@ mod translate {
                 .as_ref()
                 .and_then(|map| map.get(&java).copied())
                 .unwrap_or(0) as u32
+        }
+
+        /// Whether a Java state is water, lava or climbable, for the input
+        /// flags that tell the server how to travel through it.
+        pub fn movement_flags(&mut self, state: u32) -> u8 {
+            if let Some(flags) = self.move_flags.get(&state) {
+                return *flags;
+            }
+            let flags = match self
+                .registry
+                .state(horizon_world::registry::BlockStateId(state))
+                .map(|state| state.name.as_str())
+            {
+                Some("minecraft:water") => MoveBlock::WATER,
+                Some("minecraft:lava") => MoveBlock::LAVA,
+                Some(
+                    "minecraft:ladder"
+                    | "minecraft:vine"
+                    | "minecraft:twisting_vines"
+                    | "minecraft:twisting_vines_plant"
+                    | "minecraft:weeping_vines"
+                    | "minecraft:weeping_vines_plant"
+                    | "minecraft:cave_vines"
+                    | "minecraft:cave_vines_plant"
+                    | "minecraft:scaffolding",
+                ) => MoveBlock::CLIMBABLE,
+                _ => 0,
+            };
+            self.move_flags.insert(state, flags);
+            flags
         }
 
         fn resolve(&self, runtime_id: i32) -> u32 {
@@ -1311,6 +1396,37 @@ mod translate {
         }
         let section = entry[slot].get_or_insert_with(|| Box::new([0u32; 4096]));
         section[(((pos[1] & 15) << 8) | ((pos[2] & 15) << 4) | (pos[0] & 15)) as usize] = id;
+    }
+
+    /// Sample the few blocks around the player that decide the swimming and
+    /// water-jump flags. This runs on the network thread, where the columns are.
+    pub fn refresh_movement_blocks(ctx: &mut Context, bridge: &Bridge) {
+        let feet = *bridge.position.lock().unwrap();
+        let center = [
+            feet[0].floor() as i32,
+            feet[1].floor() as i32,
+            feet[2].floor() as i32,
+        ];
+        let mut flags = std::collections::HashMap::with_capacity(512);
+        let Some(blocks) = ctx.blocks.as_mut() else {
+            return;
+        };
+        for x in center[0] - 3..=center[0] + 3 {
+            for z in center[2] - 3..=center[2] + 3 {
+                let Some(chunk) = ctx.chunks.get(&(x >> 4, z >> 4)) else {
+                    continue;
+                };
+                for y in center[1] - 3..=center[1] + 3 {
+                    let value = blocks.movement_flags(chunk.get(x & 15, y, z & 15));
+                    if value != 0 {
+                        flags.insert((x, y, z), value);
+                    }
+                }
+            }
+        }
+        let mut shared = bridge.movement_blocks.lock().unwrap();
+        shared.flags = flags;
+        shared.valid = true;
     }
 
     /// One column as the Java client wants it: every section, its heightmaps
@@ -4074,6 +4190,23 @@ mod translate {
             was_on_ground,
             collision,
         );
+        // A real client sends the swimming pose and the water-jump flag while
+        // it is in water. The server uses them to choose liquid travel, so
+        // without them it simulates ground movement under the water.
+        let in_water = {
+            let blocks = bridge.movement_blocks.lock().unwrap();
+            blocks.touched(position, PLAYER_HEIGHT, PLAYER_WIDTH, MoveBlock::WATER)
+        };
+        let swimming = in_water && (sprinting || move_vec[1] != 0.0);
+        let was_swimming = bridge.sent_swimming.swap(swimming, Ordering::Relaxed);
+        if swimming && !was_swimming {
+            flags |= 1 << 29; // start_swimming
+        } else if !swimming && was_swimming {
+            flags |= 1 << 30; // stop_swimming
+        }
+        if in_water && input & 0x10 != 0 {
+            flags |= (1 << 7) | (1 << 21); // auto_jumping_in_water, ascend_block
+        }
         if !actions.is_empty() {
             flags |= 1 << 35; // perform_block_actions
         }
@@ -4096,6 +4229,15 @@ mod translate {
             *last = position;
             d
         };
+        // A server reads the vertical-collision bit together with a falling
+        // delta to decide that the player is on ground. Sending it while
+        // swimming or jumping up makes water travel pick ground physics, so
+        // report it only for a descending tick.
+        if delta[1] >= 0.0 {
+            flags &= !(1 << 50);
+        } else if on_ground {
+            flags |= 1 << 50;
+        }
         // The reported position carries whatever correction has not settled
         // yet; the client is not moved by it.
         let position = {
