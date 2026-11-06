@@ -76,6 +76,17 @@ pub enum Packet {
     AddEntity(AddEntity),
     RemoveEntity(u64),
     SetEntityData(SetEntityData),
+    /// A mob effect being added, changed or removed. `event` is 1 add, 2
+    /// update, 3 remove; the rest is the effect the server applied.
+    MobEffect {
+        runtime_id: u64,
+        event: u8,
+        effect: i32,
+        amplifier: i32,
+        particles: bool,
+        duration: i32,
+        ambient: bool,
+    },
     MovePlayer(MovePlayer),
     MoveEntityAbsolute(MoveEntityAbsolute),
     MoveActorDelta(MoveActorDelta),
@@ -411,6 +422,25 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::ADD_ENTITY => Packet::AddEntity(AddEntity::read(&mut r)?),
         ids::REMOVE_ENTITY => Packet::RemoveEntity(r.varlong()?),
         ids::SET_ENTITY_DATA => Packet::SetEntityData(SetEntityData::read(&mut r)?),
+        ids::MOB_EFFECT => {
+            let runtime_id = r.varlong()?;
+            let event = r.u8()?;
+            let effect = r.zigzag32()?;
+            let amplifier = r.zigzag32()?;
+            let particles = r.bool()?;
+            let duration = r.zigzag32()?;
+            let _tick = r.varlong()?;
+            let ambient = r.bool()?;
+            Packet::MobEffect {
+                runtime_id,
+                event,
+                effect,
+                amplifier,
+                particles,
+                duration,
+                ambient,
+            }
+        }
         ids::MOVE_PLAYER => Packet::MovePlayer(MovePlayer::read(&mut r)?),
         ids::MOVE_ENTITY_ABSOLUTE => Packet::MoveEntityAbsolute(MoveEntityAbsolute::read(&mut r)?),
         ids::MOVE_ACTOR_DELTA => Packet::MoveActorDelta(MoveActorDelta::read(&mut r)?),
@@ -1276,6 +1306,47 @@ pub fn is_known(id: u32) -> bool {
             | ids::MOVE_PLAYER
             | ids::TEXT
     )
+}
+
+#[cfg(test)]
+mod mob_effect_tests {
+    use super::*;
+    use crate::stream::Writer;
+
+    /// The effect packet is runtime id, event, effect, amplifier, particles,
+    /// duration, the input tick and ambient, in that order.
+    #[test]
+    fn mob_effect_reads_its_fields() {
+        let mut w = Writer::new();
+        w.varlong(42)
+            .u8(1) // add
+            .zigzag32(19) // poison
+            .zigzag32(2) // amplifier
+            .bool(true) // particles
+            .zigzag32(600) // duration
+            .varlong(7) // input tick
+            .bool(false); // ambient
+        let packet = decode(ids::MOB_EFFECT, &w.into_inner()).unwrap();
+        let Packet::MobEffect {
+            runtime_id,
+            event,
+            effect,
+            amplifier,
+            particles,
+            duration,
+            ambient,
+        } = packet
+        else {
+            panic!("expected a mob effect");
+        };
+        assert_eq!(runtime_id, 42);
+        assert_eq!(event, 1);
+        assert_eq!(effect, 19);
+        assert_eq!(amplifier, 2);
+        assert!(particles);
+        assert_eq!(duration, 600);
+        assert!(!ambient);
+    }
 }
 
 #[cfg(test)]

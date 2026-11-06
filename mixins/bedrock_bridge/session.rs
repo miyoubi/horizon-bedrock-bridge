@@ -3108,6 +3108,61 @@ mod translate {
                     },
                 )))]
             }
+            // A mob effect the server added, changed or removed. Java has no
+            // add/update split, so both become an update; the flags carry the
+            // server's ambient and particle choice, and the duration and
+            // amplifier are its own.
+            bp::Packet::MobEffect {
+                runtime_id,
+                event,
+                effect,
+                amplifier,
+                particles,
+                duration,
+                ambient,
+            } => {
+                let Some(java) = java_effect_id(*effect) else {
+                    bedrock_core::nethernet::trace(format!(
+                        "mob effect {effect} on {runtime_id}: no Java effect"
+                    ));
+                    return Vec::new();
+                };
+                let id = *runtime_id as i32;
+                match *event {
+                    // Remove.
+                    3 => vec![Event::Packet(Box::new(
+                        play::Clientbound::RemoveMobEffect(play::RemoveMobEffect {
+                            id,
+                            effect: java,
+                        }),
+                    ))],
+                    // Add and update.
+                    1 | 2 => {
+                        let mut flags = 0i8;
+                        if *ambient {
+                            flags |= 1; // ambient
+                        }
+                        if *particles {
+                            flags |= 2; // visible
+                        }
+                        let duration = if *duration == -1 {
+                            -1
+                        } else {
+                            (*duration).max(0)
+                        };
+                        vec![Event::Packet(Box::new(
+                            play::Clientbound::UpdateMobEffect(play::UpdateMobEffect {
+                                id,
+                                effect: java,
+                                amplifier: *amplifier,
+                                duration,
+                                flags,
+                            }),
+                        ))]
+                    }
+                    _ => Vec::new(),
+                }
+            }
             // The item registry: the network ids every inventory and equipment
             // packet names an item by. It arrives once, after `StartGame`.
             bp::Packet::ItemRegistry(items) => {
@@ -4315,6 +4370,62 @@ mod translate {
     fn map_item_by_id(ctx: &Context, runtime_id: i16, count: i32) -> Option<Stack> {
         let id = item_by_network_id(ctx.mappings, ctx.builtin, &ctx.items, runtime_id);
         (id != 0 && count > 0).then(|| Stack::new(id, count))
+    }
+
+    /// Bedrock's numeric effect id as the effect's name. The ids are the
+    /// server's own order, which is not the Java registry order.
+    fn bedrock_effect_name(id: i32) -> Option<&'static str> {
+        Some(match id {
+            1 => "speed",
+            2 => "slowness",
+            3 => "haste",
+            4 => "mining_fatigue",
+            5 => "strength",
+            6 => "instant_health",
+            7 => "instant_damage",
+            8 => "jump_boost",
+            9 => "nausea",
+            10 => "regeneration",
+            11 => "resistance",
+            12 => "fire_resistance",
+            13 => "water_breathing",
+            14 => "invisibility",
+            15 => "blindness",
+            16 => "night_vision",
+            17 => "hunger",
+            18 => "weakness",
+            19 => "poison",
+            20 => "wither",
+            21 => "health_boost",
+            22 => "absorption",
+            23 => "saturation",
+            24 => "levitation",
+            // Bedrock's fatal poison is Java's poison; the server sends a
+            // stronger amplifier for it.
+            25 => "poison",
+            26 => "conduit_power",
+            27 => "slow_falling",
+            28 => "bad_omen",
+            29 => "hero_of_the_village",
+            30 => "darkness",
+            31 => "trial_omen",
+            32 => "wind_charged",
+            33 => "weaving",
+            34 => "oozing",
+            35 => "infested",
+            36 => "raid_omen",
+            37 => "breath_of_the_nautilus",
+            _ => return None,
+        })
+    }
+
+    /// The Java registry id for a Bedrock effect. Java names its effects in
+    /// registry order, so the name is what joins the two lists.
+    fn java_effect_id(id: i32) -> Option<i32> {
+        let name = bedrock_effect_name(id)?;
+        horizon_client_core::potions::all_effects()
+            .position(|effect| effect.id == name)
+            .and_then(|index| i32::try_from(index).ok())
     }
 
     /// The stack in the selected hotbar slot, as a descriptor for transactions.
