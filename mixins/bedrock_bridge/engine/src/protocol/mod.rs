@@ -1350,6 +1350,49 @@ mod mob_effect_tests {
 }
 
 #[cfg(test)]
+mod add_player_tests {
+    use super::*;
+    use crate::stream::Writer;
+
+    /// A spawn carries the player's unique id only in the abilities data at
+    /// the end; the removal names that id, so it has to be read.
+    #[test]
+    fn add_player_reads_the_unique_id_from_the_abilities_data() {
+        let mut w = Writer::new();
+        w.bytes(&[7; 16])
+            .string("Tester")
+            .varlong(99)
+            .string("")
+            .f32(1.0)
+            .f32(2.0)
+            .f32(3.0) // position
+            .f32(0.0)
+            .f32(0.0)
+            .f32(0.0) // velocity
+            .f32(0.0)
+            .f32(90.0)
+            .f32(90.0) // pitch, yaw, head yaw
+            // An empty item descriptor: zero id, count, net id, block id and
+            // user data.
+            .i16(0)
+            .i16(0)
+            .varint(0)
+            .bool(false)
+            .varint(0)
+            .varint(0)
+            .zigzag32(0) // game mode
+            .varint(0) // no metadata
+            .varint(0) // no int properties
+            .varint(0) // no float properties
+            .i64(-123_456_789); // abilities data: target actor unique id
+        let player = AddPlayer::read(&mut Reader::new(&w.into_inner())).unwrap();
+        assert_eq!(player.username, "Tester");
+        assert_eq!(player.runtime_id, 99);
+        assert_eq!(player.unique_id, -123_456_789);
+    }
+}
+
+#[cfg(test)]
 mod inventory_tests {
     use super::*;
     use crate::stream::{Reader, Writer};

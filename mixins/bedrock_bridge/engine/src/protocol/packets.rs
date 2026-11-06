@@ -388,6 +388,10 @@ pub struct AddPlayer {
     pub uuid: [u8; 16],
     pub username: String,
     pub runtime_id: u64,
+    /// The server's unique id for the player, from the abilities data at the
+    /// end. A removal names this id, not the runtime id, so it is what maps
+    /// one to the other.
+    pub unique_id: i64,
     pub position: [f32; 3],
     pub velocity: [f32; 3],
     pub pitch: f32,
@@ -412,10 +416,26 @@ impl AddPlayer {
         let held_item = NetworkItem::read(r)?;
         let gamemode = r.zigzag32()?;
         let metadata = read_metadata(r)?;
+        // Synched properties: two indexed lists, ints then floats.
+        let ints = r.varint()?;
+        for _ in 0..ints {
+            let _index = r.varint()?;
+            let _value = r.zigzag32()?;
+        }
+        let floats = r.varint()?;
+        for _ in 0..floats {
+            let _index = r.varint()?;
+            let _value = r.f32()?;
+        }
+        // The abilities data starts with the player's unique entity id. It is a
+        // plain little-endian long, not a varint, and it is what a removal
+        // names.
+        let unique_id = r.i64()?;
         Ok(AddPlayer {
             uuid,
             username,
             runtime_id,
+            unique_id,
             position,
             velocity,
             pitch,

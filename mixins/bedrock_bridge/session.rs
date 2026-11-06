@@ -780,6 +780,7 @@ fn run(
     let mut last_water = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
+    let mut last_entity_sweep = std::time::Instant::now();
     loop {
         // Outbound Java → Bedrock. The channel closing (or the game signalling
         // shutdown) ends the thread.
@@ -830,6 +831,12 @@ fn run(
             let _ = events.send(event);
         }
         translate::sweep_columns(&mut ctx);
+        if last_entity_sweep.elapsed() >= std::time::Duration::from_secs(1) {
+            for event in translate::sweep_entities(&mut ctx) {
+                let _ = events.send(event);
+            }
+            last_entity_sweep = std::time::Instant::now();
+        }
         if last_water.elapsed() >= std::time::Duration::from_millis(50) {
             translate::refresh_water(&ctx, bridge);
             last_water = std::time::Instant::now();
@@ -2569,6 +2576,77 @@ mod translate {
         )))]
     }
 
+    /// Whether the client still holds an entity under this runtime id.
+    fn entity_held(ctx: &Context, id: u64) -> bool {
+        ctx.entities.contains_key(&id)
+            || ctx.drops.contains_key(&id)
+            || ctx.players.contains(&id)
+            || ctx.kinds.contains_key(&id)
+    }
+
+    /// Drop every table entry for a runtime id. The id is about to be reused
+    /// or has been removed by the server; either way nothing may keep pointing
+    /// at it.
+    fn forget_entity(ctx: &mut Context, id: u64) {
+        ctx.entities.remove(&id);
+        ctx.kinds.remove(&id);
+        ctx.players.remove(&id);
+        ctx.drops.remove(&id);
+        ctx.drop_owner.remove(&id);
+        ctx.drop_children.remove(&id);
+        ctx.uniques.retain(|_, runtime| *runtime != id);
+    }
+
+    /// Take away every entity that has left the area the server publishes. A
+    /// real client unloads them with the chunks; the bridge keeps its own
+    /// entity table, so an entity the server forgets to remove would stay on
+    /// screen forever.
+    pub fn sweep_entities(ctx: &mut Context) -> Vec<Event> {
+        let Some((cx, cz)) = ctx.wanted_center else {
+            return Vec::new();
+        };
+        let radius = i64::from(ctx.radius.max(2) + 2);
+        let mut gone: Vec<u64> = Vec::new();
+        for (&id, &(position, ..)) in &ctx.entities {
+            let x = (position[0].floor() as i32) >> 4;
+            let z = (position[2].floor() as i32) >> 4;
+            let dx = i64::from(x - cx);
+            let dz = i64::from(z - cz);
+            if dx * dx + dz * dz > radius * radius {
+                gone.push(id);
+            }
+        }
+        if gone.is_empty() {
+            return Vec::new();
+        }
+        // A folded drop leaves with the stack it joined.
+        let mut index = 0;
+        while index < gone.len() {
+            if let Some(children) = ctx.drop_children.remove(&gone[index]) {
+                gone.extend(children);
+            }
+            index += 1;
+        }
+        gone.sort_unstable();
+        gone.dedup();
+        for id in &gone {
+            forget_entity(ctx, *id);
+        }
+        if std::env::var_os("HZ_ENT_TRACE").is_some() {
+            bedrock_core::nethernet::trace(format!(
+                "SWEEP center={:?} radius={} ids={:?}",
+                (cx, cz),
+                radius,
+                gone
+            ));
+        }
+        vec![Event::Packet(Box::new(play::Clientbound::RemoveEntities(
+            play::RemoveEntities {
+                ids: gone.into_iter().map(|id| id as i32).collect(),
+            },
+        )))]
+    }
+
     fn clientbound_inner(ctx: &mut Context, bridge: &Bridge, packet: &bp::Packet) -> Vec<Event> {
         match packet {
             bp::Packet::StartGame(g) => {
@@ -2890,14 +2968,39 @@ mod translate {
                     .lock()
                     .unwrap()
                     .retain(|(_, id)| *id != entity.runtime_id);
+                // A reused runtime id, or a reused unique id under a new
+                // runtime id, must not leave the old body behind.
+                let unique = entity.unique_id as u64;
+                let old = ctx.uniques.get(&unique).copied();
+                let mut events = Vec::new();
+                if let Some(old) = old.filter(|id| *id != entity.runtime_id) {
+                    if entity_held(ctx, old) {
+                        forget_entity(ctx, old);
+                        events.push(Event::Packet(Box::new(
+                            play::Clientbound::RemoveEntities(play::RemoveEntities {
+                                ids: vec![old as i32],
+                            }),
+                        )));
+                    }
+                }
+                let stale = entity_held(ctx, entity.runtime_id);
+                if stale {
+                    forget_entity(ctx, entity.runtime_id);
+                }
                 ctx.entities.insert(
                     entity.runtime_id,
                     (entity.position, entity.yaw, entity.pitch, entity.head_yaw),
                 );
                 ctx.kinds.insert(entity.runtime_id, java_name.clone());
-                ctx.uniques
-                    .insert(entity.unique_id as u64, entity.runtime_id);
-                vec![Event::Packet(Box::new(play::Clientbound::AddEntity(
+                ctx.uniques.insert(unique, entity.runtime_id);
+                if stale {
+                    events.push(Event::Packet(Box::new(
+                        play::Clientbound::RemoveEntities(play::RemoveEntities {
+                            ids: vec![entity.runtime_id as i32],
+                        }),
+                    )));
+                }
+                events.push(Event::Packet(Box::new(play::Clientbound::AddEntity(
                     play::AddEntity {
                         id: entity.runtime_id as i32,
                         uuid: entity.unique_id as u128,
@@ -2917,7 +3020,8 @@ mod translate {
                         head_yaw: (entity.head_yaw / (360.0 / 256.0)) as i8,
                         data: 0,
                     },
-                )))]
+                ))));
+                events
             }
             // A dropped item: spawn the Java item entity and put the stack in
             // its metadata (index 8 is the item entity's stack).
@@ -2999,8 +3103,7 @@ mod translate {
                 }
                 let mut events = Vec::new();
                 for id in flying {
-                    ctx.drops.remove(&id);
-                    ctx.entities.remove(&id);
+                    forget_entity(ctx, id);
                     events.push(Event::Packet(Box::new(
                         play::Clientbound::TakeItemEntity(play::TakeItemEntity {
                             item: id as i32,
@@ -3025,6 +3128,32 @@ mod translate {
                 let Some(kind) = entity_type_id(ctx, "minecraft:player") else {
                     return Vec::new();
                 };
+                let mut events = Vec::new();
+                let unique = player.unique_id as u64;
+                // A player who respawns can come back on a runtime id the
+                // client still holds, or with a new one under the same unique
+                // id. Take the old body away first, or the old and new player
+                // share a runtime id or leave the old one behind.
+                let old = ctx.uniques.get(&unique).copied();
+                if let Some(old) = old.filter(|id| *id != player.runtime_id) {
+                    if entity_held(ctx, old) {
+                        forget_entity(ctx, old);
+                        events.push(Event::Packet(Box::new(
+                            play::Clientbound::RemoveEntities(play::RemoveEntities {
+                                ids: vec![old as i32],
+                            }),
+                        )));
+                    }
+                }
+                if entity_held(ctx, player.runtime_id) {
+                    forget_entity(ctx, player.runtime_id);
+                    events.push(Event::Packet(Box::new(
+                        play::Clientbound::RemoveEntities(play::RemoveEntities {
+                            ids: vec![player.runtime_id as i32],
+                        }),
+                    )));
+                }
+                ctx.uniques.insert(unique, player.runtime_id);
                 ctx.players.insert(player.runtime_id);
                 ctx.kinds
                     .insert(player.runtime_id, "minecraft:player".to_owned());
@@ -3034,20 +3163,20 @@ mod translate {
                 );
                 // The server's player-list entries carry no name, so the tab
                 // entry for a player is built from the spawn, which names it.
-                vec![
-                    Event::Packet(Box::new(play::Clientbound::PlayerInfoUpdate(
-                        play::PlayerInfoUpdate {
-                            actions: 0b0001_1001, // add, latency, listed
-                            entries: vec![play::PlayerInfo {
-                                uuid,
-                                name: Some(player.username.clone()),
-                                listed: Some(true),
-                                latency: Some(0),
-                                ..Default::default()
-                            }],
-                        },
-                    ))),
-                    Event::Packet(Box::new(play::Clientbound::AddEntity(play::AddEntity {
+                events.push(Event::Packet(Box::new(
+                    play::Clientbound::PlayerInfoUpdate(play::PlayerInfoUpdate {
+                        actions: 0b0001_1001, // add, latency, listed
+                        entries: vec![play::PlayerInfo {
+                            uuid,
+                            name: Some(player.username.clone()),
+                            listed: Some(true),
+                            latency: Some(0),
+                            ..Default::default()
+                        }],
+                    }),
+                )));
+                events.push(Event::Packet(Box::new(play::Clientbound::AddEntity(
+                    play::AddEntity {
                         id: player.runtime_id as i32,
                         uuid,
                         kind,
@@ -3061,8 +3190,9 @@ mod translate {
                         yaw: (player.yaw / (360.0 / 256.0)) as i8,
                         head_yaw: 0,
                         data: 0,
-                    }))),
-                ]
+                    },
+                ))));
+                events
             }
             // Entity metadata. Bedrock's actor flags (index 0, a long) become
             // Java's shared-flags byte: on-fire, sneaking, sprinting and
@@ -3306,6 +3436,18 @@ mod translate {
                         },
                     )))]
                 } else {
+                    // Keep the stored position current: the entity sweep and
+                    // the hurt/death sounds use it, and a player who walks
+                    // away must look away to it.
+                    ctx.entities.insert(
+                        m.runtime_id,
+                        (
+                            [position[0] as f32, position[1] as f32, position[2] as f32],
+                            m.yaw,
+                            m.pitch,
+                            m.head_yaw,
+                        ),
+                    );
                     // The head turns on its own (head_yaw) while the body yaw
                     // lags behind, so without the head rotation a player only
                     // appears to pitch.
@@ -3443,7 +3585,26 @@ mod translate {
                 }),
             ))],
             bp::Packet::RemoveEntity(unique) => {
-                let id = ctx.uniques.remove(unique).unwrap_or(*unique);
+                // A removal names the unique id, not the runtime id the game
+                // was told about. Without the mapping the old code used the
+                // unique id as a runtime id, which could take away a different
+                // entity or leave a ghost; an unknown id is now only traced.
+                let Some(id) = ctx.uniques.remove(unique) else {
+                    if std::env::var_os("HZ_ENT_TRACE").is_some() {
+                        bedrock_core::nethernet::trace(format!(
+                            "REMOVE unique={unique} unknown"
+                        ));
+                    }
+                    return Vec::new();
+                };
+                if !entity_held(ctx, id) {
+                    if std::env::var_os("HZ_ENT_TRACE").is_some() {
+                        bedrock_core::nethernet::trace(format!(
+                            "REMOVE unique={unique} runtime={id} already gone"
+                        ));
+                    }
+                    return Vec::new();
+                }
                 // The server folds a pile of dropped stacks by taking the
                 // absorbed actors away. Each of them still stands for a part of
                 // that pile, so keep it on the ground and take it away with the
@@ -3467,24 +3628,25 @@ mod translate {
                 let children = ctx.drop_children.remove(&id).unwrap_or_default();
                 let mut gone = vec![id];
                 gone.extend(children);
+                gone.retain(|entity| entity_held(ctx, *entity));
                 bridge
                     .removals
                     .lock()
                     .unwrap()
                     .retain(|(_, pending)| !gone.contains(pending));
-                let mut events = Vec::new();
-                for entity in gone {
-                    ctx.entities.remove(&entity);
-                    ctx.kinds.remove(&entity);
-                    ctx.players.remove(&entity);
-                    ctx.drops.remove(&entity);
-                    events.push(Event::Packet(Box::new(play::Clientbound::RemoveEntities(
-                        play::RemoveEntities {
-                            ids: vec![entity as i32],
-                        },
-                    ))));
+                for entity in &gone {
+                    forget_entity(ctx, *entity);
                 }
-                events
+                if std::env::var_os("HZ_ENT_TRACE").is_some() {
+                    bedrock_core::nethernet::trace(format!(
+                        "REMOVE unique={unique} runtime={id} ids={gone:?}"
+                    ));
+                }
+                vec![Event::Packet(Box::new(play::Clientbound::RemoveEntities(
+                    play::RemoveEntities {
+                        ids: gone.into_iter().map(|id| id as i32).collect(),
+                    },
+                )))]
             }
             // An entity was hurt. The game's damage event flashes it red, and
             // for our own player plays the hurt sound; another entity gets a
@@ -3544,10 +3706,7 @@ mod translate {
                 }
                 let due = bridge.tick.load(Ordering::Relaxed) + 20;
                 for entity in gone {
-                    ctx.entities.remove(&entity);
-                    ctx.kinds.remove(&entity);
-                    ctx.players.remove(&entity);
-                    ctx.drops.remove(&entity);
+                    forget_entity(ctx, entity);
                     if std::env::var_os("HZ_ENT_TRACE").is_some() {
                         bedrock_core::nethernet::trace(format!(
                             "DEATH id={entity} own={} due={due}",
