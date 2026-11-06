@@ -197,8 +197,12 @@ struct Bridge {
     outbound: mpsc::Sender<Vec<bedrock_core::protocol::Out>>,
     runtime_id: AtomicI64,
     /// The player's unique id as `StartGame` reported it, which a command
-    /// origin carries.
+    /// origin carries. A respawn can hand the player a new one, so the player
+    /// list's own entry updates it too.
     unique_id: AtomicI64,
+    /// The player's account uuid from the player list. A command origin carries
+    /// the player's own uuid, not a fresh one per command.
+    player_uuid: Mutex<Option<[u8; 16]>>,
     /// The chunk radius this session streams: the smaller of the game's
     /// render-distance setting and the server's grant. Login and
     /// `SetChunkCacheRadius` both carry it, and it bounds the columns the
@@ -495,6 +499,7 @@ pub fn try_connect(
         outbound: out_tx,
         runtime_id: AtomicI64::new(0),
         unique_id: AtomicI64::new(0),
+        player_uuid: Mutex::new(None),
         chunk_radius: AtomicI32::new(
             i32::from(view_distance).max(2).min(BEDROCK_MAX_RADIUS),
         ),
@@ -3869,6 +3874,18 @@ mod translate {
             // carried in the entry but not sent yet: Java wants a PNG behind a
             // textures property, and Bedrock hands over raw RGBA.
             bp::Packet::PlayerList(list) => {
+                // The entry with no name is the local player: a real client
+                // gets its own uuid and actor id from here, and both are what
+                // a command origin names.
+                for entry in &list.entries {
+                    if entry.username.is_empty() {
+                        *bridge.player_uuid.lock().unwrap() = Some(entry.uuid);
+                        if list.kind == 0 && entry.unique_id != 0 {
+                            ctx.unique_id = entry.unique_id;
+                            bridge.unique_id.store(entry.unique_id, Ordering::Relaxed);
+                        }
+                    }
+                }
                 let entries: Vec<play::PlayerInfo> = list
                     .entries
                     .iter()
@@ -6252,11 +6269,12 @@ mod translate {
                         bridge.unique_id.load(Ordering::Relaxed)
                     ));
                 }
+                let uuid = *bridge.player_uuid.lock().unwrap();
                 vec![bp::Out::CommandRequest {
                     command: format!("/{}", c.command),
                     player_id: bridge.unique_id.load(Ordering::Relaxed),
                     numeric: super::command_numeric_layout(),
-                    uuid: None,
+                    uuid,
                 }]
             }
             _ => Vec::new(),

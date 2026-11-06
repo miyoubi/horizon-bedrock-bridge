@@ -1377,6 +1377,8 @@ fn image(r: &mut Reader) -> Result<(u32, u32, Vec<u8>)> {
 /// A `PlayerList` (63) update: the server's players, their names and skins.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerList {
+    /// 0 add, 1 remove.
+    pub kind: u8,
     pub entries: Vec<PlayerListEntry>,
 }
 
@@ -1423,7 +1425,7 @@ impl PlayerList {
                 r.bool()?;
             }
         }
-        Ok(PlayerList { entries })
+        Ok(PlayerList { kind, entries })
     }
 }
 
