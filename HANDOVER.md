@@ -1048,3 +1048,57 @@ own light module.
   before optimising anything.
 - Read crashes from the play log first: `crates/horizon-client/src/net.rs:<n>`
   maps into the injected `session.rs`.
+
+## Parity after movement — current state
+
+Seven commits on `main` after the movement work, each built and launched against
+the local server with no panic:
+
+| Commit | What it did |
+|---|---|
+| `a444059` | Hold-style usable items start with `StartUsingItem`, use the `Use` action, and end with an `ItemReleaseTransaction`. The release was missing its empty action list, which made the server drop the session: that is fixed. A block click that passes to the item is dropped and the item use goes out alone. Non-place items never carry an inventory action, so the held stack is not shrunk. |
+| `54d2b27` | `MobEffect` is decoded and add/update/remove become the game's effect packets. Bedrock ids are mapped by name to the Java registry; the live server puts `raid_omen` at 36 and `infested` at 35, the reverse of one reference list. |
+| `d4ffdae` | The player's unique id is read from the spawn's abilities data and mapped to the runtime id, so a player removal no longer leaves a ghost. A reused runtime id or unique id removes the old body first. Removals only go out for held entities; a once-a-second sweep removes anything left outside the published area. Other players' stored positions follow their move packets. |
+| `658e774` | A pickup no longer sends a removal beside it, so the client plays the three-tick flight into the collector. |
+| `d7a94a9` | A click or drag outside the inventory window drops the carried stack (all for the left button, one for the right, one for Q), which used to send nothing. A request unanswered for three seconds clears the pending slot names and asks the server for the inventories again instead of needing a rejoin. |
+| `1588e9a` | The command origin uses the player's own uuid from the player list, and the player-list entry for the local player refreshes the actor unique id a respawn can change. |
+| `b7465f9` | Titles, subtitles, action bars, title timings and clear/reset are decoded and shown. |
+
+Verified live on the last build (`native-d7077bc-3201f84f216d`, against Horizon
+`d7077bc27`):
+
+- a bow fired from the air and from a block, consumed an arrow and was picked
+  back up after landing; crossbow charged, showed the using flag and fired;
+  shield in the main hand starts and ends its use (Bedrock shields belong in
+  the off hand, so it does not block there);
+- speed/poison/omen effects add, update and clear, including the newer omen
+  ids; the local player's effect list matches the server's;
+- `/give @s` resolves repeatedly, before and after a death/respawn;
+- Q on a slot, carrying a stack and dropping it outside the window, and
+  dragging outside all produce server-accepted stack requests;
+- a killed cow plays its death then leaves, and a cow left behind after the
+  published centre moved is swept away;
+- title, subtitle, action bar and timing commands reach the game;
+- block placement still consumes the held stack.
+
+Known gaps after this pass:
+
+- **Item use:** a real client sends a use transaction on simulation ticks while
+  a hold-style use continues; the bridge sends only the first one. Fireworks in
+  the main hand do not consume on the ground (the server only boosts while
+  gliding). A PvP/other-player check of the held use animation is still needed.
+- **Pickups:** the pickup particle is now sent alone; a held item that is
+  picked up while the cursor is non-empty still depends on the game's own menu
+  state.
+- **Inventory:** the item stack request bytes are the shape the live server
+  accepts (two type bytes and a fixed `li32` stack id), which differs from the
+  1.26.60 schema files. Do not "fix" them to the schema without a capture. The
+  three-second recovery has not been forced live; only its compile and normal
+  operation are verified.
+- **`@s`:** the uuid comes from the player-list entry with no name. If the
+  server ever sends that entry only as a removal, the uuid is still the
+  account's, but a new-session check is worthwhile.
+- **Section 12:** most of it remains. The largest visible pieces still missing
+  are gamerules, boss bars, scoreboards, block entities, per-chunk biomes,
+  dimensions, attributes, passengers, crafting/creative, `Dynamic` registries,
+  and the NetherNet reconnect/transfer work.
