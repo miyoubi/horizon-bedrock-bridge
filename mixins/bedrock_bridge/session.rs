@@ -2802,6 +2802,44 @@ mod translate {
                     .flat_map(command_lines)
                     .collect()
             }
+            // Titles, subtitles, the action bar and their timings.
+            bp::Packet::SetTitle {
+                kind,
+                text,
+                fade_in,
+                stay,
+                fade_out,
+            } => match *kind {
+                0 => vec![Event::Packet(Box::new(play::Clientbound::ClearTitles(
+                    play::Bool1 { value: false },
+                )))],
+                1 => vec![Event::Packet(Box::new(play::Clientbound::ClearTitles(
+                    play::Bool1 { value: true },
+                )))],
+                2 | 6 => vec![Event::Packet(Box::new(play::Clientbound::SetTitleText(
+                    play::Text {
+                        text: text_component(text),
+                    },
+                )))],
+                3 | 7 => vec![Event::Packet(Box::new(
+                    play::Clientbound::SetSubtitleText(play::Text {
+                        text: text_component(text),
+                    }),
+                ))],
+                4 | 8 => vec![Event::Packet(Box::new(
+                    play::Clientbound::SetActionBarText(play::Text {
+                        text: text_component(text),
+                    }),
+                ))],
+                5 => vec![Event::Packet(Box::new(
+                    play::Clientbound::SetTitlesAnimation(play::TitlesAnimation {
+                        fade_in: *fade_in,
+                        stay: *stay,
+                        fade_out: *fade_out,
+                    }),
+                ))],
+                _ => Vec::new(),
+            },
             // The server's command list: the game's command tree, so `/` lists
             // the commands, tab-completion works and an unknown command gets
             // the game's own "did you mean" suggestion.

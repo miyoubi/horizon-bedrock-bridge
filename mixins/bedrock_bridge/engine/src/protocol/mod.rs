@@ -171,6 +171,16 @@ pub enum Packet {
     PlaySound,
     LevelSoundEvent,
     BossEvent,
+    /// A title, subtitle, action bar, timing or clear (88).
+    SetTitle {
+        /// 0 clear, 1 reset, 2 title, 3 subtitle, 4 action bar, 5 times,
+        /// 6/7/8 the same three text kinds as a text object.
+        kind: i32,
+        text: String,
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
     /// The command tree (76).
     AvailableCommands(AvailableCommands),
     /// The result of a `CommandRequest` (79).
@@ -574,6 +584,20 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::PLAY_SOUND => Packet::PlaySound,
         ids::LEVEL_SOUND_EVENT => Packet::LevelSoundEvent,
         ids::BOSS_EVENT => Packet::BossEvent,
+        ids::SET_TITLE => {
+            let kind = r.zigzag32()?;
+            let text = r.string()?;
+            let fade_in = r.zigzag32()?;
+            let stay = r.zigzag32()?;
+            let fade_out = r.zigzag32()?;
+            Packet::SetTitle {
+                kind,
+                text,
+                fade_in,
+                stay,
+                fade_out,
+            }
+        }
         ids::AVAILABLE_COMMANDS => {
             Packet::AvailableCommands(AvailableCommands::read(&mut r)?)
         }
