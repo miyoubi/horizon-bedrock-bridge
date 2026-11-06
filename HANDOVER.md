@@ -1102,3 +1102,34 @@ Known gaps after this pass:
   are gamerules, boss bars, scoreboards, block entities, per-chunk biomes,
   dimensions, attributes, passengers, crafting/creative, `Dynamic` registries,
   and the NetherNet reconnect/transfer work.
+
+### Boss bars, explosions and actor ids (latest)
+
+`b0b452c` adds the rest of the wither/boss path that a live check exposed:
+
+- `BossEvent` is decoded (signed actor id, event, title, filtered title,
+  health, colour, overlay). The first `Add` creates the game's bar, later
+  `Add`s are health updates (the server repeats `Add` while a boss spawns),
+  `Update_Name`, `Update_Percent` and both style events map directly, and
+  `Remove` takes the bar away. A `RemoveEntity` for the boss actor also
+  removes its bar, because the server did not send event 2 in this test.
+- The title is a translation key (`entity.wither.name`). It is sent as the
+  game's own key (`entity.minecraft.wither`), so the bar reads `Wither`
+  rather than the key. Literal title text still goes as literal text.
+- `LevelEvent` 2025 becomes the game's explosion packet with an explosion
+  or explosion-emitter particle, an explosion sound and a radius from the
+  event's data (wither 7, creeper-like 1). This is the wither death burst.
+- Actor unique ids are signed on the wire. `AddEntity`, `AddItemEntity`,
+  `AddPlayer`, `RemoveEntity` and `BossEvent` now all use the same signed
+  id and the same key, which is what stopped wither skulls (mobs that leave
+  without a death event) from remaining as ghosts.
+
+Verified on `native-d7077bc-940c4b41631a`: `/give @s` still resolves, a
+wither shows a bar, sends the 2025 explosion at death, its skulls disappear,
+and no panic appears in either log. The bar's disappearance itself needs one
+more visual pass: the server's `RemoveEntity` for the boss id is present and the
+bridge emits the bar removal for it.
+
+Remaining from section 12 is unchanged: gamerules, scoreboards, block entities,
+per-chunk biomes, dimensions, attributes, passengers, crafting/creative,
+`Dynamic` registries, and the NetherNet reconnect/transfer work.
