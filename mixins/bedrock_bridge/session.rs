@@ -333,7 +333,7 @@ struct Bridge {
     /// The slots as they were before each move the bridge has sent but not yet
     /// had answered, keyed by the request id the server echoes. A move is
     /// shown at once (a real client predicts it) and put back if refused.
-    pending_moves: Mutex<Vec<(i32, Items)>>,
+    pending_moves: Mutex<Vec<(i32, Items, std::time::Instant)>>,
     /// The slots a move has changed locally but the server has not answered for
     /// yet, each mapped to that request's id. A slot changed by an
     /// unacknowledged request is named by the request id, not by the stack id it
@@ -5165,45 +5165,65 @@ mod translate {
         let actions = match c.input {
             // Pick up: the stack, or one item of it with the right button.
             0 => {
-                let Some(clicked) = clicked else {
-                    return Vec::new();
-                };
-                let held = *bridge.cursor.lock().unwrap();
-                let here = item_at(bridge, clicked.container.name, clicked.slot);
-                let count = if c.button == 1 {
-                    1
+                // A click outside the window drops the carried stack: the
+                // left button throws all of it, the right one only one. This
+                // is a pickup click with no slot, and it used to return here
+                // with nothing sent, so the item vanished on the client while
+                // the server still had it.
+                if c.slot == -999 {
+                    let Some(holding) = *bridge.cursor.lock().unwrap() else {
+                        return Vec::new();
+                    };
+                    vec![bp::StackAction::Drop {
+                        count: if c.button == 1 {
+                            1
+                        } else {
+                            holding.count.max(0) as u8
+                        },
+                        source: cursor,
+                        randomly: false,
+                    }]
                 } else {
-                    here.map_or(0, |d| d.count.max(0) as u8)
-                };
-                match (held, here) {
-                    (None, Some(_)) => vec![bp::StackAction::Take {
-                        count,
-                        source: clicked,
-                        destination: cursor,
-                    }],
-                    (Some(holding), Some(existing))
-                        if holding.runtime_id == existing.runtime_id =>
-                    {
-                        vec![bp::StackAction::Place {
-                            count: if c.button == 1 {
-                                1
-                            } else {
-                                holding.count.max(0) as u8
-                            },
+                    let Some(clicked) = clicked else {
+                        return Vec::new();
+                    };
+                    let held = *bridge.cursor.lock().unwrap();
+                    let here = item_at(bridge, clicked.container.name, clicked.slot);
+                    let count = if c.button == 1 {
+                        1
+                    } else {
+                        here.map_or(0, |d| d.count.max(0) as u8)
+                    };
+                    match (held, here) {
+                        (None, Some(_)) => vec![bp::StackAction::Take {
+                            count,
+                            source: clicked,
+                            destination: cursor,
+                        }],
+                        (Some(holding), Some(existing))
+                            if holding.runtime_id == existing.runtime_id =>
+                        {
+                            vec![bp::StackAction::Place {
+                                count: if c.button == 1 {
+                                    1
+                                } else {
+                                    holding.count.max(0) as u8
+                                },
+                                source: cursor,
+                                destination: clicked,
+                            }]
+                        }
+                        (Some(_), Some(_)) => vec![bp::StackAction::Swap {
+                            first: clicked,
+                            second: cursor,
+                        }],
+                        (Some(holding), None) => vec![bp::StackAction::Place {
+                            count: holding.count.max(0) as u8,
                             source: cursor,
                             destination: clicked,
-                        }]
+                        }],
+                        (None, None) => Vec::new(),
                     }
-                    (Some(_), Some(_)) => vec![bp::StackAction::Swap {
-                        first: clicked,
-                        second: cursor,
-                    }],
-                    (Some(holding), None) => vec![bp::StackAction::Place {
-                        count: holding.count.max(0) as u8,
-                        source: cursor,
-                        destination: clicked,
-                    }],
-                    (None, None) => Vec::new(),
                 }
             }
             // Shift-click: move the stack towards the other side of the window.
@@ -5440,7 +5460,7 @@ mod translate {
         }
         {
             let mut pending = bridge.pending_moves.lock().unwrap();
-            pending.push((request_id, before));
+            pending.push((request_id, before, std::time::Instant::now()));
             if pending.len() > 64 {
                 pending.remove(0);
             }
@@ -5485,7 +5505,7 @@ mod translate {
             let mut pending = bridge.pending_moves.lock().unwrap();
             pending
                 .iter()
-                .position(|(id, _)| *id == response.request_id)
+                .position(|(id, _, _)| *id == response.request_id)
                 .map(|index| pending.remove(index).1)
         };
         if response.result != 0 {
@@ -5724,6 +5744,23 @@ mod translate {
         bridge.tick.fetch_add(1, Ordering::Relaxed);
         let actions = std::mem::take(&mut *bridge.actions.lock().unwrap());
         let mut out = auth_input(bridge, actions);
+        // A request the server never answered would leave the slots named by
+        // its id forever, and every later move on them would quote a request
+        // the server has forgot. Ask for the whole inventory again and forget
+        // the pending names, which is what a rejoin used to be needed for.
+        let stale = bridge
+            .pending_moves
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, at)| at.elapsed() >= std::time::Duration::from_secs(3));
+        if stale {
+            bridge.pending_moves.lock().unwrap().clear();
+            bridge.pending_ids.lock().unwrap().clear();
+            bridge.quick_moves.lock().unwrap().clear();
+            bedrock_core::nethernet::trace("inventory: no answer in 3 s, resyncing".to_string());
+            out.push(bedrock_core::protocol::Out::InventoryMismatch);
+        }
         // A pickup is granted on the server a moment after it happens, so ask
         // for the inventories once it has had time to apply it. Asking straight
         // away returned the state from before the pickup and undid it.
