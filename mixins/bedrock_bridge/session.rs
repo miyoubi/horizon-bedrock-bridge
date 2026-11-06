@@ -3104,16 +3104,16 @@ mod translate {
                 let mut events = Vec::new();
                 for id in flying {
                     forget_entity(ctx, id);
+                    // Only the pickup: the client animates the stack into the
+                    // collector over three ticks and removes the entity itself.
+                    // Sending a removal here as well cut that animation off, so
+                    // a picked-up stack vanished on the ground instead of
+                    // flying to the player.
                     events.push(Event::Packet(Box::new(
                         play::Clientbound::TakeItemEntity(play::TakeItemEntity {
                             item: id as i32,
                             player: *actor as i32,
-                            amount: 1,
-                        }),
-                    )));
-                    events.push(Event::Packet(Box::new(
-                        play::Clientbound::RemoveEntities(play::RemoveEntities {
-                            ids: vec![id as i32],
+                            amount: 0,
                         }),
                     )));
                 }
