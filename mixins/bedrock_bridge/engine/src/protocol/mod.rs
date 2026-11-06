@@ -74,7 +74,7 @@ pub enum Packet {
     ChunkRadiusUpdated(i32),
     AddPlayer(AddPlayer),
     AddEntity(AddEntity),
-    RemoveEntity(u64),
+    RemoveEntity(i64),
     SetEntityData(SetEntityData),
     /// A mob effect being added, changed or removed. `event` is 1 add, 2
     /// update, 3 remove; the rest is the effect the server applied.
@@ -93,7 +93,7 @@ pub enum Packet {
     /// A dropped item lying in the world.
     AddItemEntity {
         runtime_id: u64,
-        unique_id: u64,
+        unique_id: i64,
         item: NetworkItem,
         position: [f32; 3],
         velocity: [f32; 3],
@@ -170,7 +170,15 @@ pub enum Packet {
     },
     PlaySound,
     LevelSoundEvent,
-    BossEvent,
+    /// A boss bar being shown, changed or hidden (74).
+    BossEvent {
+        boss: i64,
+        event: u32,
+        title: String,
+        health: f32,
+        color: u32,
+        overlay: u32,
+    },
     /// A title, subtitle, action bar, timing or clear (88).
     SetTitle {
         /// 0 clear, 1 reset, 2 title, 3 subtitle, 4 action bar, 5 times,
@@ -430,7 +438,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         ids::CHUNK_RADIUS_UPDATED => Packet::ChunkRadiusUpdated(r.zigzag32()?),
         ids::ADD_PLAYER => Packet::AddPlayer(AddPlayer::read(&mut r)?),
         ids::ADD_ENTITY => Packet::AddEntity(AddEntity::read(&mut r)?),
-        ids::REMOVE_ENTITY => Packet::RemoveEntity(r.varlong()?),
+        ids::REMOVE_ENTITY => Packet::RemoveEntity(r.zigzag64()?),
         ids::SET_ENTITY_DATA => Packet::SetEntityData(SetEntityData::read(&mut r)?),
         ids::MOB_EFFECT => {
             let runtime_id = r.varlong()?;
@@ -477,7 +485,7 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
             }
         }
         ids::ADD_ITEM_ENTITY => {
-            let unique_id = r.varlong()?;
+            let unique_id = r.zigzag64()?;
             let runtime_id = r.varlong()?;
             let item = NetworkItem::read(&mut r)?;
             let position = [r.f32()?, r.f32()?, r.f32()?];
@@ -583,7 +591,26 @@ pub fn decode(id: u32, body: &[u8]) -> Result<Packet> {
         }
         ids::PLAY_SOUND => Packet::PlaySound,
         ids::LEVEL_SOUND_EVENT => Packet::LevelSoundEvent,
-        ids::BOSS_EVENT => Packet::BossEvent,
+        ids::BOSS_EVENT => {
+            // Only the boss actor id is on the wire in this protocol; the
+            // player id the older references list is gone. The id is the same
+            // signed actor id a removal names.
+            let boss = r.zigzag64()?;
+            let event = r.varint()?;
+            let title = r.string()?;
+            let _filtered = r.string()?;
+            let health = r.f32()?;
+            let color = r.varint()?;
+            let overlay = r.varint()?;
+            Packet::BossEvent {
+                boss,
+                event,
+                title,
+                health,
+                color,
+                overlay,
+            }
+        }
         ids::SET_TITLE => {
             let kind = r.zigzag32()?;
             let text = r.string()?;

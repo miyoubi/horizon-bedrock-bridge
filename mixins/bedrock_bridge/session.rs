@@ -761,6 +761,7 @@ fn run(
         last_emit: None,
         entities: std::collections::HashMap::new(),
         players: std::collections::HashSet::new(),
+        bosses: std::collections::HashSet::new(),
         drops: std::collections::HashMap::new(),
         drop_owner: std::collections::HashMap::new(),
         uniques: std::collections::HashMap::new(),
@@ -1089,6 +1090,10 @@ mod translate {
         /// The runtime ids the server spawned as players, so a hurt sound can
         /// pick the player's own hurt sound.
         pub players: std::collections::HashSet<u64>,
+        /// The boss actor ids whose bar the game already has. A boss sends
+        /// several Add events while it spawns; only the first one adds a bar,
+        /// the rest are health updates.
+        pub bosses: std::collections::HashSet<u64>,
         /// The stack each dropped item entity carries, so a pickup can put it
         /// into the inventory: the server sends no inventory packet for one.
         pub drops: std::collections::HashMap<u64, bp::NetworkItem>,
@@ -1998,6 +2003,29 @@ mod translate {
         JTag::compound([("text", JTag::String(JavaString::from(message)))])
     }
 
+    /// A title text from the server. A boss bar (and a raw title) can name a
+    /// translation key rather than literal words; the game's own key is the
+    /// same name under its own namespace.
+    fn title_component(message: &str) -> JTag {
+        let text = message.trim();
+        for (from, to) in [
+            ("entity.", "entity.minecraft."),
+            ("tile.", "block.minecraft."),
+            ("item.", "item.minecraft."),
+        ] {
+            if let Some(rest) = text.strip_prefix(from)
+                && let Some(name) = rest.strip_suffix(".name")
+            {
+                let key = format!("{to}{name}");
+                return JTag::compound([(
+                    "translate",
+                    JTag::String(JavaString::from(key.as_str())),
+                )]);
+            }
+        }
+        text_component(message)
+    }
+
     /// A positional hurt sound at a hurt entity, since the game's sound-event
     /// handler takes a position rather than an entity. Bedrock's own level
     /// sound event for the same hurt is not decoded.
@@ -2802,6 +2830,62 @@ mod translate {
                     .flat_map(command_lines)
                     .collect()
             }
+            // Boss bars. The server names one by its actor unique id, which
+            // becomes the bar's uuid here; the game keeps each bar by that id.
+            bp::Packet::BossEvent {
+                boss,
+                event,
+                title,
+                health,
+                color,
+                overlay,
+            } => {
+                // Bedrock's colours have one more entry (rebecca purple at 6)
+                // than the game's, so white moves down by one.
+                let color = match *color {
+                    0..=5 => *color as i32,
+                    6 => 5, // rebecca purple, the closest game colour
+                    _ => 6, // white
+                };
+                let key = *boss as u64;
+                let id = u128::from(key);
+                let action = match *event {
+                    // The server repeats Add while a boss spawns. Only the
+                    // first creates the bar; the rest carry its health.
+                    0 if ctx.bosses.insert(key) => play::BossAction::Add {
+                        name: title_component(title),
+                        progress: health.clamp(0.0, 1.0),
+                        color,
+                        overlay: *overlay as i32,
+                        darken: true,
+                        music: true,
+                        fog: true,
+                    },
+                    0 => play::BossAction::UpdateProgress {
+                        progress: health.clamp(0.0, 1.0),
+                    },
+                    2 => {
+                        ctx.bosses.remove(&key);
+                        play::BossAction::Remove
+                    }
+                    4 => play::BossAction::UpdateProgress {
+                        progress: health.clamp(0.0, 1.0),
+                    },
+                    5 => play::BossAction::UpdateName {
+                        name: title_component(title),
+                    },
+                    // 6 and 7 both carry the colour and overlay in this
+                    // protocol.
+                    6 | 7 => play::BossAction::UpdateStyle {
+                        color,
+                        overlay: *overlay as i32,
+                    },
+                    _ => return Vec::new(),
+                };
+                vec![Event::Packet(Box::new(play::Clientbound::BossEvent(
+                    play::BossEvent { id, action },
+                )))]
+            }
             // Titles, subtitles, the action bar and their timings.
             bp::Packet::SetTitle {
                 kind,
@@ -2818,17 +2902,17 @@ mod translate {
                 )))],
                 2 | 6 => vec![Event::Packet(Box::new(play::Clientbound::SetTitleText(
                     play::Text {
-                        text: text_component(text),
+                        text: title_component(text),
                     },
                 )))],
                 3 | 7 => vec![Event::Packet(Box::new(
                     play::Clientbound::SetSubtitleText(play::Text {
-                        text: text_component(text),
+                        text: title_component(text),
                     }),
                 ))],
                 4 | 8 => vec![Event::Packet(Box::new(
                     play::Clientbound::SetActionBarText(play::Text {
-                        text: text_component(text),
+                        text: title_component(text),
                     }),
                 ))],
                 5 => vec![Event::Packet(Box::new(
@@ -2974,6 +3058,44 @@ mod translate {
             // Weather. Bedrock announces rain and thunder as level events, and
             // the game wants both the state and the level it rains at -- the
             // state alone does not make it rain.
+            // An explosion's particles and sound. Bedrock sends only the
+            // effect; the game's explosion packet draws it and plays the
+            // sound. Data 7 is the large (wither) burst.
+            bp::Packet::LevelEvent(e) if e.event == 2025 => {
+                let large = e.data >= 7;
+                // The data is the blast kind/size; a wither's is 7, a
+                // creeper's 1. The packet's radius drives the debris ring.
+                let radius = (e.data.max(1) as f32).clamp(4.0, 16.0);
+                let kind = if large {
+                    horizon_client_core::particle_type::ParticleType::ExplosionEmitter
+                } else {
+                    horizon_client_core::particle_type::ParticleType::Explosion
+                };
+                let particle = horizon_client_core::particle_type::ParticleType::ALL
+                    .iter()
+                    .position(|p| *p == kind)
+                    .and_then(|id| i32::try_from(id).ok())
+                    .unwrap_or(0);
+                vec![Event::Packet(Box::new(play::Clientbound::Explode(
+                    play::Explode {
+                        center: [
+                            e.position[0] as f64,
+                            e.position[1] as f64,
+                            e.position[2] as f64,
+                        ],
+                        radius,
+                        block_count: 0,
+                        knockback: None,
+                        particle: horizon_protocol::entity_data::Particle {
+                            id: particle,
+                            data: None,
+                        },
+                        sound: (-1, Some(("minecraft:entity.generic.explode".into(), None))),
+                        block_particles: Vec::new(),
+                        play_sound: true,
+                    },
+                )))]
+            }
             bp::Packet::LevelEvent(e) if (3001..=3004).contains(&e.event) => {
                 let (event, param) = match e.event {
                     3001 => (1u8, 0.0f32),
@@ -3632,13 +3754,21 @@ mod translate {
                 // was told about. Without the mapping the old code used the
                 // unique id as a runtime id, which could take away a different
                 // entity or leave a ghost; an unknown id is now only traced.
-                let Some(id) = ctx.uniques.remove(unique) else {
+                let unique_key = *unique as u64;
+                let boss_gone = ctx.bosses.remove(&unique_key);
+                let boss_event = || {
+                    Event::Packet(Box::new(play::Clientbound::BossEvent(play::BossEvent {
+                        id: u128::from(unique_key),
+                        action: play::BossAction::Remove,
+                    })))
+                };
+                let Some(id) = ctx.uniques.remove(&unique_key) else {
                     if std::env::var_os("HZ_ENT_TRACE").is_some() {
                         bedrock_core::nethernet::trace(format!(
                             "REMOVE unique={unique} unknown"
                         ));
                     }
-                    return Vec::new();
+                    return if boss_gone { vec![boss_event()] } else { Vec::new() };
                 };
                 if !entity_held(ctx, id) {
                     if std::env::var_os("HZ_ENT_TRACE").is_some() {
@@ -3646,7 +3776,7 @@ mod translate {
                             "REMOVE unique={unique} runtime={id} already gone"
                         ));
                     }
-                    return Vec::new();
+                    return if boss_gone { vec![boss_event()] } else { Vec::new() };
                 }
                 // The server folds a pile of dropped stacks by taking the
                 // absorbed actors away. Each of them still stands for a part of
@@ -3685,11 +3815,15 @@ mod translate {
                         "REMOVE unique={unique} runtime={id} ids={gone:?}"
                     ));
                 }
-                vec![Event::Packet(Box::new(play::Clientbound::RemoveEntities(
-                    play::RemoveEntities {
+                let mut events = vec![Event::Packet(Box::new(
+                    play::Clientbound::RemoveEntities(play::RemoveEntities {
                         ids: gone.into_iter().map(|id| id as i32).collect(),
-                    },
-                )))]
+                    }),
+                ))];
+                if boss_gone {
+                    events.push(boss_event());
+                }
+                events
             }
             // An entity was hurt. The game's damage event flashes it red, and
             // for our own player plays the hurt sound; another entity gets a
