@@ -313,6 +313,17 @@ struct Bridge {
     /// Block uses wait for the network thread, which is where the column data
     /// lives and the clicked block's state can be looked up.
     pending_use: Mutex<Vec<play::UseItemOn>>,
+    /// When the block use was queued. It waits a moment so an item use sent in
+    /// the same tick can replace it instead of arriving after it.
+    pending_use_since: Mutex<Option<std::time::Instant>>,
+    /// Item uses the game sent in the same tick as a block use. They replace
+    /// that block click, because Java only sends one when the block did not
+    /// consume the interaction.
+    pending_use_item: Mutex<Vec<play::UseItem>>,
+    /// Set for the one input tick a hold-style item use begins. The server
+    /// wants `StartUsingItem` on the same tick as the use transaction, and
+    /// clearing it after that input keeps the flag from repeating.
+    use_started: AtomicBool,
     /// The block of the last use, so a resync can be tied to it.
     last_use: Mutex<Option<[i32; 3]>>,
     /// Entities to take away once their death has been shown, with the tick it
@@ -522,6 +533,9 @@ pub fn try_connect(
         spawn_info: Mutex::new(None),
         teleport_ack: AtomicBool::new(false),
         pending_use: Mutex::new(Vec::new()),
+        pending_use_since: Mutex::new(None),
+        pending_use_item: Mutex::new(Vec::new()),
+        use_started: AtomicBool::new(false),
         last_use: Mutex::new(None),
         removals: Mutex::new(Vec::new()),
         pending_moves: Mutex::new(Vec::new()),
@@ -577,6 +591,7 @@ pub fn send(session: &Session, packet: &play::Serverbound) -> bool {
     // network thread holds the column data.
     if let play::Serverbound::UseItemOn(u) = packet {
         bridge.pending_use.lock().unwrap().push(u.clone());
+        *bridge.pending_use_since.lock().unwrap() = Some(std::time::Instant::now());
         return true;
     }
     let out = translate::serverbound(bridge, packet);
@@ -822,6 +837,48 @@ fn run(
         for event in translate::flush_removals(bridge) {
             let _ = events.send(event);
         }
+        // Uses queued by the game thread, in the order the game made them: a
+        // block click first, then the item use it falls back to. Draining both
+        // here keeps that order across the thread boundary, which the item use
+        // needs or the block click's stop cancels the use.
+        {
+            let items: Vec<play::UseItem> =
+                bridge.pending_use_item.lock().unwrap().drain(..).collect();
+            if items.is_empty() {
+                // No item use followed, so this really was a block
+                // interaction. Give the game thread a moment to send one
+                // before acting on it.
+                let due = bridge
+                    .pending_use_since
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(5));
+                if due {
+                    *bridge.pending_use_since.lock().unwrap() = None;
+                    let uses: Vec<play::UseItemOn> =
+                        bridge.pending_use.lock().unwrap().drain(..).collect();
+                    for u in uses {
+                        let out = translate::use_item_on(&mut ctx, &**bridge, &u);
+                        if !out.is_empty() {
+                            let _ = client.send(&out);
+                        }
+                    }
+                }
+            } else {
+                // The block click passed to the item itself: Java sends
+                // `UseItem` only when the block did not consume the
+                // interaction. Drop the block transaction and send the item
+                // use alone, in the air, which is the shape the server takes.
+                *bridge.pending_use_since.lock().unwrap() = None;
+                let _ = bridge.pending_use.lock().unwrap().drain(..).last();
+                for _ in items {
+                    let out = translate::use_item_air(&**bridge);
+                    if !out.is_empty() {
+                        let _ = client.send(&out);
+                    }
+                }
+            }
+        }
         // Sub-chunk requests queued while translating.
         if !ctx.requests.is_empty() {
             let batch: Vec<bedrock_core::protocol::Out> = ctx.requests.drain(..).collect();
@@ -861,14 +918,6 @@ fn run(
             };
             for event in translate::clientbound(&mut ctx, &**bridge, &packet) {
                 let _ = events.send(event);
-            }
-            // Block uses were queued by the game thread for this one, which
-            // holds the column data the transaction needs.
-            for u in bridge.pending_use.lock().unwrap().drain(..) {
-                let out = translate::use_item_on(&mut ctx, &**bridge, &u);
-                if !out.is_empty() {
-                    let _ = client.send(&out);
-                }
             }
             // React to the resource-pack phase automatically.
             if let bedrock_core::protocol::Packet::PlayStatus(s) = &packet {
@@ -4184,6 +4233,13 @@ mod translate {
         if !actions.is_empty() {
             flags |= 1 << 35; // perform_block_actions
         }
+        // The use transaction goes out in the same client tick as this input,
+        // and the server only predicts the use when the flag is here. It is a
+        // one-tick edge, not a state: the item stays in use until the release
+        // transaction, not for as long as this bit is set.
+        if bridge.use_started.swap(false, Ordering::Relaxed) {
+            flags |= 1 << 53; // start_using_item
+        }
         // A respawn's teleport is not settled on the server until an input
         // reports it handled.
         if bridge.teleport_ack.swap(false, Ordering::Relaxed) {
@@ -5455,6 +5511,37 @@ mod translate {
         )
     }
 
+    /// An item use in the air: the same complex transaction with the `Use`
+    /// action and no block. It carries no inventory action, so the held stack
+    /// is only changed by the server's answer.
+    pub fn use_item_air(bridge: &Bridge) -> Vec<bp::Out> {
+        let pos = *bridge.position.lock().unwrap();
+        let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
+        vec![
+            // A real client reports the start of a hold-style use as a player
+            // action, and the input tick carries the matching `StartUsingItem`
+            // flag.
+            bp::Out::PlayerAction {
+                runtime_id,
+                action: 37, // start using item
+                position: [0; 3],
+                result: [0; 3],
+                face: 255,
+            },
+            // `Use`, not `Place`: the item itself, with no block.
+            bp::Out::ItemUseOnBlock {
+                block: [0; 3],
+                face: 255,
+                hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                action: 1, // use
+                item: held_item(bridge),
+                cursor: [0.0; 3],
+                position: pos,
+                block_id: 0,
+            },
+        ]
+    }
+
     /// Java serverbound → Bedrock.
     pub fn serverbound(bridge: &Bridge, packet: &play::Serverbound) -> Vec<bp::Out> {
         serverbound_with(bridge, packet, 0)
@@ -5660,7 +5747,7 @@ mod translate {
                     ]
                 };
                 let mut out = vec![
-                    // Placing or using swings the arm, as a hit does.
+                    // A right-click on a block swings the arm, as a hit does.
                     bp::Out::Animate {
                         runtime_id,
                         action: 1, // swing_arm
@@ -5672,37 +5759,36 @@ mod translate {
                         result,
                         face: u.face,
                     },
+                    // This is the block click itself. A block is consumed by
+                    // the action the encoder writes for it; an item that is
+                    // not a block carries no action, so its stack is untouched.
+                    // A hold-style use of the item follows in `UseItem` when
+                    // the block does not consume the click.
+                    bp::Out::ItemUseOnBlock {
+                        block: u.pos,
+                        face: u.face,
+                        hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
+                        action: 0, // place / click block
+                        item: held,
+                        cursor: u.cursor,
+                        // The transaction carries the feet position, not the
+                        // eye: the server measures reach from here.
+                        position: pos,
+                        block_id,
+                    },
                 ];
-                if !placing {
-                    // A bow, shield, firework or other usable item starts its
-                    // use animation. A real client reports this as action 37.
+                // A placement ends its block use. A usable item is not stopped
+                // here: the item use queued behind this packet starts the
+                // hold, and a stop would cancel it. Java's release ends it.
+                if placing {
                     out.push(bp::Out::PlayerAction {
                         runtime_id,
-                        action: 37, // start using item
+                        action: 29, // stop item use on
                         position: u.pos,
                         result: [0; 3],
-                        face: 255,
+                        face: 0,
                     });
                 }
-                out.push(bp::Out::ItemUseOnBlock {
-                    block: u.pos,
-                    face: u.face,
-                    hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
-                    action: if placing { 0 } else { 1 }, // place / use
-                    item: held,
-                    cursor: u.cursor,
-                    // The transaction carries the feet position, not the eye:
-                    // the server measures reach from here.
-                    position: pos,
-                    block_id,
-                });
-                out.push(bp::Out::PlayerAction {
-                    runtime_id,
-                    action: 29, // stop item use on
-                    position: u.pos,
-                    result: [0; 3],
-                    face: 0,
-                });
                 out.push(
                     // The stack shrank; the held item the server shows must say
                     // so, or everyone else keeps seeing the old count.
@@ -5717,28 +5803,17 @@ mod translate {
             }
             // Using the held item in the air (eating, throwing, drawing,
             // raising): the same transaction with a use action and no block.
-            play::Serverbound::UseItem(_) => {
-                let pos = *bridge.position.lock().unwrap();
-                let runtime_id = bridge.runtime_id.load(Ordering::Relaxed) as u64;
-                vec![
-                    bp::Out::PlayerAction {
-                        runtime_id,
-                        action: 37, // start using item
-                        position: [0; 3],
-                        result: [0; 3],
-                        face: 255,
-                    },
-                    bp::Out::ItemUseOnBlock {
-                        block: [0, 0, 0],
-                        face: 255,
-                        hotbar_slot: bridge.hotbar.load(Ordering::Relaxed) as i32,
-                        action: 1, // use
-                        item: held_item(bridge),
-                        cursor: [0.0; 3],
-                        position: pos,
-                        block_id: 0,
-                    },
-                ]
+            play::Serverbound::UseItem(u) => {
+                bridge.use_started.store(true, Ordering::Relaxed);
+                bedrock_core::nethernet::trace(format!(
+                    "USE item slot={} item={:?}",
+                    bridge.hotbar.load(Ordering::Relaxed),
+                    held_item(bridge)
+                ));
+                // The network thread sends this after any block use queued for
+                // the same tick, so the block click cannot cancel it.
+                bridge.pending_use_item.lock().unwrap().push(u.clone());
+                Vec::new()
             }
             // The game closed a container: tell the server, which is the only
             // side that can actually close it.

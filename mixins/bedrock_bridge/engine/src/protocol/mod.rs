@@ -966,8 +966,14 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             // A placement says which slot changed: the held stack becomes one
             // smaller. The server checks the transaction against it, and with
             // no action it treats the placement as not matching the inventory.
-            let placed = if *action == 0 { *item } else { None };
-            match placed.filter(|from| from.count > 0) {
+            // A block click with a non-block item is still a `Place` action,
+            // but it changes no stack, so it must carry no inventory action at
+            // all; using an item in the air likewise leaves the stack alone.
+            let placed = match (*action, *item) {
+                (0, Some(from)) if from.block_runtime_id > 0 && from.count > 0 => Some(from),
+                _ => None,
+            };
+            match placed {
                 Some(from) => {
                     w.varint(1); // actions count
                     w.varint(0); // source: container inventory
@@ -1098,6 +1104,10 @@ pub fn encode(packet: &Out) -> Vec<u8> {
             w.varint(0); // legacy request id
             w.bool(false); // no legacy data
             w.varint(4); // ItemReleaseTransaction
+            // Every complex transaction carries its inventory actions before
+            // its own data. Releasing changes no slot, so the list is empty;
+            // leaving the count out shifted every following field.
+            w.varint(0); // no inventory actions
             w.zigzag32(*action);
             w.zigzag32(*hotbar_slot);
             write_item(&mut w, *item);
@@ -1420,5 +1430,56 @@ mod inventory_tests {
             assert_eq!(read.block_runtime_id, 99);
             assert_eq!(read.net_id, net_id);
         }
+    }
+
+    /// A block click carries an inventory action only when it places: a tool
+    /// used on a block, and an item used in the air, leave the held stack
+    /// alone.
+    #[test]
+    fn item_use_writes_an_action_only_for_a_placed_block() {
+        let placeable = ItemDescriptor {
+            runtime_id: 3,
+            count: 4,
+            damage: 0,
+            net_id: Some(9),
+            block_runtime_id: 14825,
+        };
+        let tool = ItemDescriptor {
+            runtime_id: 400,
+            count: 1,
+            damage: 0,
+            net_id: Some(10),
+            block_runtime_id: 0,
+        };
+        let use_item = |action, item| {
+            encode(&Out::ItemUseOnBlock {
+                block: [0; 3],
+                face: 1,
+                hotbar_slot: 0,
+                action,
+                item: Some(item),
+                cursor: [0.0; 3],
+                position: [0.0; 3],
+                block_id: 0,
+            })
+        };
+        // The action count follows the id, legacy request id, legacy flag and
+        // transaction type.
+        assert_eq!(use_item(0, tool)[4], 0, "a tool on a block changes nothing");
+        assert_eq!(use_item(1, placeable)[4], 0, "a use in the air changes nothing");
+        assert_eq!(use_item(0, placeable)[4], 1, "a placed block is consumed");
+    }
+
+    /// A release transaction carries its (empty) action list before its own
+    /// fields; without it the server reads the action type as a list length.
+    #[test]
+    fn item_release_writes_its_empty_action_list() {
+        let out = encode(&Out::ItemUseRelease {
+            action: 0,
+            hotbar_slot: 3,
+            item: None,
+            position: [0.0; 3],
+        });
+        assert_eq!(&out[..6], &[0x1e, 0x00, 0x00, 0x04, 0x00, 0x00]);
     }
 }
